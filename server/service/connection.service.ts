@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { ConnectionEntity } from '../model/connection.entity';
 import { getDataPath } from '../utils/data-dir';
+import { loadConfig } from '../utils/config';
 import { execSync } from 'child_process';
 
 const ENCRYPTED_PREFIX = 'enc:v1:';
@@ -226,8 +227,9 @@ export class ConnectionService {
     }
 
     // ssh2 协议级 debug：默认不向前端推送（避免握手/KEX/keepalive 等噪音刷屏）；
-    // 仅在环境变量 AETHEROPS_SSH_DEBUG=1 时转发，便于排障。进程侧始终记录到 stdout。
-    const forwardSSHDebug = process.env.AETHEROPS_SSH_DEBUG === '1';
+    // 仅当配置 debug.sshDebug 为真（或环境变量 AETHEROPS_SSH_DEBUG=1）时转发，便于排障。
+    // 进程侧始终记录到 stdout。
+    const forwardSSHDebug = loadConfig().debug.sshDebug;
     config.debug = (msg: string) => {
       if (forwardSSHDebug && onLog) {
         onLog(`[debug] ${msg.trim()}`);

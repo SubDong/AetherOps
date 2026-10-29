@@ -62,12 +62,41 @@ function ensureDataDir() {
 }
 
 // PID 文件操作
-const readPid = () => {
-  const f = getDataPath('aetherops.server.pid');
+// 服务端的 PID 文件是按端口区分的（server.js: aetherops.server.<PORT>.pid），
+// 本 CLI 以前写死 aetherops.server.pid，两边对不上：server.js 自己写的 PID
+// 本 CLI 根本读不到，stop 只能依赖 lsof 兑底（而 lsof 在 Windows 上不存在）。
+// 现在统一按端口命名，并确保默认端口与配置层一致。
+function loadRuntimeConfig() {
+  try {
+    const { loadConfig } = require(path.join(projectRoot, 'dist/server/utils/config'));
+    return loadConfig();
+  } catch {
+    // dist 尚未构建（刚 clone 仓库 / 只装了依赖）：回退到与 config 默认值一致的行为
+    return null;
+  }
+}
+// 懒加载：loadConfig 在配置文件缺失时会生成模板，不能因为用户只跑了 -v / help
+// 就往数据目录写文件；只真正需要配置的命令（start/stop/restart）才触发。
+let _runtimeConfig;
+let _runtimeConfigLoaded = false;
+function getRuntimeConfig() {
+  if (!_runtimeConfigLoaded) {
+    _runtimeConfigLoaded = true;
+    _runtimeConfig = loadRuntimeConfig();
+  }
+  return _runtimeConfig;
+}
+const pidFileFor = (port) => getDataPath(`aetherops.server.${port}.pid`);
+
+const readPid = (port) => {
+  const f = pidFileFor(port);
   return fs.existsSync(f) ? parseInt(fs.readFileSync(f, 'utf8')) : null;
 };
 const getAccessToken = () => {
-  if (process.env.AETHEROPS_ACCESS_TOKEN) return process.env.AETHEROPS_ACCESS_TOKEN;
+  // loadConfig 已经把 AETHEROPS_ACCESS_TOKEN 等环境变量合进来了，优先用配置结果
+  const cfg = getRuntimeConfig();
+  const configured = cfg ? cfg.auth.accessToken : process.env.AETHEROPS_ACCESS_TOKEN;
+  if (configured) return configured;
   ensureDataDir();
   const f = getDataPath('access-token');
   try {
@@ -81,14 +110,24 @@ const getAccessToken = () => {
   try { fs.chmodSync(f, 0o600); } catch { /* ignore */ }
   return token;
 };
-const writePid = (pid) => {
+const writePid = (pid, port) => {
   ensureDataDir();
-  fs.writeFileSync(getDataPath('aetherops.server.pid'), pid.toString());
+  fs.writeFileSync(pidFileFor(port), pid.toString());
 };
-const deletePid = () => {
-  const f = getDataPath('aetherops.server.pid');
+const deletePid = (port) => {
+  const f = pidFileFor(port);
   if (fs.existsSync(f)) fs.unlinkSync(f);
 };
+
+/** 从命令行参数解析端口，start / stop / restart 共用 */
+function resolvePort() {
+  const portIndex = commandArgs.findIndex(arg => arg === '-p' || arg === '--port');
+  const raw = portIndex !== -1 ? commandArgs[portIndex + 1] : undefined;
+  const parsed = parseInt(raw);
+  if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  const cfg = getRuntimeConfig();
+  return cfg ? cfg.server.port : (Number(process.env.PORT) || 9802);
+}
 
 const args = process.argv.slice(2);
 const command = args[0] || 'help';
@@ -124,7 +163,8 @@ async function findAvailablePort(startPort) {
 async function startProject() {
   console.log('Starting aetherops...');
 
-  const pid = readPid();
+  const port = resolvePort();
+  const pid = readPid(port);
   if (pid) {
     try {
       process.kill(pid, 0);
@@ -133,19 +173,15 @@ async function startProject() {
     } catch (error) {
       if (error.code === 'ESRCH') {
         console.log('Cleaning up stale PID file...');
-        deletePid();
+        deletePid(port);
       }
     }
   }
 
-  let port = 9801;
-  const portIndex = commandArgs.findIndex(arg => arg === '-p' || arg === '--port');
-  if (portIndex !== -1 && commandArgs[portIndex + 1]) {
-    port = parseInt(commandArgs[portIndex + 1]);
-  }
+  let startPort = port;
 
   try {
-    port = await findAvailablePort(port);
+    startPort = await findAvailablePort(startPort);
   } catch (error) {
     console.error('Error:', error.message);
     process.exit(1);
@@ -158,37 +194,32 @@ async function startProject() {
     logFileFd = fs.openSync(logFilePath, 'a');
   } catch (e) { /* ignore */ }
 
-  const child = spawn('node', ['server.js', '-p', port.toString()], {
+  const child = spawn('node', ['server.js', '-p', startPort.toString()], {
     cwd: projectRoot,
     detached: true,
     stdio: ['ignore', logFileFd || 'inherit', logFileFd || 'inherit']
   });
 
   child.unref();
-  writePid(child.pid);
+  writePid(child.pid, startPort);
 
   const accessToken = getAccessToken();
-  const startUrl = `http://localhost:${port}/?token=${encodeURIComponent(accessToken)}`;
+  const startUrl = `http://localhost:${startPort}/?token=${encodeURIComponent(accessToken)}`;
   console.log('Server started with PID:', child.pid);
-  console.log(`aetherops is running at http://localhost:${port}`);
+  console.log(`aetherops is running at http://localhost:${startPort}`);
   openBrowser(startUrl);
 }
 
 function stopProject() {
   console.log('Stopping aetherops...');
 
-  // 解析 -p / --port 参数（与 start 保持一致）
-  let port = 9801;
-  const portIndex = commandArgs.findIndex(arg => arg === '-p' || arg === '--port');
-  if (portIndex !== -1 && commandArgs[portIndex + 1]) {
-    const p = parseInt(commandArgs[portIndex + 1]);
-    if (!isNaN(p)) port = p;
-  }
+  // 端口解析与 start 共用同一入口（不再各自写死 9801）
+  const port = resolvePort();
 
   let stopped = false;
 
   // 1) 优先用 PID 文件
-  const pid = readPid();
+  const pid = readPid(port);
   if (pid) {
     try {
       process.kill(pid, 'SIGTERM');
@@ -201,7 +232,7 @@ function stopProject() {
     }
   }
 
-  // 2) 兜底：查找监听该端口的 node server.js 进程（PID 文件丢失/跨用户/进程已变均适用）
+  // 2) 兜底：查找监听该端口的进程（PID 文件丢失/跨用户/进程已变均适用）
   const portPids = findPidsByPort(port);
   for (const p of portPids) {
     try {
@@ -215,9 +246,8 @@ function stopProject() {
     }
   }
 
-  // 3) 清理所有已知位置的 PID 文件（root 与普通用户），避免跨用户遗留
-  deletePid();
-  try { fs.unlinkSync('/root/.aetherops/aetherops.server.pid'); } catch { /* ignore */ }
+  // 3) 清理本端口的 PID 文件，避免下次 start 误判
+  deletePid(port);
 
   if (stopped) {
     console.log('Server stopped');
@@ -226,9 +256,24 @@ function stopProject() {
   }
 }
 
-// 通过 lsof 查找监听指定端口的进程 PID 列表（macOS / Linux 通用）
+// 查找监听指定端口的进程 PID（Windows 用 netstat，其余平台用 lsof）
 function findPidsByPort(port) {
   const pids = new Set();
+  if (process.platform === 'win32') {
+    try {
+      // netstat -ano 行形如：  TCP  0.0.0.0:9802  0.0.0.0:0  LISTENING  1234
+      const out = execSync(`netstat -ano -p tcp`, { encoding: 'utf8' });
+      for (const line of out.split('\n')) {
+        const cols = line.trim().split(/\s+/);
+        if (cols.length < 5 || cols[3].toUpperCase() !== 'LISTENING') continue;
+        if (cols[1].endsWith(':' + port)) {
+          const p = parseInt(cols[4]);
+          if (!Number.isNaN(p) && p !== process.pid) pids.add(p);
+        }
+      }
+    } catch { /* netstat 不可用或无可匹配进程 */ }
+    return [...pids];
+  }
   try {
     const out = execSync(`lsof -tiTCP:${port} -sTCP:LISTEN 2>/dev/null`).toString().trim();
     if (out) {
@@ -243,8 +288,9 @@ function findPidsByPort(port) {
 
 function restartProject() {
   stopProject();
+  const port = resolvePort();
   for (let i = 0; i < 10; i++) {
-    if (!readPid()) break;
+    if (!readPid(port)) break;
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
   }
   startProject();

@@ -54,6 +54,14 @@ COPY --from=build-stage /app/patches ./patches
 COPY --from=build-stage /app/server.js ./server.js
 COPY --from=build-stage /app/bin ./bin
 COPY --from=build-stage /app/public ./public
+# 内置技能：SkillService 从 process.cwd()/data/skills 读取（容器内 cwd = /app），
+# 不拷进来会导致镜像里的技能列表为空，只剩用户自己写在数据目录下的技能
+COPY --from=build-stage /app/data/skills ./data/skills
+
+# 数据默认落在 $HOME/.aetherops（本镜像即 /root/.aetherops，含 config.json、连接配置、
+# 加密密钥、审计日志）。声明 VOLUME 后，即使忘记 -v，数据也进命名卷而不是容器可写层，
+# 不会因容器重建被静默丢弃。若用 AETHEROPS_DATA_DIR 改了路径，就要改成挂那个路径。
+VOLUME ["/root/.aetherops"]
 
 # 暴露端口
 EXPOSE 9802

@@ -8,6 +8,8 @@ const WebSocket = require('ws');
 
 // 统一数据目录管理（所有写入文件必须通过此模块获取路径）
 const { ensureDataDir, getDataPath } = require('./dist/server/utils/data-dir');
+// 统一配置入口：优先级 环境变量 > ~/.aetherops/config.json > 内置默认值
+const { loadConfig, validateConfig, describeDatabase, getConfigPath } = require('./dist/server/utils/config');
 const {
   getAccessToken,
   getCookieHeader,
@@ -19,6 +21,25 @@ const {
   maxUploadBytes,
 } = require('./dist/server/utils/security');
 const dataDir = ensureDataDir();
+
+// 配置文件损坏（非法 JSON 等）必须立即退出：继续跑等于拿默认空配置去连库
+let appConfig;
+try {
+  appConfig = loadConfig();
+} catch (err) {
+  console.error('[FATAL] 配置加载失败:', err.message);
+  process.exit(1);
+}
+// 数据库配置缺失先只告警：此时存储层尚未切到 MySQL，硬拦会把整个应用拒在门外。
+// DB 接入层落地后（server/db）改为启动即校验失败退出。
+const configProblems = validateConfig(appConfig);
+if (configProblems.length) {
+  console.warn('[config] 数据库配置不完整: ' + configProblems.join('; '));
+  console.warn('[config] 请编辑 ' + getConfigPath());
+} else {
+  console.log('[config] database -> ' + describeDatabase(appConfig.database));
+}
+
 const accessToken = getAccessToken();
 const uploadLimitBytes = maxUploadBytes();
 
@@ -107,7 +128,7 @@ app.use((req, res, next) => {
 // 健康检查端点：供 VSCode 扩展探活。若设置了启动令牌，则必须携带正确 token，
 // 避免端口被其它无关进程占用时被误判为服务已就绪。
 app.get('/health', (req, res) => {
-  const tok = process.env.AETHEROPS_LAUNCH_TOKEN;
+  const tok = appConfig.auth.launchToken;
   if (tok) {
     const q = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams.get('token');
     if (q !== tok) {
@@ -659,9 +680,10 @@ for (let i = 0; i < process.argv.length; i++) {
   }
 }
 
-// 启动服务器
-const PORT = portFromArgs || process.env.PORT || 9802;
-const HOST = process.env.HOST || process.env.AETHEROPS_HOST || '127.0.0.1';
+// 启动服务器（优先级：命令行参数 > 环境变量 > 配置文件 > 默认值；
+// 后三层已由 config 模块合并完毕）
+const PORT = portFromArgs || appConfig.server.port;
+const HOST = appConfig.server.host;
 
 // PID 文件路径：按端口区分，避免多实例（桌面端 / CLI / 多个 VSCode 窗口）互相覆盖
 // （多个进程监听不同端口，共用同一数据目录时，同名 PID 文件会导致 stop 杀错对象）

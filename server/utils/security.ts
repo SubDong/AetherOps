@@ -2,16 +2,23 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getDataPath, ensureDataDir } from './data-dir';
+import { loadConfig } from './config';
 
 const TOKEN_FILE = 'access-token';
 const COOKIE_NAME = 'aetherops_token';
 
 export function isAuthDisabled(): boolean {
-  return process.env.AETHEROPS_AUTH_DISABLED === '1' || process.env.AETHEROPS_AUTH_DISABLED === 'true';
+  return loadConfig().auth.disabled;
 }
 
+/**
+ * 访问令牌：优先取配置（环境变量 AETHEROPS_ACCESS_TOKEN 或 config.json 的 auth.accessToken），
+ * 都没配则生成一个并落盘（生成的仍然写到 access-token 文件，不把随机值回写进配置，
+ * 避免用户手改配置时被随机令牌干扰）。
+ */
 export function getAccessToken(): string {
-  if (process.env.AETHEROPS_ACCESS_TOKEN) return process.env.AETHEROPS_ACCESS_TOKEN;
+  const configured = loadConfig().auth.accessToken;
+  if (configured) return configured;
   ensureDataDir();
   const tokenPath = getDataPath(TOKEN_FILE);
   try {
@@ -119,9 +126,9 @@ export function normalizeUploadName(name: string): string {
 }
 
 export function maxUploadBytes(): number {
-  const value = Number(process.env.AETHEROPS_MAX_UPLOAD_MB || 100);
-  const mb = Number.isFinite(value) && value > 0 ? value : 100;
-  return Math.floor(mb * 1024 * 1024);
+  // 上限已由 config 层统一解析（含类型纠正），这里只做字节换算与下限保护
+  const mb = loadConfig().auth.maxUploadMb;
+  return Math.floor((Number.isFinite(mb) && mb > 0 ? mb : 100) * 1024 * 1024);
 }
 
 export function safeJoinInside(baseDir: string, ...segments: string[]): string {

@@ -57,6 +57,10 @@ docker run -d \
   aetherops
 ```
 
+> 镜像已声明 `VOLUME /root/.aetherops`，所以忘写 `-v` 时数据会落到自动创建的匿名卷里，
+> 不会随容器重建消失；但匿名卷不好备份，生产环境仍建议像上面那样显式绑定目录。
+> 若设了 `AETHEROPS_DATA_DIR`，挂载路径要跟着改。
+
 ### Docker Compose
 
 ```yaml
@@ -82,10 +86,12 @@ docker-compose up -d
 
 项目使用多阶段构建：
 
-1. **构建阶段**：基于 `node:22-alpine`，安装编译工具 + pnpm，执行 `pnpm install` 和 `pnpm build`
-2. **生产阶段**：基于 `node:22-alpine`，仅复制构建产物和运行时依赖，执行 `pnpm prune --prod` 清理开发依赖
+1. **构建阶段**：基于 `node:22-slim`，换阿里云 Debian 源，安装编译工具（python3 / make / g++）+ pnpm 9，执行 `pnpm install` 和 `pnpm run build`
+2. **生产阶段**：基于 `node:22-slim`，只拷 `dist`、`node_modules`、`server.js`、`bin`、`public`、`data/skills` 等运行所需文件
 
-数据持久化在 `/root/.aetherops`，通过 volume 挂载保留。
+数据持久化在 `/root/.aetherops`（即容器内的 `~/.aetherops`），通过 volume 挂载保留；
+`data/skills` 是内置技能目录，服务端按 `process.cwd()/data/skills` 读取，与数据目录无关。
+镜像内置 `HOST=0.0.0.0`、`TZ=Asia/Shanghai`、`NODE_ENV=production`。
 
 ### 环境变量
 
@@ -94,6 +100,9 @@ docker-compose up -d
 | `PORT` | 监听端口（`--port` / `-p` 参数优先级更高） | `9802` |
 | `HOST` / `AETHEROPS_HOST` | 监听地址；`HOST` 优先，两者都未设则只绑本机 | `127.0.0.1` |
 | `AETHEROPS_DATA_DIR` | 自定义数据存储目录；设置后**不会**执行 `~/.aicmd` 旧目录自动迁移 | `~/.aetherops` |
+| `AETHEROPS_CONFIG` | 直接指定配置文件路径（绝对路径，或相对当前工作目录）。设置后**不再**读写数据目录下的 `config.json`，也不会在那边生成模板；指错路径会直接报错退出 | 未设 |
+| `AETHEROPS_DB_HOST` / `AETHEROPS_DB_PORT` / `AETHEROPS_DB_USER` / `AETHEROPS_DB_PASSWORD` / `AETHEROPS_DB_NAME` | 覆盖 `config.json` 里 `database` 段的对应项，用于不想把密码落盘的场景 | 主机/账号/密码为空，库名 `aetherops` |
+| `AETHEROPS_DB_POOL_SIZE` / `AETHEROPS_DB_SSL` / `AETHEROPS_DB_TZ` | 连接池上限 / 是否走 TLS / 驱动时区 | `10` / 未设 / `+00:00` |
 | `AETHEROPS_ACCESS_TOKEN` | 固定访问令牌；未设置则每次启动随机生成并打印到日志 | 随机生成 |
 | `AETHEROPS_AUTH_DISABLED` | 设为 `1` / `true` 关闭令牌校验。仅适用于内网临时调试，对外暴露等于无认证 | 未设 |
 | `AETHEROPS_MAX_UPLOAD_MB` | 单次文件上传上限（同时决定 WS `maxPayload`） | `100` |
@@ -232,14 +241,19 @@ git push origin v0.1.6
 
 ```
 ~/.aetherops/
+├── config.json         # 配置文件（首次启动自动生成，权限 0600）
 ├── connections.json    # SSH 连接配置
+├── connections.key     # 上述敏感字段的加密密钥
 ├── sessions.json       # 终端会话状态
 ├── ai-config.json      # AI 配置（API Key、模型等）
+├── ai-config.key       # AI 配置的加密密钥
 ├── ai-history/         # 聊天历史
 ├── audit/              # 审计日志（按日分文件）
 │   └── 2025-06-01.jsonl
 ├── skills/             # 用户自定义技能
 │   └── my-deploy.md
+├── access-token        # 未固定令牌时的随机访问令牌
+├── server.log          # 服务端日志
 └── .trash/             # 回收站
 ```
 
@@ -248,6 +262,24 @@ git push origin v0.1.6
 ```bash
 AETHEROPS_DATA_DIR=/data/aetherops node server.js
 ```
+
+## 配置文件
+
+`~/.aetherops/config.json` 是本项目唯一的配置文件，首次启动时自动生成模板，分四段：
+
+| 段 | 作用 |
+|------|------|
+| `server` | 监听端口与地址（对应 `PORT` / `HOST`） |
+| `database` | MySQL 连接参数（主机/端口/账号密码/库名/连接池），待存储层接入后生效 |
+| `auth` | 令牌开关、上传上限 |
+| `debug` | SSH 调试输出转发 |
+
+优先级：内置默认值 < 配置文件 < 环境变量。因此同一份镜像可以用环境变量临时改行为，
+不必动盘上的文件；把密码写在配置文件里则重启后仍然有效。
+
+环境变量命名见上文 `AETHEROPS_DB_*` / `AETHEROPS_ACCESS_TOKEN` 等条目。文件内容写坏（不是
+合法 JSON）会直接报错退出，不会静默回到默认值；`database` 段填写完成后，日志会打印
+一行 `user@host:port/dbname` 的连接摘要（不含密码）以便确认到底读到了哪份配置。
 
 ## 反向代理
 
