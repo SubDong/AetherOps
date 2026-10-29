@@ -1,0 +1,1585 @@
+<template>
+  <div class="terminal-wrapper" ref="terminalWrapper">
+    <!-- 文件管理器面板（左侧） -->
+    <div v-if="showFileManager && status === 'connected'" class="file-manager-wrapper" :style="{ width: fmWidth + 'px' }">
+      <div class="fm-resize-handle" @mousedown="startFmResize"></div>
+      <FileManager
+        :sessionId="sessionId || tabId"
+        @close="showFileManager = false"
+      />
+    </div>
+
+    <div class="terminal-container" ref="terminalContainer"></div>
+
+    <!-- 文件传输浮动面板 -->
+    <FileTransfer ref="fileTransferRef" />
+
+    <!-- AI 按钮 -->
+    <button
+      v-if="status === 'connected'"
+      class="ai-toggle-btn"
+      :class="{ active: showAIChat }"
+      :style="showAIChat ? { right: (aiChatWidth + 12) + 'px' } : {}"
+      @click="toggleAIChat"
+      :title="t('ai.chat')"
+    >
+      <i class="bi bi-robot"></i>
+    </button>
+
+    <!-- 文件管理器按钮 -->
+    <button
+      v-if="status === 'connected'"
+      class="ai-toggle-btn"
+      :class="{ active: showFileManager }"
+      :style="showAIChat ? { right: (aiChatWidth + 52) + 'px' } : { right: '52px' }"
+      @click="showFileManager = !showFileManager"
+      :title="t('fileManager.title')"
+    >
+      <i class="bi bi-folder2-open"></i>
+    </button>
+
+    <!-- 命令片段按钮 -->
+    <button
+      v-if="status === 'connected'"
+      class="ai-toggle-btn snippet-toggle-btn"
+      :class="{ active: showSnippets }"
+      :style="showAIChat ? { right: (aiChatWidth + 92) + 'px' } : { right: '92px' }"
+      @click="showSnippets = !showSnippets"
+      :title="t('snippet.title')"
+    >
+      <i class="bi bi-lightning-charge"></i>
+    </button>
+
+    <!-- 命令片段面板 -->
+    <div
+      v-if="showSnippets"
+      class="snippet-popover"
+      :style="{ right: showAIChat ? (aiChatWidth + 12) + 'px' : '12px' }"
+    >
+      <SnippetPanel @run="handleSnippetRun" @close="showSnippets = false" />
+    </div>
+
+    <!-- 终端搜索按钮 -->
+    <button
+      v-if="status === 'connected'"
+      class="ai-toggle-btn"
+      :class="{ active: showSearch }"
+      :style="showAIChat ? { right: (aiChatWidth + 132) + 'px' } : { right: '132px' }"
+      @click="showSearch ? closeSearch() : openSearch()"
+      :title="t('search.title') + ' (Ctrl+F)'"
+    >
+      <i class="bi bi-search"></i>
+    </button>
+
+    <!-- 终端搜索条 -->
+    <div v-if="showSearch" class="terminal-search-bar">
+      <i class="bi bi-search"></i>
+      <input
+        ref="searchInputRef"
+        v-model="searchQuery"
+        type="text"
+        class="terminal-search-input"
+        :placeholder="t('search.placeholder')"
+        @input="handleSearchInput"
+        @keydown="handleSearchKeydown"
+      />
+      <button class="search-nav-btn" :title="t('search.prev')" @click="handleSearchNav('prev')">
+        <i class="bi bi-chevron-up"></i>
+      </button>
+      <button class="search-nav-btn" :title="t('search.next')" @click="handleSearchNav('next')">
+        <i class="bi bi-chevron-down"></i>
+      </button>
+      <button class="search-nav-btn" :title="t('common.close')" @click="closeSearch">
+        <i class="bi bi-x-lg"></i>
+      </button>
+    </div>
+
+    <!-- AI 对话面板 -->
+    <div v-show="showAIChat" class="ai-chat-wrapper" :style="{ width: aiChatWidth + 'px' }" ref="aiChatWrapperRef">
+      <div class="ai-resize-handle" @mousedown="startResize"></div>
+      <AIChat
+        ref="aiChatRef"
+        :sessionId="sessionId || tabId"
+        :sessionName="props.connection.name"
+        :connectionId="props.connection.id"
+        :isOpen="showAIChat"
+        :getTerminalContext="getTerminalContext"
+        @close="showAIChat = false"
+        @ws-send="handleAISend"
+        @terminal-command="handleTerminalCommand"
+        @open-settings="$emit('open-ai-settings')"
+      />
+    </div>
+
+    <!-- 终端右键上下文菜单 -->
+    <div 
+      v-if="contextMenuVisible" 
+      class="terminal-context-menu"
+      :style="{ left: contextMenuX + 'px', top: contextMenuY + 'px' }"
+      @click.stop
+    >
+      <div class="context-menu-item" @click="handleContextCopy">
+        <i class="bi bi-clipboard"></i>{{ t('context.copy') || 'Copy' }}
+      </div>
+      <div class="context-menu-item" @click="handleContextPaste">
+        <i class="bi bi-clipboard-check"></i>{{ t('context.paste') || 'Paste' }}
+      </div>
+      <div class="context-menu-item" @click="handleContextSelectAll">
+        <i class="bi bi-textarea-t"></i>{{ t('context.selectAll') || 'Select All' }}
+      </div>
+      <div class="context-menu-item" @click="handleContextCopyAll">
+        <i class="bi bi-clipboard-data"></i>{{ t('context.copyAll') || 'Copy All Output' }}
+      </div>
+      <div class="context-menu-item" @click="handleContextClear">
+        <i class="bi bi-eraser"></i>{{ t('context.clear') || 'Clear' }}
+      </div>
+      <div class="context-menu-item" @click="handleContextReconnect">
+        <i class="bi bi-arrow-repeat"></i>{{ t('context.reconnect') || 'Reconnect' }}
+      </div>
+    </div>
+  </div>
+</template>
+
+<script lang="ts" setup>
+import { ref, onMounted, onBeforeUnmount, watch, nextTick } from 'vue';
+import { useI18n } from 'vue-i18n';
+import { Terminal } from '@xterm/xterm';
+import { FitAddon } from '@xterm/addon-fit';
+import { WebLinksAddon } from '@xterm/addon-web-links';
+import { SearchAddon } from '@xterm/addon-search';
+import '@xterm/xterm/css/xterm.css';
+import type { ConnectionEntity, WSMessage } from '@/typings/connection';
+import { createSentry, base64ToOctets, stringToOctets, octetsToBase64, Zmodem } from '@/utils/zmodem';
+import AIChat from '@/components/ai-chat/index.vue';
+import FileTransfer from '@/components/file-transfer.vue';
+import FileManager from '@/components/file-manager.vue';
+import SnippetPanel from '@/components/snippet-panel.vue';
+import {
+  TERMINAL_THEME_DARK,
+  TERMINAL_THEME_LIGHT,
+  buildVscodeTerminalTheme,
+  onVscodeThemeChange,
+} from '@/utils/vscode-theme';
+import {
+  writeClipboard,
+  readClipboard,
+} from '@/utils/vscode-clipboard';
+
+const { t } = useI18n();
+
+const props = defineProps<{
+  tabId: string;
+  connection: ConnectionEntity;
+  active: boolean;
+}>();
+
+const emit = defineEmits<{
+  (e: 'status-change', status: 'connecting' | 'connected' | 'disconnected' | 'error' | 'reconnecting', sessionId?: string): void;
+  (e: 'zmodem-detected', detection: any): void;
+  (e: 'open-ai-settings'): void;
+}>();
+
+const terminalWrapper = ref<HTMLElement>();
+const terminalContainer = ref<HTMLElement>();
+const fileTransferRef = ref<InstanceType<typeof FileTransfer>>();
+const status = ref<'connecting' | 'connected' | 'disconnected' | 'error' | 'reconnecting'>('connecting');
+const errorMessage = ref('');
+
+// AI 聊天相关
+const showAIChat = ref(false);
+const aiChatRef = ref<InstanceType<typeof AIChat>>();
+
+// 文件管理器相关
+const showFileManager = ref(false);
+const fmWidth = ref(360);
+const FM_MIN_WIDTH = 280;
+const FM_MAX_WIDTH_RATIO = 0.5;
+
+// 命令片段相关
+const showSnippets = ref(false);
+
+// 终端搜索相关
+const showSearch = ref(false);
+const searchQuery = ref('');
+const searchInputRef = ref<HTMLInputElement>();
+let searchAddon: SearchAddon | null = null;
+
+function startFmResize(e: MouseEvent) {
+  e.preventDefault();
+  const startX = e.clientX;
+  const startWidth = fmWidth.value;
+  const containerWidth = terminalWrapper.value?.clientWidth || 800;
+  const maxWidth = containerWidth * FM_MAX_WIDTH_RATIO;
+
+  const onMouseMove = (ev: MouseEvent) => {
+    const delta = ev.clientX - startX; // 向右拖 = 宽度增加
+    const newWidth = Math.min(Math.max(startWidth + delta, FM_MIN_WIDTH), maxWidth);
+    fmWidth.value = newWidth;
+  };
+
+  const onMouseUp = () => {
+    document.removeEventListener('mousemove', onMouseMove);
+    document.removeEventListener('mouseup', onMouseUp);
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  };
+
+  document.addEventListener('mousemove', onMouseMove);
+  document.addEventListener('mouseup', onMouseUp);
+  document.body.style.cursor = 'col-resize';
+  document.body.style.userSelect = 'none';
+}
+
+/** 显示文件传输浮动面板 */
+function showFileTransfer(info?: any) {
+  const termRef = {
+    sessionId: sessionId,
+    sendToServer,
+    getCurrentCwd: inferCurrentCwdFromTerminal,
+  };
+  fileTransferRef.value?.show(props.tabId, termRef, info);
+}
+
+function inferCurrentCwdFromTerminal(): string {
+  if (!terminal) return '';
+  const buffer = terminal.buffer.active;
+  const lines: string[] = [];
+  const start = Math.max(0, buffer.baseY + buffer.cursorY - 80);
+  const end = buffer.baseY + buffer.cursorY;
+  for (let i = start; i <= end; i++) {
+    const line = buffer.getLine(i)?.translateToString(true).trim();
+    if (line) lines.push(line);
+  }
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const userHostPath = line.match(/(?:^|\s)[^\s@]+@[^\s:]+:(\/[^\s#$]+)\s*[#$]\s*$/);
+    if (userHostPath?.[1]) return userHostPath[1];
+
+    const plainPath = line.match(/(?:^|\s)(\/[^\s#$]+)\s*[#$]\s*$/);
+    if (plainPath?.[1]) return plainPath[1];
+  }
+  return '';
+}
+
+let terminal: Terminal | null = null;
+let fitAddon: FitAddon | null = null;
+let ws: WebSocket | null = null;
+let ipcCleanup: (() => void) | null = null;
+let sessionId: string | null = null;
+// 客户端预生成 sessionId，确保 IPC 模式下从一开始就能精确过滤消息
+const pendingSessionId = `ssh-${Date.now()}-${Math.random().toString(36).substr(2, 8)}`;
+let resizeObserver: ResizeObserver | null = null;
+let sentry: any = null;
+let zmodemSession: any = null;
+let zmodemRole: string | null = null; // 'send' | 'receive'
+let offVscodeTheme: (() => void) | null = null; // VSCode 主题变化订阅
+let fileUploadResultCallback: ((msg: WSMessage) => void) | null = null;
+
+/**
+ * 解析终端配色：
+ * 1. 连接显式选择「亮色」时用 Catppuccin Latte；
+ * 2. 在 VSCode 扩展 WebView 中优先跟随 VSCode 主题的终端配色；
+ * 3. 其余情况（桌面端 / 浏览器默认）用 Catppuccin Mocha。
+ */
+function resolveTerminalTheme() {
+  if (props.connection.terminal?.theme === 'light') return TERMINAL_THEME_LIGHT;
+  return buildVscodeTerminalTheme() || TERMINAL_THEME_DARK;
+}
+
+// 初始化终端
+function initTerminal() {
+  if (!terminalContainer.value) return;
+
+  terminal = new Terminal({
+    cols: props.connection.terminal?.cols || 80,
+    rows: props.connection.terminal?.rows || 24,
+    fontSize: props.connection.terminal?.fontSize || 14,
+    fontFamily: props.connection.terminal?.fontFamily || '"JetBrains Mono", "Fira Code", Menlo, Monaco, "Courier New", monospace',
+    theme: resolveTerminalTheme(),
+    cursorStyle: props.connection.terminal?.cursorStyle || 'block',
+    cursorBlink: true,
+    cursorInactiveStyle: 'outline',
+    scrollback: 5000,
+    lineHeight: 1.2,
+    letterSpacing: 0.5,
+    // @ts-ignore
+    wordWrap: true,
+    allowProposedApi: true,
+  });
+
+  fitAddon = new FitAddon();
+  terminal.loadAddon(fitAddon);
+  terminal.loadAddon(new WebLinksAddon());
+  searchAddon = new SearchAddon();
+  terminal.loadAddon(searchAddon);
+
+  terminal.open(terminalContainer.value);
+
+  // 绑定终端右键上下文菜单
+  const termElement = terminalContainer.value?.querySelector('.xterm') as HTMLElement;
+  if (termElement) {
+    termElement.addEventListener('contextmenu', showTerminalContextMenu);
+  }
+
+  // 粘贴去重：记录「最近一次原生 paste 事件」与「最近一次粘贴快捷键」的时间戳。
+  // 部分宿主（VSCode 系 WebView）可能不派发原生 paste 事件，此时由快捷键分支补发一次，
+  // 从而在任何环境下都保证「恰好粘贴一次」：既不重复，也不会完全没反应。
+  let lastNativePasteAt = 0;
+  let lastPasteKeyDownAt = 0;
+
+  // 统一粘贴处理：在捕获阶段拦截终端 textarea 的原生 paste 事件，
+  // 直接从 e.clipboardData 同步读取（跨源 webview 亦可，不依赖受限的 navigator.clipboard），
+  // 并阻止事件继续传播到 xterm 的默认粘贴监听，从根上避免 Ctrl/Cmd+V 重复粘贴。
+  if (terminalContainer.value) {
+    terminalContainer.value.addEventListener('paste', (e: ClipboardEvent) => {
+      lastNativePasteAt = Date.now();
+      if (e.defaultPrevented) return; // 已被上层（如全局剪贴板桥接）接管，跳过
+      e.preventDefault();
+      e.stopPropagation();
+      const text = e.clipboardData?.getData('text/plain') || '';
+      if (text) {
+        pasteToTerminal(text);
+      } else {
+        // 极端情况下 e.clipboardData 为空，回退到桥接读取
+        readClipboard().then((t) => { if (t) pasteToTerminal(t); }).catch(() => {});
+      }
+    }, true);
+  }
+
+  // 自适应大小
+  nextTick(() => {
+    fitAddon?.fit();
+  });
+
+  // 监听用户输入
+  terminal.onData((data) => {
+    sendToServer({ type: 'terminal', sessionId: sessionId || pendingSessionId, data });
+  });
+
+  // 监听二进制数据
+  terminal.onBinary((data) => {
+    sendToServer({ type: 'terminal', sessionId: sessionId || pendingSessionId, data });
+  });
+
+  // 监听大小变化
+  terminal.onResize(({ cols, rows }) => {
+    sendToServer({ type: 'resize', sessionId: sessionId || pendingSessionId, data: { cols, rows } });
+  });
+
+  // 拦截复制/粘贴快捷键
+  // contextIsolation 下 navigator.clipboard 不可用，需通过 preload clipboard API
+  // 支持两套快捷键：
+  //   1. 标准快捷键：Ctrl+C / Ctrl+V（有选中时复制，无选中时放行给终端作 SIGINT）
+  //   2. 终端传统：Ctrl+Shift+C / Ctrl+Shift+V（始终复制/粘贴）
+  terminal.attachCustomKeyEventHandler((event: KeyboardEvent) => {
+    const isMac = (window as any).electronAPI?.platform === 'darwin' || navigator.platform.includes('Mac');
+    const modKey = isMac ? event.metaKey : event.ctrlKey;
+    const key = event.key.toLowerCase();
+
+    // ===== 终端搜索快捷键：Ctrl/Cmd+F 开搜索条，Esc 关（搜索条打开时） =====
+    if (event.type === 'keydown' && !event.altKey) {
+      if (modKey && key === 'f') {
+        openSearch();
+        return false;
+      }
+      if (event.key === 'Escape' && showSearch.value) {
+        closeSearch();
+        return false;
+      }
+    }
+
+    // 判断是否为复制/粘贴触发键
+    const isCopyTrigger = modKey && key === 'c';
+    const isPasteTrigger = modKey && key === 'v';
+
+    if (!isCopyTrigger && !isPasteTrigger) return true; // 其他按键放行
+
+    const hasSelection = !!(terminal && terminal.getSelection());
+
+    // ===== 复制 =====
+    if (isCopyTrigger) {
+      if (hasSelection) {
+        // 有选中文本 → 执行复制（无论是否按了 Shift）
+        const text = terminal!.getSelection();
+        writeClipboard(text).catch(() => {});
+        return false; // 阻止 xterm.js 处理
+      }
+      // 无选中文本：
+      // - 如果按了 Shift（Ctrl+Shift+C），显式复制空文本（无操作）
+      // - 如果没有 Shift（纯 Ctrl+C），放行给终端（发送 SIGINT）
+      if (event.shiftKey) return false;
+      return true; // 放行 Ctrl+C → SIGINT
+    }
+
+    // ===== 粘贴 =====
+    if (isPasteTrigger) {
+      // 优先由 initTerminal 中注册的「捕获阶段 paste 监听」处理（即时、同步读取 clipboardData）。
+      // 但部分宿主会吞掉 keydown 的默认粘贴动作导致原生 paste 事件根本不派发，
+      // 那样会造成「完全粘贴不了」。因此这里补一道保险：
+      // 若该窗口期内没有原生 paste 事件到来，则延时经桥接补发一次。
+      // 两条路径互斥（依据 lastNativePasteAt 时间戳去重），保证恰好粘贴一次。
+      lastPasteKeyDownAt = Date.now();
+      const kbAt = lastPasteKeyDownAt;
+      setTimeout(() => {
+        if (lastNativePasteAt >= kbAt) return; // 原生 paste 事件已处理，跳过补发
+        readClipboard()
+          .then((text) => { if (text) pasteToTerminal(text); })
+          .catch(() => {});
+      }, 150);
+      return false; // 阻止 xterm 把该组合键当作普通按键输入（避免插入字面 '^V'）
+    }
+
+    return true;
+  });
+
+  // 初始化 ZMODEM Sentry
+  initSentry();
+}
+
+// 初始化 ZMODEM Sentry
+function initSentry() {
+  console.log('[ZMODEM] Initializing Sentry...');
+  sentry = createSentry({
+    toTerminal: (octets: number[]) => {
+      // 将 octets 写入终端
+      if (terminal && octets.length > 0) {
+        // 调试：检查写入终端的数据是否包含 ZMODEM 特征
+        const hasZm = octets.length >= 4 && octets.some((_, i) =>
+          i + 3 < octets.length &&
+          octets[i] === 42 && octets[i+1] === 42 && octets[i+2] === 24 && octets[i+3] === 66
+        );
+        if (hasZm) {
+          console.warn('[ZMODEM] !!! Sentry passed ZMODEM bytes to terminal! length:', octets.length,
+            'bytes:', octets.slice(0, 30).join(','));
+        }
+        terminal.write(new Uint8Array(octets));
+      }
+    },
+    sender: (octets: number[]) => {
+      // 将 ZMODEM 协议数据发送到服务器（base64 编码）
+      const b64 = octetsToBase64(octets);
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'terminal',
+          sessionId: sessionId || pendingSessionId,
+          data: b64,
+          binary: true,
+        }));
+      }
+    },
+    onDetect: (detection: any) => {
+      const role = detection.get_session_role();
+      console.log('[ZMODEM] >>>> onDetect fired! role:', role, 'existingSession:', !!zmodemSession);
+
+      // 【关键防护】如果已有活跃 ZMODEM session，忽略新的检测
+      // 原因：rz 时浏览器发送 ZRINIT 回应，PTY 可能回显 ZRINIT 字节
+      // sentry 会把回显的 ZRINIT 误检为 Session.Send（role='send'），
+      // 覆盖正确的 Session.Receive（role='receive'）
+      if (zmodemSession) {
+        console.warn('[ZMODEM] Ignoring duplicate detection (role:', role, '), session already active');
+        try { detection.deny(); } catch(_e) { /* ignore */ }
+        return;
+      }
+
+      console.log('[ZMODEM] Detected:', role, '- auto-confirming immediately');
+
+      // 立即 confirm，防止后续 ZRQINIT/ZRINIT 导致 detection 变 stale
+      try {
+        const session = detection.confirm();
+        zmodemSession = session;
+        zmodemRole = role;
+
+        // 【关键补丁1】预注册所有可能的事件类型，防止 "Bad event" 异常
+        // Session.Send 没有注册 'offer' 等事件，如果意外触发会崩溃
+        const neededEvents = ['offer', 'data_in', 'file_end'];
+        for (const evt of neededEvents) {
+          if (!session._on_evt || session._on_evt[evt] === undefined) {
+            console.log('[ZMODEM] Pre-registering missing event:', evt);
+            try { session._Add_event(evt); } catch(_e) { /* ignore */ }
+          }
+        }
+
+        // 【关键补丁2】包装 session.consume 以安全处理事件时序问题
+        const _origSessionConsume = session.consume.bind(session);
+        const _eventBuffer: Array<{evt: string, args: any[]}> = [];
+        let _handlersReady = false;
+
+        // 包装 _Happen 来缓存或安全忽略早期事件
+        const _origHappen = session._Happen.bind(session);
+        session._Happen = function(this: any, evt: string, ...args: any[]) {
+          if (!_handlersReady) {
+            // handlers 尚未注册，缓存事件
+            console.log('[ZMODEM] Early event (buffering):', evt);
+            _eventBuffer.push({ evt, args });
+            return;
+          }
+          return _origHappen(evt, ...args);
+        };
+
+        // 包装 consume 捕获任何未处理的异常
+        session.consume = function(octets: number[]) {
+          try {
+            return _origSessionConsume(octets);
+          } catch (err: any) {
+            console.warn('[ZMODEM] session.consume() error (caught):', err);
+          }
+        };
+
+        // 监听 session 结束，清理状态以便下次检测
+        // 直接包装内部方法，不走 _Happen 事件系统，确保不被缓冲
+        const _origOnSessionEnd = session._on_session_end?.bind(session);
+        if (_origOnSessionEnd) {
+          session._on_session_end = function() {
+            console.log('[ZMODEM] Session ended, cleaning up state');
+            zmodemSession = null;
+            zmodemRole = null;
+            return _origOnSessionEnd();
+          };
+        }
+
+        // 通知 file-transfer 组件时，传递一个 replay 函数
+        // 当 handlers 注册完毕后调用，重放缓存的事件
+        const markHandlersReady = () => {
+          _handlersReady = true;
+          console.log('[ZMODEM] Handlers ready, replaying', _eventBuffer.length, 'buffered events');
+          for (const item of _eventBuffer) {
+            try {
+              _origHappen(item.evt, ...item.args);
+            } catch (e) {
+              console.warn('[ZMODEM] Replay error for', item.evt, ':', e);
+            }
+          }
+          _eventBuffer.length = 0;
+        };
+
+        if (role === 'send') {
+          // zmodem.js: ZRINIT → Session.Send → role='send'
+          // rz 发送 ZRINIT，浏览器应上传文件
+          console.log('[ZMODEM] rz detected (ZRINIT) - browser will send files');
+          emit('zmodem-detected', { role, session, markHandlersReady });
+          showFileTransfer({ role, session, markHandlersReady });
+        } else {
+          // zmodem.js: ZRQINIT → Session.Receive → role='receive'
+          // sz 发送 ZRQINIT，浏览器应下载文件
+          console.log('[ZMODEM] sz detected (ZRQINIT) - browser will receive files');
+          emit('zmodem-detected', { role, session, markHandlersReady });
+          showFileTransfer({ role, session, markHandlersReady });
+        }
+      } catch (err) {
+        console.error('[ZMODEM] Auto-confirm error:', err);
+        zmodemSession = null;
+        zmodemRole = null;
+      }
+    },
+    onRetract: () => {
+      console.log('[ZMODEM] Retracted - detection invalidated');
+      // 只在没有已确认 session 时清理（retract 只影响 pending detection）
+      if (!zmodemSession) {
+        zmodemRole = null;
+      }
+    },
+  });
+  console.log('[ZMODEM] Sentry initialized:', !!sentry);
+}
+
+// 检测是否在 Electron 生产模式中（桌面客户端生产模式用 IPC，开发模式/Web 端用 WebSocket）
+function isElectronIPC(): boolean {
+  return !!((window as any).electronAPI?.isElectron && (window as any).electronAPI?.isPackaged);
+}
+
+/**
+ * IPC 适配器 - 在 Electron 中模拟 WebSocket 接口
+ * 通过 preload 暴露的 terminalIPC 与主进程通信
+ */
+function createIPCAdapter(): WebSocket {
+  const ipc = (window as any).electronAPI.terminalIPC;
+  const adapter: any = {
+    readyState: 1, // OPEN
+    send(msg: string) {
+      ipc.send(JSON.parse(msg));
+    },
+    close() {
+      adapter.readyState = 3; // CLOSED
+      if (adapter.onclose) adapter.onclose({ code: 1000, reason: 'IPC closed' });
+    },
+    onopen: null as any,
+    onmessage: null as any,
+    onerror: null as any,
+    onclose: null as any,
+  };
+
+  // 监听主进程消息
+  const removeListener = ipc.onMessage((msg: any) => {
+    if (adapter.onmessage) {
+      adapter.onmessage({ data: JSON.stringify(msg) });
+    }
+  });
+
+  // 立即触发 onopen（IPC 无需等待连接）
+  setTimeout(() => {
+    if (adapter.onopen) adapter.onopen({});
+  }, 0);
+
+  // 保存清理函数
+  ipcCleanup = () => {
+    removeListener();
+    adapter.readyState = 3;
+  };
+
+  return adapter as WebSocket;
+}
+
+// WebSocket / IPC 连接
+function connectWebSocket() {
+  if (isElectronIPC()) {
+    // Electron（开发/生产均走 IPC）
+    console.log('[TerminalTab] Using Electron IPC');
+    ws = createIPCAdapter();
+  } else {
+    // Web 端：使用 WebSocket
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const token = new URLSearchParams(location.search).get('token');
+    const wsUrl = `${protocol}//${location.host}/ws/terminal${token ? `?token=${encodeURIComponent(token)}` : ''}`;
+    console.log(`[TerminalTab] Connecting to WebSocket: ${wsUrl}`);
+    ws = new WebSocket(wsUrl);
+  }
+
+  ws.onopen = () => {
+    console.log(`[TerminalTab] WebSocket connected, sending create`);
+    // 发送创建会话请求
+    sendToServer({
+      type: 'create',
+      sessionId: pendingSessionId,
+      data: {
+        connectionId: props.connection.id,
+        cols: terminal?.cols || 80,
+        rows: terminal?.rows || 24,
+        name: props.connection.name,
+      }
+    });
+  };
+
+  ws.onmessage = (event) => {
+    const dataStr = typeof event.data === 'string' ? event.data : '[binary]';
+    console.log(`[TerminalTab] WS message:`, dataStr.substring(0, 100));
+    try {
+      const msg: WSMessage = JSON.parse(event.data);
+      handleServerMessage(msg);
+    } catch (e) {
+      console.error('WebSocket message parse error:', e);
+    }
+  };
+
+  ws.onerror = (err) => {
+    console.error('[TerminalTab] WebSocket error:', err);
+    setStatus('error', t('tab.wsFailed'));
+  };
+
+  ws.onclose = (event) => {
+    console.log(`[TerminalTab] WebSocket closed, code: ${event.code}, reason: ${event.reason}`);
+    if (status.value !== 'disconnected' && status.value !== 'reconnecting') {
+      setStatus('disconnected');
+    }
+    // WebSocket 断开后自动尝试重连
+    scheduleReconnect();
+  };
+}
+
+// 重连相关
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_BASE_DELAY = 2000; // 基础延迟 2 秒
+
+function scheduleReconnect() {
+  if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+    console.log('[TerminalTab] Max reconnect attempts reached');
+    if (terminal) {
+      terminal.writeln(`\x1b[31m✗ ${t('tab.maxReconnectReached')}\x1b[0m`);
+    }
+    return;
+  }
+  const delay = RECONNECT_BASE_DELAY * Math.pow(1.5, reconnectAttempts);
+  console.log(`[TerminalTab] Scheduling reconnect in ${delay}ms (attempt ${reconnectAttempts + 1})`);
+  reconnectTimer = setTimeout(() => {
+    reconnect();
+  }, delay);
+}
+
+function reconnect() {
+  // 清除之前的重连定时器
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  console.log('[TerminalTab] Reconnecting...');
+  setStatus('reconnecting');
+  reconnectAttempts++;
+
+  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+    // WebSocket 已断开，重新建立连接
+    connectWebSocket();
+  } else {
+    // WebSocket 还活着，只是 SSH 断开了，发送重连请求
+    sendToServer({
+      type: 'reconnect',
+      sessionId: sessionId || pendingSessionId,
+      data: {
+        connectionId: props.connection.id,
+        cols: terminal?.cols || 80,
+        rows: terminal?.rows || 24,
+        name: props.connection.name,
+      }
+    });
+  }
+}
+
+/** Hex header length (without CR+LF): type(2) + flags(8) + crc(4) = 14 hex chars + 5 prefix = 19, or 18 without CR */
+const ZMODEM_HEX_HEADER_LEN = 19; // with CR before LF
+const ZMODEM_HEX_HEADER_LEN_NO_CR = 18;
+
+/**
+ * 手动检测 ZRQINIT/ZRINIT hex 帧
+ * 搜索 **\x18B0 前缀 + 正确的 hex header 结构（含 CR+LF 校验）
+ */
+function detectZmodemFrame(octets: number[]): { type: 'ZRQINIT' | 'ZRINIT'; offset: number; frameLen: number } | null {
+  for (let i = 0; i <= octets.length - 20; i++) {
+    if (octets[i] === 42 && octets[i+1] === 42 && octets[i+2] === 24 &&
+        octets[i+3] === 66 && octets[i+4] === 48) {
+      // 找到 **\x18B0 前缀，验证 hex header 结构
+      // 在 i+5 开始搜索 CR(0x0d)+LF(0x8a) 或 LF(0x0a)
+      const searchEnd = Math.min(i + 25, octets.length);
+      for (let j = i + 5; j < searchEnd; j++) {
+        if (octets[j] === 0x8a || octets[j] === 0x0a) {
+          // 检查 CR+LF: LF 前一字节应为 CR(0x0d 或 0x8d)
+          const hexLen = j - i; // 从 ** 到 LF(含) 的长度
+          if ((hexLen === ZMODEM_HEX_HEADER_LEN + 1 && (octets[j-1] === 0x0d || octets[j-1] === 0x8d)) ||
+              hexLen === ZMODEM_HEX_HEADER_LEN_NO_CR + 1) {
+            // 有效 hex header! 检查帧类型
+            const frameLen = j - i + 1; // 包含 LF
+            // 可选：也包含尾部 XON (0x11)
+            const totalLen = (j + 1 < octets.length && octets[j+1] === 0x11) ? frameLen + 1 : frameLen;
+            if (octets[i+5] === 48) return { type: 'ZRQINIT', offset: i, frameLen: totalLen };
+            if (octets[i+5] === 49) return { type: 'ZRINIT', offset: i, frameLen: totalLen };
+          }
+          break;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * 手动创建 ZMODEM session 并设置到 sentry
+ * 完全绕过 sentry 的检测机制（因为 Vite 缓存导致 _parse_hex patch 不生效）
+ */
+function createManualSession(type: 'ZRQINIT' | 'ZRINIT', frameOctets: number[]) {
+  let session: any;
+  let role: string;
+
+  if (type === 'ZRQINIT') {
+    // sz 命令发送 ZRQINIT → 远程发送 → 浏览器接收 → Session.Receive
+    session = new (Zmodem.Session as any).Receive();
+    role = 'receive';
+  } else {
+    // rz 命令发送 ZRINIT → 远程接收 → 浏览器发送 → Session.Send
+    session = new (Zmodem.Session as any).Send(
+      Zmodem.Header.build('ZRINIT', ['CANFDX', 'CANOVIO', 'CANFC32'])
+    );
+    role = 'send';
+  }
+
+  zmodemSession = session;
+  zmodemRole = role;
+  console.log('[ZMODEM] Manual session created:', role, '(' + type + ')');
+
+  // 【关键】清理 sentry 内部状态，防止旧缓存数据干扰
+  sentry._cache = [];
+  sentry._parsed_session = null;
+  sentry._zsession = session;
+
+  // 注册 garbage 事件（将非 ZMODEM 数据输出到终端）
+  session.on('garbage', (garbage: number[]) => {
+    if (terminal && garbage.length > 0) {
+      terminal.write(new Uint8Array(garbage));
+    }
+  });
+
+  // session 结束时清理 sentry 和本地状态
+  session.on('session_end', () => {
+    console.log('[ZMODEM] Session ended (via event), cleaning up');
+    sentry._zsession = null;
+    zmodemSession = null;
+    zmodemRole = null;
+  });
+
+  // 设置 sender（将 ZMODEM 协议数据发回远程）
+  session.set_sender((octets: number[]) => {
+    const b64 = octetsToBase64(octets);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({
+        type: 'terminal',
+        sessionId: sessionId || pendingSessionId,
+        data: b64,
+        binary: true,
+      }));
+    }
+  });
+
+  // 预注册 Receive session 才有的事件，防止 Session.Send 被误创建时崩溃
+  const neededEvents = ['offer', 'data_in', 'file_end'];
+  for (const evt of neededEvents) {
+    if (!session._on_evt || session._on_evt[evt] === undefined) {
+      try { session._Add_event(evt); } catch(_e) { /* ignore */ }
+    }
+  }
+
+  // 事件缓冲（handlers 注册前的事件先缓存）
+  const _eventBuffer: Array<{evt: string, args: any[]}> = [];
+  let _handlersReady = false;
+  const _origHappen = session._Happen.bind(session);
+  session._Happen = function(evt: string, ...args: any[]) {
+    if (!_handlersReady) {
+      _eventBuffer.push({ evt, args });
+      return;
+    }
+    return _origHappen(evt, ...args);
+  };
+
+  const _origSessionConsume = session.consume.bind(session);
+  session.consume = function(octets: number[]) {
+    try { return _origSessionConsume(octets); }
+    catch (err: any) {
+      console.warn('[ZMODEM] session.consume() error (caught):', err);
+      throw err; // 重新抛出，让 handleServerMessage 处理
+    }
+  };
+
+  // 包装 _on_session_end 确保状态清理（不走 _Happen 事件系统）
+  const _origOnSessionEnd = session._on_session_end?.bind(session);
+  if (_origOnSessionEnd) {
+    session._on_session_end = function() {
+      console.log('[ZMODEM] _on_session_end called, cleaning up');
+      zmodemSession = null;
+      zmodemRole = null;
+      return _origOnSessionEnd();
+    };
+  }
+
+  const markHandlersReady = () => {
+    _handlersReady = true;
+    console.log('[ZMODEM] Handlers ready, replaying', _eventBuffer.length, 'buffered events');
+    for (const item of _eventBuffer) {
+      try { _origHappen(item.evt, ...item.args); } catch (e) { /* ignore */ }
+    }
+    _eventBuffer.length = 0;
+  };
+
+  // 通知父组件
+  emit('zmodem-detected', { role, session, markHandlersReady });
+  showFileTransfer({ role, session, markHandlersReady });
+}
+
+// 处理服务端消息
+function handleServerMessage(msg: WSMessage) {
+  // 【关键修复】IPC 模式下所有 tab 共享 terminal:event 通道，
+  // 必须按 sessionId 过滤消息，否则一个 tab 的输出会写到其他 tab。
+  // 使用 pendingSessionId（发送 create 时预生成）或 sessionId（status 确认后）进行匹配。
+  const myId = sessionId || pendingSessionId;
+  if (msg.sessionId && myId && msg.sessionId !== myId) {
+    return; // 消息属于其他 session，忽略
+  }
+
+  switch (msg.type) {
+    case 'terminal':
+      if (msg.data && sentry) {
+        let octets: number[];
+        if (msg.binary) {
+          octets = base64ToOctets(msg.data as string);
+        } else {
+          octets = stringToOctets(msg.data as string);
+        }
+        try {
+          // 检查已有 session 是否已结束（例如 ZFIN 后）
+          // 如果已结束，清理状态并将数据直接写到终端
+          if (zmodemSession) {
+            try {
+              if (zmodemSession.has_ended?.()) {
+                console.log('[ZMODEM] Session already ended, cleaning up and passing data to terminal');
+                zmodemSession = null;
+                zmodemRole = null;
+                sentry._zsession = null;
+                sentry._cache = [];
+                if (terminal && octets.length > 0) {
+                  terminal.write(new Uint8Array(octets));
+                }
+                return;
+              }
+            } catch (e) {
+              // has_ended 可能抛异常，忽略
+            }
+          }
+
+          // 【核心修复】zmodem.js 的 _parse_hex 在整个 buffer 中搜索 LF，
+          // 当 ZRQINIT/ZRINIT 帧前面有文本时解析失败。
+          // Vite 缓存导致 node_modules 的 patch 不生效。
+          // 方案：完全绕过 sentry 的检测，手动识别 ZMODEM 帧。
+          if (!zmodemSession) {
+            const frameInfo = detectZmodemFrame(octets);
+            if (frameInfo) {
+              console.log('[ZMODEM] Manual detection:', frameInfo.type,
+                'at offset', frameInfo.offset, 'frameLen:', frameInfo.frameLen);
+              // 将帧前的文本直接写到终端（绕过 sentry）
+              if (frameInfo.offset > 0) {
+                const textPart = octets.slice(0, frameInfo.offset);
+                console.log('[ZMODEM] Writing prefix text to terminal:', textPart.length, 'bytes');
+                if (terminal) terminal.write(new Uint8Array(textPart));
+              }
+              // 提取帧数据
+              const frameData = octets.slice(frameInfo.offset, frameInfo.offset + frameInfo.frameLen);
+              // 手动创建 session（会清理 sentry 缓存并设置 _zsession）
+              createManualSession(frameInfo.type, frameData);
+              // 帧之后的尾部数据（如果有）通过 sentry 路由（现在 _zsession 已设置）
+              const trailing = octets.slice(frameInfo.offset + frameInfo.frameLen);
+              if (trailing.length > 0) {
+                console.log('[ZMODEM] Passing trailing bytes to sentry:', trailing.length);
+                sentry.consume(trailing);
+              }
+              return;
+            }
+            // 没有检测到帧，且没有活跃 session → 正常通过 sentry
+            // （sentry 可能检测到但我们没检测到，让它处理）
+          }
+          sentry.consume(octets);
+        } catch (err: any) {
+          // sentry/session 抛出错误 → 强制清理 ZMODEM 状态并恢复终端
+          console.warn('[ZMODEM] handleServerMessage error, force cleanup:', err?.message || err);
+          zmodemSession = null;
+          zmodemRole = null;
+          try { sentry._zsession = null; sentry._cache = []; sentry._parsed_session = null; } catch (_) { /* ignore */ }
+          if (terminal && octets.length > 0) {
+            terminal.write(new Uint8Array(octets));
+          }
+        }
+      }
+      break;
+
+    case 'status':
+      if (msg.sessionId) {
+        sessionId = msg.sessionId;
+      }
+      if (msg.data === 'connected') {
+        reconnectAttempts = 0; // 重置重连计数
+        setStatus('connected', msg.sessionId);
+      }
+      break;
+
+    case 'close':
+      setStatus('disconnected');
+      break;
+
+    case 'error':
+      setStatus('error', msg.data || '连接失败');
+      break;
+
+    case 'conn-log':
+      // SSH 连接过程日志，直接写入终端（绕过 ZMODEM sentry）
+      if (terminal && msg.data) {
+        terminal.writeln(`\r\n\x1b[36m[SSH] ${msg.data}\x1b[0m`);
+      }
+      break;
+
+    case 'ai-agent-event':
+      // 转发 Agent 事件到 AIChat 组件
+      if (aiChatRef.value && msg.event) {
+        aiChatRef.value.handleAgentEvent(msg.event);
+      }
+      break;
+
+    case 'monitor-event':
+      // 转发监控事件到 AIChat 组件
+      if (aiChatRef.value && msg.event) {
+        aiChatRef.value.handleMonitorEvent(msg.event);
+      }
+      break;
+
+    case 'file-upload-result':
+      // 转发 SFTP 上传结果到 file-transfer 组件
+      if (fileUploadResultCallback) {
+        fileUploadResultCallback(msg);
+      }
+      break;
+  }
+}
+
+// 发送消息到服务端
+function sendToServer(msg: WSMessage) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+// 把文本作为粘贴内容发送到终端
+function pasteToTerminal(text: string) {
+  sendToServer({ type: 'terminal', sessionId: sessionId || pendingSessionId, data: text });
+}
+
+// 将状态信息写入终端信息流
+function writeStatusToTerminal(s: typeof status.value, detail?: string) {
+  if (!terminal) return;
+  const host = props.connection.host || '';
+  switch (s) {
+    case 'connecting':
+      terminal.writeln(`\r\n\x1b[33m⚡ ${t('tab.connectingTo', { host })}\x1b[0m`);
+      break;
+    case 'connected':
+      // 连接成功的详细信息已由服务端推送，此处不再重复输出
+      break;
+    case 'error':
+      terminal.writeln(`\x1b[31m✗ ${t('tab.connectionFailed')}: ${detail || errorMessage.value}\x1b[0m`);
+      break;
+    case 'disconnected':
+      terminal.writeln(`\x1b[90m⚠ ${t('tab.disconnected')}\x1b[0m`);
+      break;
+    case 'reconnecting':
+      terminal.writeln(`\x1b[33m⟳ ${t('tab.reconnecting')} (${reconnectAttempts + 1}/${MAX_RECONNECT_ATTEMPTS})\x1b[0m`);
+      break;
+  }
+}
+
+// 更新状态
+function setStatus(s: typeof status.value, detail?: string) {
+  status.value = s;
+  if (s === 'error' && detail) errorMessage.value = detail;
+  writeStatusToTerminal(s, detail);
+  emit('status-change', s, sessionId || undefined);
+}
+
+// 聚焦终端
+function focus() {
+  terminal?.focus();
+}
+
+// 自适应大小
+function fit() {
+  nextTick(() => {
+    fitAddon?.fit();
+  });
+}
+
+// 写入数据到终端（用于 ZMODEM 等场景）
+function writeToTerminal(data: string) {
+  terminal?.write(data);
+}
+
+// 获取终端实例
+function getTerminal() {
+  return terminal;
+}
+
+// 获取 ZMODEM session 对象
+function getZmodemSession() {
+  return zmodemSession;
+}
+
+// 获取 ZMODEM role
+function getZmodemRole() {
+  return zmodemRole;
+}
+
+// 获取 Sentry 实例
+function getSentry() {
+  return sentry;
+}
+
+// 监听 active 状态变化，切换时重新 fit
+watch(() => props.active, (val) => {
+  if (val) {
+    nextTick(() => {
+      fit();
+      focus();
+    });
+  }
+});
+
+onMounted(() => {
+  initTerminal();
+  writeStatusToTerminal('connecting');
+
+  // VSCode 主题切换时（含明暗切换）实时同步终端配色
+  offVscodeTheme = onVscodeThemeChange(() => {
+    if (!terminal) return;
+    const next = resolveTerminalTheme();
+    terminal.options.theme = next;
+    // xterm 主题变更不重绘已有单元格的默认前景/背景，重置一次以立即生效
+    terminal.refresh(0, terminal.rows - 1);
+  });
+
+  // 全局点击关闭右键菜单
+  document.addEventListener('click', onDocumentClick);
+
+  // ResizeObserver 监听容器大小变化（监听 terminal-container，因为 flex 布局下它会随 AI 面板开合而变化）
+  if (terminalContainer.value) {
+    resizeObserver = new ResizeObserver(() => {
+      if (props.active) fit();
+    });
+    resizeObserver.observe(terminalContainer.value);
+  }
+
+  // 建立 WebSocket 连接
+  connectWebSocket();
+});
+
+onBeforeUnmount(() => {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  resizeObserver?.disconnect();
+  document.removeEventListener('click', onDocumentClick);
+  offVscodeTheme?.();
+  ws?.close();
+  ipcCleanup?.();
+  terminal?.dispose();
+});
+
+defineExpose({ focus, fit, writeToTerminal, getTerminal, getZmodemSession, getZmodemRole, getSentry, sendToServer, setFileUploadCallback: (cb: ((msg: WSMessage) => void) | null) => { fileUploadResultCallback = cb; }, _getWsState: () => ws ? (ws.readyState === WebSocket.OPEN ? 'open' : ws.readyState === WebSocket.CONNECTING ? 'connecting' : ws.readyState === WebSocket.CLOSING ? 'closing' : 'closed') : 'null', _getWsBufferedAmount: () => ws ? (ws as any).bufferedAmount ?? 0 : 0, get sessionId() { return sessionId; } });
+
+// AI 相关方法
+const aiChatWrapperRef = ref<HTMLElement>();
+const aiChatWidth = ref(380);
+const AI_CHAT_MIN_WIDTH = 280;
+const AI_CHAT_MAX_WIDTH_RATIO = 0.6; // 最大宽度为容器的 60%
+
+function startResize(e: MouseEvent) {
+  e.preventDefault();
+  const startX = e.clientX;
+  const startWidth = aiChatWidth.value;
+  const containerWidth = terminalWrapper.value?.clientWidth || 800;
+  const maxWidth = containerWidth * AI_CHAT_MAX_WIDTH_RATIO;
+
+  const onMouseMove = (ev: MouseEvent) => {
+    const delta = startX - ev.clientX; // 向左拖 = 宽度增加
+    const newWidth = Math.min(Math.max(startWidth + delta, AI_CHAT_MIN_WIDTH), maxWidth);
+    aiChatWidth.value = newWidth;
+  };
+
+  const onMouseUp = () => {
+    document.removeEventListener('mousemove', onMouseMove);
+    document.removeEventListener('mouseup', onMouseUp);
+    document.body.style.cursor = '';
+    document.body.style.userSelect = '';
+  };
+
+  document.addEventListener('mousemove', onMouseMove);
+  document.addEventListener('mouseup', onMouseUp);
+  document.body.style.cursor = 'col-resize';
+  document.body.style.userSelect = 'none';
+}
+
+function toggleAIChat() {
+  showAIChat.value = !showAIChat.value;
+}
+
+function getTerminalContext(): string {
+  // 获取终端最近的输出内容
+  if (!terminal) return '';
+  const buffer = terminal.buffer.active;
+  const lines: string[] = [];
+  for (let i = Math.max(0, buffer.cursorY - 50); i <= buffer.cursorY; i++) {
+    const line = buffer.getLine(i);
+    if (line) {
+      lines.push(line.translateToString(true));
+    }
+  }
+  return lines.join('\n');
+}
+
+function handleExecuteCommand(command: string) {
+  // 将命令发送到终端
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    sendToServer({ 
+      type: 'terminal', 
+      sessionId: sessionId || pendingSessionId, 
+      data: command + '\n' 
+    });
+  }
+}
+
+// AI Agent WebSocket 发送
+function handleAISend(msg: any) {
+  sendToServer(msg);
+}
+
+// ========== 终端右键上下文菜单 ==========
+const contextMenuVisible = ref(false);
+const contextMenuX = ref(0);
+const contextMenuY = ref(0);
+
+function showTerminalContextMenu(event: MouseEvent) {
+  event.preventDefault();
+  event.stopPropagation();
+  contextMenuX.value = event.clientX;
+  contextMenuY.value = event.clientY;
+  contextMenuVisible.value = true;
+}
+
+function hideTerminalContextMenu() {
+  contextMenuVisible.value = false;
+}
+
+function handleContextCopy() {
+  hideTerminalContextMenu();
+  if (!terminal) return;
+  const selection = terminal.getSelection();
+  if (selection) {
+    writeClipboard(selection).catch(() => {});
+  }
+}
+
+async function handleContextPaste() {
+  hideTerminalContextMenu();
+  if (!terminal) return;
+  try {
+    const text = await readClipboard();
+    if (text) pasteToTerminal(text);
+  } catch {
+    /* ignore */
+  }
+}
+
+function handleContextSelectAll() {
+  hideTerminalContextMenu();
+  terminal?.selectAll();
+}
+
+function handleContextClear() {
+  hideTerminalContextMenu();
+  if (!terminal) return;
+  if (status.value === 'connected') {
+    // 与 Ctrl+L 同义：发送 form feed 交给 shell 清屏（readline 会重绘提示符并保留已输入内容），回滚历史保留可上滚
+    sendToServer({ type: 'terminal', sessionId: sessionId || pendingSessionId, data: '\x0c' });
+  } else {
+    // 断连时终端已死，本地清空即可
+    terminal.clear();
+  }
+}
+
+async function handleContextCopyAll() {
+  hideTerminalContextMenu();
+  if (!terminal) return;
+  const buffer = terminal.buffer.active;
+  const lines: string[] = [];
+  for (let i = 0; i < buffer.length; i++) {
+    const line = buffer.getLine(i);
+    if (line) lines.push(line.translateToString());
+  }
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  if (!lines.length) return;
+  try {
+    await writeClipboard(lines.join('\n'));
+  } catch {
+    /* ignore */
+  }
+}
+
+function handleContextReconnect() {
+  hideTerminalContextMenu();
+  reconnectAttempts = 0; // 手动重连重置计数，允许在自动重连耗尽后恢复
+  reconnect();
+}
+
+/** AI 回复代码块的「插入终端 / 执行」处理（execute=true 时复用 handleExecuteCommand 自动回车执行） */
+function handleTerminalCommand({ command, execute }: { command: string; execute: boolean }) {
+  if (status.value !== 'connected') return;
+  if (execute) {
+    handleExecuteCommand(command);
+  } else {
+    sendToServer({ type: 'terminal', sessionId: sessionId || pendingSessionId, data: command });
+  }
+  terminal?.focus();
+}
+
+/** 命令片段执行（点击片段即发送到终端） */
+function handleSnippetRun(command: string) {
+  if (status.value !== 'connected') return;
+  sendToServer({ type: 'terminal', sessionId: sessionId || pendingSessionId, data: command + '\n' });
+  terminal?.focus();
+}
+
+// ===== 终端搜索 =====
+/** 搜索命中高亮配色（琥珀色半透明，暗/亮主题下均可辨识） */
+const SEARCH_DECORATIONS = {
+  matchBackground: 'rgba(245, 158, 11, 0.30)',
+  matchOverviewRuler: '#f59e0b',
+  activeMatchBackground: 'rgba(245, 158, 11, 0.55)',
+  activeMatchOverviewRuler: '#f59e0b',
+  activeMatchColorOverviewRuler: '#d97706',
+};
+
+function openSearch() {
+  showSearch.value = true;
+  showSnippets.value = false; // 避免与片段浮层重叠
+  nextTick(() => {
+    searchInputRef.value?.focus();
+    searchInputRef.value?.select();
+  });
+}
+
+function closeSearch() {
+  showSearch.value = false;
+  searchAddon?.clearDecorations();
+  terminal?.focus();
+}
+
+function handleSearchInput() {
+  if (!searchAddon) return;
+  const q = searchQuery.value;
+  if (!q) {
+    searchAddon.clearDecorations();
+    return;
+  }
+  searchAddon.findNext(q, { incremental: true, decorations: SEARCH_DECORATIONS });
+}
+
+function handleSearchKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    closeSearch();
+    return;
+  }
+  if (e.key !== 'Enter' || !searchQuery.value || !searchAddon) return;
+  if (e.shiftKey) {
+    searchAddon.findPrevious(searchQuery.value, { decorations: SEARCH_DECORATIONS });
+  } else {
+    searchAddon.findNext(searchQuery.value, { decorations: SEARCH_DECORATIONS });
+  }
+}
+
+function handleSearchNav(dir: 'next' | 'prev') {
+  if (!searchQuery.value || !searchAddon) return;
+  if (dir === 'next') {
+    searchAddon.findNext(searchQuery.value, { decorations: SEARCH_DECORATIONS });
+  } else {
+    searchAddon.findPrevious(searchQuery.value, { decorations: SEARCH_DECORATIONS });
+  }
+}
+
+// 全局点击关闭右键菜单 / 命令片段面板
+function onDocumentClick(e: MouseEvent) {
+  if (contextMenuVisible.value) {
+    hideTerminalContextMenu();
+  }
+  if (showSnippets.value) {
+    const target = e.target as HTMLElement | null;
+    if (target?.closest?.('.snippet-popover') || target?.closest?.('.snippet-toggle-btn')) return;
+    showSnippets.value = false;
+  }
+}
+</script>
+
+<style scoped>
+.terminal-wrapper {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+  display: flex;
+}
+
+.terminal-container {
+  flex: 1;
+  height: 100%;
+  padding: 4px;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* AI 按钮 */
+.ai-toggle-btn {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 36px;
+  height: 36px;
+  border: none;
+  border-radius: 8px;
+  background: rgb(var(--bg-input-rgb) / 90%);
+  color: var(--text-secondary);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  transition: all 0.2s, right 0.15s ease;
+  z-index: 20;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+
+.ai-toggle-btn:hover {
+  background: rgb(var(--border-strong-rgb) / 95%);
+  color: var(--accent);
+  transform: scale(1.05);
+}
+
+.ai-toggle-btn.active {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+/* 命令片段浮层 */
+.snippet-popover {
+  position: absolute;
+  top: 56px;
+  width: 300px;
+  max-height: calc(100% - 72px);
+  z-index: 20;
+  background: var(--bg-menu, var(--bg-dark));
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 终端搜索条 */
+.terminal-search-bar {
+  position: absolute;
+  top: 56px;
+  right: 12px;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--bg-menu, var(--bg-dark));
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+.terminal-search-bar > i.bi-search {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.terminal-search-input {
+  width: 200px;
+  background: var(--bg-input, rgb(var(--bg-input-rgb)));
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 4px 8px;
+  color: var(--text-primary);
+  font-size: 12px;
+  outline: none;
+}
+.terminal-search-input:focus {
+  border-color: var(--accent);
+}
+.search-nav-btn {
+  background: none;
+  border: none;
+  padding: 3px 6px;
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.search-nav-btn:hover {
+  background: rgb(var(--overlay-rgb) / 12%);
+  color: var(--text-primary);
+}
+
+/* 文件管理器按钮定位在左上角 */
+/* 文件管理器面板包装器 */
+.file-manager-wrapper {
+  position: relative;
+  min-width: 280px;
+  max-width: 50%;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.file-manager-wrapper .fm-resize-handle {
+  position: absolute;
+  right: 0;
+  top: 0;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 20;
+  background: transparent;
+  transition: background 0.2s;
+}
+.file-manager-wrapper .fm-resize-handle:hover,
+.file-manager-wrapper .fm-resize-handle:active {
+  background: var(--accent, #89b4fa);
+  opacity: 0.6;
+}
+
+/* AI 对话面板包装器 */
+.ai-chat-wrapper {
+  position: relative;
+  width: 380px;
+  min-width: 280px;
+  height: 100%;
+  flex-shrink: 0;
+  z-index: 15;
+  will-change: transform;
+  transform: translateZ(0);
+}
+
+/* AI 拖拽调整宽度的手柄 */
+.ai-resize-handle {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 20;
+  background: transparent;
+  transition: background 0.2s;
+}
+.ai-resize-handle:hover,
+.ai-resize-handle:active {
+  background: var(--accent, #89b4fa);
+  opacity: 0.6;
+}
+
+/* 终端右键上下文菜单 */
+.terminal-context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 160px;
+  background: var(--bg-menu);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  padding: 4px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+
+.context-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: var(--text-primary);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s;
+  white-space: nowrap;
+}
+
+.context-menu-item:hover {
+  background: var(--border-strong);
+}
+
+.context-menu-item i {
+  font-size: 14px;
+  width: 16px;
+  text-align: center;
+}
+</style>

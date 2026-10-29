@@ -1,0 +1,341 @@
+name: Build and Release AetherOps (VSIX + Client)
+
+# Single pipeline that produces BOTH the VS Code extension (.vsix) and the Electron
+# desktop client (win/mac/linux) and attaches everything to one GitHub Release for tags
+# of the form `aetherops-v*`. It also publishes the extension to the VS Code Marketplace
+# (VSCODE_TOKEN) and the Open VSX Registry (OVSX_TOKEN).
+#
+# NOTE: the standalone .github/workflows/build.yml now only triggers on plain `v*` tags
+# (a fallback channel); the `aetherops-v*` channel is fully handled by this file so the two
+# release workflows never collide. The version check below compares
+# packages/vscode/package.json.
+on:
+  push:
+    tags:
+      - 'aetherops-v*'
+    branches:
+      - master
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required by softprops/action-gh-release to create releases
+
+jobs:
+  build-vsix:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies (root)
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: pnpm install --no-frozen-lockfile
+
+      # Tagged releases must match packages/vscode version so the published artifact is unambiguous.
+      - name: Verify tag matches extension version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          PKG_VER="$(node -p "require('./packages/vscode/package.json').version")"
+          TAG="${GITHUB_REF_NAME#aetherops-v}"
+          if [ "$PKG_VER" != "$TAG" ]; then
+            echo "::error::Git tag '${GITHUB_REF_NAME}' does not match packages/vscode version '${PKG_VER}'. Bump the version before tagging."
+            exit 1
+          fi
+
+      - name: Build app & prepare backend runtime
+        run: |
+          pnpm build-only
+          node scripts/prepare-vscode-runtime.mjs
+
+      - name: Package VSIX
+        working-directory: packages/vscode
+        run: ../../node_modules/.bin/vsce package --out aetherops.vsix
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aetherops-${{ github.sha }}
+          path: packages/vscode/aetherops.vsix
+          if-no-files-found: error
+
+      - name: Create GitHub Release (with VSIX)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/vscode/aetherops.vsix
+          generate_release_notes: true
+          force: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # Windows client
+  # ============================================================
+  build-win:
+    needs: build-vsix
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build Electron app
+        env:
+          CI: 'true'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/electron-build.js --platform=win
+
+      - name: Upload artifacts to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.exe
+            release/*.blockmap
+            release/latest*.yml
+          draft: false
+          force: true
+          prerelease: ${{ contains(github.ref, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # macOS client
+  # ============================================================
+  build-mac:
+    needs: build-vsix
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Install Rosetta (for x64 cross-compile)
+        run: softwareupdate --install-rosetta --agree-to-license
+        continue-on-error: true
+
+      - name: Build Electron app
+        env:
+          CI: 'true'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/electron-build.js --platform=mac
+
+      - name: Ad-hoc codesign (no Apple cert in CI)
+        run: |
+          find release -name "*.app" -maxdepth 3 | while read app; do
+            echo "Ad-hoc signing: $app"
+            codesign --force --deep --sign - "$app" || true
+          done
+
+      - name: Upload artifacts to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.dmg
+            release/*.zip
+            release/*.blockmap
+            release/latest*.yml
+          draft: false
+          force: true
+          prerelease: ${{ contains(github.ref, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # Linux client
+  # ============================================================
+  build-linux:
+    needs: build-vsix
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm fakeroot
+
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build Electron app
+        env:
+          CI: 'true'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/electron-build.js --platform=linux
+
+      - name: Upload artifacts to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.AppImage
+            release/*.snap
+            release/*.deb
+            release/*.rpm
+            release/*.tar.gz
+            release/*.blockmap
+            release/latest*.yml
+          draft: false
+          force: true
+          prerelease: ${{ contains(github.ref, '-') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Publish to the VS Code Marketplace on `aetherops-v*` tags. The repository secret VSCODE_TOKEN
+  # (an Azure DevOps PAT with Marketplace > Manage, owned by the publisher in package.json)
+  # is mapped to VSCE_PAT, which vsce reads.
+  publish-marketplace:
+    needs: build-vsix
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install dependencies (root)
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build app & prepare backend runtime
+        run: |
+          pnpm build-only
+          node scripts/prepare-vscode-runtime.mjs
+
+      - name: Package VSIX
+        working-directory: packages/vscode
+        run: ../../node_modules/.bin/vsce package --out aetherops.vsix
+
+      - name: Publish to VS Code Marketplace
+        working-directory: packages/vscode
+        run: ../../node_modules/.bin/vsce publish --packagePath aetherops.vsix -p "$VSCE_PAT"
+        env:
+          VSCE_PAT: ${{ secrets.VSCODE_TOKEN }}
+
+  # Publish to the Open VSX Registry on `aetherops-v*` tags. OVSX_TOKEN may be stored as a
+  # repository secret OR a repository variable; the expression falls back to the variable when
+  # the secret is empty. NOTE: repository variables are NOT masked in logs, so prefer a secret.
+  publish-ovsx:
+    needs: build-vsix
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Install dependencies (root)
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build app & prepare backend runtime
+        run: |
+          pnpm build-only
+          node scripts/prepare-vscode-runtime.mjs
+
+      - name: Package VSIX
+        working-directory: packages/vscode
+        run: ../../node_modules/.bin/vsce package --out aetherops.vsix
+
+      - name: Publish to Open VSX
+        working-directory: packages/vscode
+        run: ../../node_modules/.bin/ovsx publish aetherops.vsix -p "$OVSX_TOKEN"
+        env:
+          OVSX_TOKEN: ${{ secrets.OVSX_TOKEN || vars.OVSX_TOKEN }}

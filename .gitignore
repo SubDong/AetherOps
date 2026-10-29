@@ -1,0 +1,53 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+.DS_Store
+dist-ssr
+coverage
+*.local
+
+# NW.js (legacy)
+nw-build/
+nw-build-*/
+nw-cache/
+release/
+
+# Electron
+release-electron/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/tasks.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+server.pid
+aetherops.server.pid
+dist/
+data/*.json
+data/exports/
+
+# Build artifacts
+dist/
+release/
+*.tsbuildinfo
+data/messages/
+# 旧构建产物备份（非源码，不入库）
+dist.rootbak/
+
+# VSCode extension packaged output (must not be committed; pollutes *.vsix globs)
+*.vsix
+# 打包进扩展的后端运行时（由 scripts/prepare-vscode-runtime.mjs 生成，不入库）
+packages/vscode/runtime/

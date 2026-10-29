@@ -1,0 +1,41 @@
+# pnpm 工作区设置
+#
+# 为什么需要这个文件：pnpm 10+ 起，原本放在 package.json `pnpm` 字段里的配置
+# （onlyBuiltDependencies / patchedDependencies 等）已迁移到 pnpm-workspace.yaml，
+# pnpm 11/12 会直接忽略 package.json 的 `pnpm` 字段并打印警告。
+# 上游 CI 锁定的是 pnpm 10（见 .github/workflows、.cnb.yml），本地/新版是 pnpm 12，
+# 因此两份配置都保留：allowBuilds 给 pnpm 12+，onlyBuiltDependencies 给 pnpm 10/11。
+#
+# 缺失这里的配置会导致两类静默故障：
+#   1. patchedDependencies 不生效 -> zmodem.js 补丁未打 -> rz/sz 文件传输不可靠
+#   2. 构建脚本白名单不生效 -> 原生依赖（node-pty / ssh2 / electron）跳过构建
+#
+# 注意：pnpm 12 在首次安装时会往本文件头部写入 allowBuilds 占位段（值为
+# "set this to true or false"）。若出现重复的 allowBuilds 键，整个文件会解析失败
+# （ERR: duplicate mapping key），删除占位段即可。
+
+# 允许执行构建脚本的原生依赖（pnpm 12+）
+allowBuilds:
+  '@parcel/watcher': true
+  '@vscode/vsce-sign': true
+  cpu-features: true
+  electron: true
+  electron-winstaller: true
+  esbuild: true
+  node-pty: true
+  ssh2: true
+
+# 允许执行构建脚本的原生依赖（pnpm 10 / 11）
+onlyBuiltDependencies:
+  - '@parcel/watcher'
+  - '@vscode/vsce-sign'
+  - cpu-features
+  - electron
+  - electron-winstaller
+  - esbuild
+  - node-pty
+  - ssh2
+
+# 依赖补丁：zmodem.js 的 hex header LF 定位修复（缺一不可，否则 ZMODEM 传输不可靠）
+patchedDependencies:
+  zmodem.js: patches/zmodem.js.patch

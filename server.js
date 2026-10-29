@@ -1,0 +1,701 @@
+#!/usr/bin/env node
+
+const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const http = require('http');
+const WebSocket = require('ws');
+
+// 统一数据目录管理（所有写入文件必须通过此模块获取路径）
+const { ensureDataDir, getDataPath } = require('./dist/server/utils/data-dir');
+const {
+  getAccessToken,
+  getCookieHeader,
+  extractTokenFromHeaders,
+  isValidToken,
+  isAllowedOrigin,
+  requiresToken,
+  normalizeUploadName,
+  maxUploadBytes,
+} = require('./dist/server/utils/security');
+const dataDir = ensureDataDir();
+const accessToken = getAccessToken();
+const uploadLimitBytes = maxUploadBytes();
+
+// 日志文件路径（写入数据目录，非安装目录）
+const logFilePath = getDataPath('server.log');
+const logStream = fs.createWriteStream(logFilePath, { flags: 'a' });
+const originalLog = console.log;
+const originalError = console.error;
+
+console.log = function (...args) {
+  const output = args.map(a => {
+    if (typeof a === 'object') return JSON.stringify(a);
+    return String(a);
+  }).join(' ') + '\n';
+  logStream.write(`[${new Date().toISOString()}] ${output}`);
+  originalLog.apply(console, args);
+};
+
+console.error = function (...args) {
+  const output = args.map(a => {
+    if (typeof a === 'object') return JSON.stringify(a);
+    return String(a);
+  }).join(' ') + '\n';
+  logStream.write(`[${new Date().toISOString()}] [ERROR] ${output}`);
+  originalError.apply(console, args);
+};
+
+// 创建 express 应用
+const app = express();
+const server = http.createServer(app);
+
+// 静态文件目录
+const staticDir = path.join(__dirname, 'dist');
+
+// 解析 JSON 请求体
+app.use(express.json());
+
+// 检查 server 构建产物
+const serverIndexPath = path.join(__dirname, 'dist/server/index.js');
+// 打包态（VSCode 扩展 runtime）下服务端已内联进本文件，dist/server 已被删除，
+// 跳过此校验；开发态仍保留校验以提供友好报错。
+if (!process.env.AETHEROPS_BUNDLED && !fs.existsSync(serverIndexPath)) {
+  console.error(`[ERROR] 找不到 server 构建产物: ${serverIndexPath}`);
+  console.error('[ERROR] 请先运行构建: pnpm run build-only');
+  process.exit(1);
+}
+
+// 访问控制：默认仅允许同源/本机来源，并要求本地 token
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const host = req.headers.host;
+  if (!isAllowedOrigin(origin, host)) {
+    res.statusCode = 403;
+    res.end('Forbidden origin');
+    return;
+  }
+
+  if (origin) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id, X-File-Name, X-AetherOps-Token, Authorization');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  const requestUrl = new URL(req.url, `http://${host || 'localhost'}`);
+  const queryToken = requestUrl.searchParams.get('token');
+  if (queryToken && isValidToken(queryToken)) {
+    res.setHeader('Set-Cookie', getCookieHeader(queryToken, req.socket.encrypted === true));
+    if (requestUrl.pathname === '/') {
+      res.writeHead(302, { Location: '/' });
+      res.end();
+      return;
+    }
+  }
+
+  if ((requestUrl.pathname.startsWith('/api/') || requestUrl.pathname.startsWith('/ws/')) && requiresToken(req.headers.origin, req.headers.host) && !isValidToken(extractTokenFromHeaders(req.headers))) {
+    res.statusCode = 401;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ ret: 401, msg: 'Unauthorized' }));
+    return;
+  }
+
+  next();
+});
+
+// 健康检查端点：供 VSCode 扩展探活。若设置了启动令牌，则必须携带正确 token，
+// 避免端口被其它无关进程占用时被误判为服务已就绪。
+app.get('/health', (req, res) => {
+  const tok = process.env.AETHEROPS_LAUNCH_TOKEN;
+  if (tok) {
+    const q = new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams.get('token');
+    if (q !== tok) {
+      res.status(401).json({ ok: false });
+      return;
+    }
+  }
+  res.json({ ok: true });
+});
+
+// HTTP 文件上传端点（绕过 WebSocket，支持大文件）
+app.post('/api/file-upload', async (req, res) => {
+  const sessionId = req.headers['x-session-id'];
+  let fileName;
+  try {
+    fileName = normalizeUploadName(req.headers['x-file-name']);
+  } catch (err) {
+    res.status(400).json({ success: false, error: err.message || 'Invalid file name' });
+    return;
+  }
+  if (!sessionId || !fileName) {
+    res.status(400).json({ success: false, error: 'Missing X-Session-Id or X-File-Name header' });
+    return;
+  }
+  try {
+    const serverModule = require('./dist/server/index.js');
+    const { sshService } = serverModule;
+    // 收集原始请求体（文件二进制数据）
+    console.log(`[HTTP-Upload] Receiving file: session=${sessionId}, file=${fileName}`);
+    const chunks = [];
+    let received = 0;
+    for await (const chunk of req) {
+      received += chunk.length;
+      if (received > uploadLimitBytes) {
+        res.status(413).json({ success: false, error: `File too large, limit ${uploadLimitBytes} bytes`, fileName });
+        return;
+      }
+      chunks.push(chunk);
+    }
+    const fileBuffer = Buffer.concat(chunks);
+    console.log(`[HTTP-Upload] Received ${fileBuffer.length} bytes, calling SFTP...`);
+    const bytes = await sshService.uploadFileViaSftp(sessionId, fileName, fileBuffer);
+    console.log(`[HTTP-Upload] SFTP done: ${fileName}, ${bytes} bytes`);
+    res.json({ success: true, bytes, fileName });
+  } catch (err) {
+    console.error(`[HTTP-Upload] Error: ${err.message}`);
+    res.status(500).json({ success: false, error: err.message, fileName });
+  }
+});
+
+// 查询当前终端所在目录（Web 模式：上传前由前端拉取，确保文件落到当前目录）
+// zmodem=1 表示远端 rz 正在等待接收文件：此时禁止向交互式 shell 注入探测命令，
+// 否则 Ctrl+C 会打断 rz，注入的文本也会被 rz 当成数据吞掉。
+app.get('/api/cwd', async (req, res) => {
+  const sessionId = req.headers['x-session-id'] || req.query.sessionId;
+  if (!sessionId) {
+    res.status(400).json({ success: false, error: 'Missing sessionId' });
+    return;
+  }
+  const zmodem = req.query.zmodem === '1' || req.query.zmodem === 'true';
+  const force = req.query.force === '1' || req.query.force === 'true';
+  try {
+    const serverModule = require('./dist/server/index.js');
+    const { sshService } = serverModule;
+    const { cwd, reliable } = await sshService.getSessionCwdDetailed(String(sessionId), {
+      allowShellProbe: !zmodem,
+      preferTransferProcess: !!zmodem,
+      force,
+    });
+    res.json({ success: true, cwd, reliable });
+  } catch (err) {
+    res.status(200).json({ success: false, cwd: '', error: err.message || String(err) });
+  }
+});
+
+// 文件下载端点：通过 SFTP 读取远程文件并以二进制流返回
+app.get('/api/file/download', async (req, res) => {
+  const sessionId = req.headers['x-session-id'] || req.query.sessionId;
+  const filePath = req.query.path;
+  if (!sessionId || !filePath) {
+    return res.status(400).json({ success: false, error: 'Missing sessionId or path' });
+  }
+  try {
+    const serverModule = require('./dist/server/index.js');
+    const { sshService } = serverModule;
+    const buf = await sshService.downloadFile(String(sessionId), String(filePath));
+    const baseName = path.basename(String(filePath)) || 'download';
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(baseName)}"`);
+    res.setHeader('Content-Type', 'application/octet-stream');
+    res.setHeader('Content-Length', buf.length);
+    res.end(buf);
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message || String(err) });
+  }
+});
+
+// 处理 API 请求
+app.use('/api/', async (req, res, next) => {
+  if (req.method === 'POST') {
+    try {
+      const serverModule = require('./dist/server/index.js');
+      const pathname = new URL(req.originalUrl, `http://${req.headers.host || 'localhost'}`).pathname;
+      const result = await serverModule.handleRoutes(pathname, req.body);
+      res.status(200).json({ ret: 0, msg: 'success', data: result });
+    } catch (error) {
+      console.error('API Error:', error);
+      res.status(500).json({ ret: 500, msg: error.message || 'Internal server error' });
+    }
+  } else {
+    next();
+  }
+});
+
+// 静态文件
+app.use('/public', express.static(path.join(staticDir, 'public'), { dotfiles: 'allow' }));
+
+// SPA fallback
+app.use((req, res) => {
+  const indexPath = path.join(staticDir, 'view', 'index.html');
+  res.sendFile(indexPath, { dotfiles: 'allow' }, (err) => {
+    if (err) {
+      res.status(500).send('Error loading index.html:' + err.toString());
+    }
+  });
+});
+
+// WebSocket 文件消息限制跟随上传限制，base64 约有 33% 膨胀
+const wss = new WebSocket.Server({ server, path: '/ws/terminal', maxPayload: Math.ceil(uploadLimitBytes * 1.4) });
+console.log(`[WS] WebSocket server created on path /ws/terminal (maxPayload: ${Math.ceil(uploadLimitBytes * 1.4)} bytes)`);
+
+// 分块上传缓冲区: uploadId -> { chunks: string[], totalChunks: number, fileName: string, sessionId: string }
+const pendingUploads = new Map();
+
+// 跟踪 sessionId -> WebSocket 映射（用于推送监控事件）
+const wsBySessionId = new Map();
+
+// 注册日志监控事件回调（全局注册，通过 sessionId 查找对应的 WebSocket）
+try {
+  const serverModule = require('./dist/server/index.js');
+  if (serverModule.monitorService) {
+    serverModule.monitorService.onEvent((sid, event) => {
+      const targetWs = wsBySessionId.get(sid);
+      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        try { targetWs.send(JSON.stringify({ type: 'monitor-event', sessionId: sid, event })); }
+        catch(e) { console.warn('[WS] monitor-event send error:', e.code, e.message); }
+      }
+    });
+  }
+} catch (e) {
+  console.error('[WS] Failed to register monitor event callback:', e.message);
+}
+
+wss.on('connection', async (ws, req) => {
+  const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const wsToken = requestUrl.searchParams.get('token') || extractTokenFromHeaders(req.headers);
+  if (!isAllowedOrigin(req.headers.origin, req.headers.host) || (requiresToken(req.headers.origin, req.headers.host) && !isValidToken(wsToken))) {
+    ws.close(1008, 'Unauthorized');
+    return;
+  }
+  let sessionId = null;
+  console.log(`[WS] Client connected from ${req.socket.remoteAddress}`);
+
+  // 安全发送 WebSocket 消息：捕获 EAGAIN 等写入异常，防止未处理的 'error' 事件导致进程崩溃
+  // highFreq=true 时启用背压检测，缓冲区超过阈值则丢弃该消息（终端输出可丢帧，不影响连接）
+  const WS_BACKPRESSURE_LIMIT = 4 * 1024 * 1024; // 4MB
+  function safeSend(data, highFreq = false) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    if (highFreq && ws.bufferedAmount > WS_BACKPRESSURE_LIMIT) {
+      console.warn(`[WS] Backpressure: dropping message (buffered: ${ws.bufferedAmount} bytes)`);
+      return;
+    }
+    try {
+      ws.send(data);
+    } catch (err) {
+      // EAGAIN / ECONNRESET / EPIPE 等 — 记录但不崩溃
+      console.warn(`[WS] safeSend error (code=${err.code}): ${err.message}`);
+    }
+  }
+
+  // 提取会话创建逻辑，供 create 和 reconnect 复用
+  async function createSSHSession(sid, data) {
+    const serverModule = require('./dist/server/index.js');
+    const { sshService } = serverModule;
+    const { connectionId, cols, rows, name } = data || {};
+    if (!connectionId) {
+      ws.send(JSON.stringify({ type: 'error', data: '缺少 connectionId' }));
+      return;
+    }
+
+    sessionId = sid || `ssh-${Date.now()}-${Math.random().toString(36).substr(2, 8)}`;
+    console.log(`[WS] Creating SSH session: ${sessionId}, connectionId: ${connectionId}`);
+
+    // 将连接过程日志推送到前端终端信息流
+    // 使用独立的 conn-log 类型，避免经过 ZMODEM sentry 处理被吞掉
+    const sendLog = (msg) => {
+      safeSend(JSON.stringify({ type: 'conn-log', sessionId, data: msg }));
+    };
+
+    const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog);
+    console.log(`[WS] SSH session created: ${sessionId}`);
+
+    // 根据会话类型绑定输出和关闭事件
+    const sendOutput = (chunk) => {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      const hasBinary = buf.some(b => b > 127);
+      // 通知输出监听器（用于 Agent 捕获输出）
+      if (!hasBinary) {
+        try { sshService.notifyOutput(sessionId, buf.toString('utf-8')); } catch(e) {}
+      }
+      if (hasBinary) {
+        safeSend(JSON.stringify({ type: 'terminal', sessionId, data: buf.toString('base64'), binary: true }), true);
+      } else {
+        safeSend(JSON.stringify({ type: 'terminal', sessionId, data: buf.toString('utf-8') }), true);
+      }
+    };
+    const sendClose = (source) => () => {
+      console.log(`[WS] ${source} closed: ${sessionId}`);
+      safeSend(JSON.stringify({ type: 'close', sessionId }));
+    };
+
+    if (session.pty) {
+      session.pty.onData(sendOutput);
+      session.pty.onExit(sendClose('Local PTY'));
+    } else if (session.childProcess) {
+      session.childProcess.stdout.on('data', sendOutput);
+      session.childProcess.stderr.on('data', sendOutput);
+      session.childProcess.on('close', sendClose('Local shell'));
+    } else if (session.stream) {
+      session.stream.on('data', sendOutput);
+      session.stream.on('close', sendClose('SSH stream'));
+    }
+
+    safeSend(JSON.stringify({ type: 'status', sessionId, data: 'connected' }));
+    // 注册 sessionId -> ws 映射
+    wsBySessionId.set(sessionId, ws);
+    console.log(`[WS] Session ${sessionId} connected, status sent`);
+  }
+
+  ws.on('message', async (raw) => {
+    console.log(`[WS] Received raw message: ${raw.toString().substring(0, 200)}`);
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch (e) {
+      console.error('[WS] Invalid message format:', e.message);
+      ws.send(JSON.stringify({ type: 'error', data: 'Invalid message format' }));
+      return;
+    }
+
+    const { type, sessionId: sid, data } = msg;
+    console.log(`[WS] Processing message type: ${type}, sessionId: ${sid}`);
+
+    try {
+      const serverModule = require('./dist/server/index.js');
+      const { sshService, connectionService } = serverModule;
+
+      if (!sshService || !connectionService) {
+        console.error('[WS] Server module not loaded properly');
+        ws.send(JSON.stringify({ type: 'error', data: 'Server module not loaded' }));
+        return;
+      }
+
+      switch (type) {
+        case 'create': {
+          // 创建新的 SSH 会话
+          try {
+            await createSSHSession(sid, data);
+          } catch (err) {
+            console.error(`[WS] SSH session creation failed: ${err.message}`);
+            ws.send(JSON.stringify({ type: 'error', sessionId, data: err.message || 'SSH 连接失败' }));
+          }
+          break;
+        }
+
+        case 'reconnect': {
+          // 重连：关闭旧会话并重新创建
+          console.log(`[WS] Reconnecting session: ${sid}`);
+          try {
+            const serverModule = require('./dist/server/index.js');
+            // 先关闭旧会话
+            if (sid) {
+              serverModule.sshService.closeSession(sid);
+            }
+            await createSSHSession(sid, data);
+          } catch (err) {
+            console.error(`[WS] SSH session reconnect failed: ${err.message}`);
+            ws.send(JSON.stringify({ type: 'error', sessionId, data: err.message || '重连失败' }));
+          }
+          break;
+        }
+
+        case 'terminal': {
+          // 用户输入转发到 SSH
+          if (sid && data) {
+            if (msg.binary) {
+              // 二进制数据（ZMODEM等）
+              sshService.writeData(sid, Buffer.from(data, 'base64'));
+            } else {
+              sshService.writeData(sid, data);
+            }
+          }
+          break;
+        }
+
+        case 'resize': {
+          // 调整终端大小
+          if (sid && data) {
+            sshService.resize(sid, data.cols, data.rows);
+          }
+          break;
+        }
+
+        case 'close': {
+          // 关闭会话
+          if (sid) {
+            console.log(`[WS] Closing session: ${sid}`);
+            sshService.closeSession(sid);
+          }
+          break;
+        }
+
+        case 'ai-agent-run': {
+          // AI Agent run
+          const { aiSessionId, message, context, skillId, locale } = data || {};
+          if (!aiSessionId || !message) {
+            ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params' } }));
+            break;
+          }
+          const { aiService } = serverModule;
+          if (!aiService) {
+            ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'AI service unavailable' } }));
+            break;
+          }
+          console.log(`[WS] AI Agent run: session=${aiSessionId}, skill=${skillId || 'none'}, locale=${locale || 'auto'}, message=${message.substring(0, 50)}`);
+          aiService.agentRun(aiSessionId, message, context, (event) => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, event }));
+            }
+          }, skillId, locale).catch((err) => {
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, event: { type: 'error', error: err.message } }));
+            }
+          });
+          break;
+        }
+
+        case 'file-upload': {
+          // SFTP 文件上传 - 单消息模式（小文件，<上传限制）
+          let fileName;
+          const { data: fileData } = data || {};
+          try {
+            fileName = normalizeUploadName(data?.fileName);
+          } catch (err) {
+            ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: err.message || 'Invalid file name' }));
+            break;
+          }
+          if (!sid || !fileName || !fileData) {
+            console.error(`[WS] file-upload missing params: sid=${sid}, fileName=${fileName}, hasData=${!!fileData}`);
+            ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: 'Missing params', fileName }));
+            break;
+          }
+          const fileBuffer = Buffer.from(fileData, 'base64');
+          if (fileBuffer.length > uploadLimitBytes) {
+            ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: `File too large, limit ${uploadLimitBytes} bytes`, fileName }));
+            break;
+          }
+          try {
+            console.log(`[WS] SFTP upload START: session=${sid}, file=${fileName}, bytes=${fileBuffer.length}, wsReady=${ws.readyState}`);
+            const bytes = await sshService.uploadFileViaSftp(sid, fileName, fileBuffer);
+            console.log(`[WS] SFTP upload DONE: ${fileName}, ${bytes} bytes, wsReady=${ws.readyState}`);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'file-upload-result', success: true, bytes, fileName }));
+            } else {
+              console.error(`[WS] Cannot send result, WS not open: state=${ws.readyState}`);
+            }
+          } catch (err) {
+            console.error(`[WS] SFTP upload ERROR: ${err.message}`, err.stack);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: err.message, fileName }));
+            }
+          }
+          break;
+        }
+
+        case 'get-cwd': {
+          // 查询当前终端所在目录（由服务端可靠解析，避免依赖前端提示符解析）
+          try {
+            const cwd = await sshService.getSessionCwd(sid);
+            ws.send(JSON.stringify({ type: 'cwd', sessionId: sid, cwd }));
+          } catch (err) {
+            ws.send(JSON.stringify({ type: 'cwd', sessionId: sid, cwd: '', error: err.message || String(err) }));
+          }
+          break;
+        }
+
+        case 'file-upload-start': {
+          // 分块上传 - 开始（大文件）
+          const { uploadId, totalChunks } = data || {};
+          let startFileName;
+          try {
+            startFileName = normalizeUploadName(data?.fileName);
+          } catch (err) {
+            ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: err.message || 'Invalid file name' }));
+            break;
+          }
+          if (!uploadId || !startFileName || !Number.isInteger(totalChunks) || totalChunks <= 0 || totalChunks > 10000) {
+            ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: 'Invalid upload params', fileName: startFileName }));
+            break;
+          }
+          console.log(`[WS] Chunked upload start: id=${uploadId}, file=${startFileName}, chunks=${totalChunks}`);
+          pendingUploads.set(uploadId, { chunks: new Array(totalChunks), totalChunks, fileName: startFileName, sessionId: sid, receivedChunks: 0, receivedBytes: 0, createdAt: Date.now() });
+          break;
+        }
+
+        case 'file-upload-chunk': {
+          // 分块上传 - 数据块
+          const { uploadId: chunkId, chunkIndex, data: chunkData } = data || {};
+          const upload = chunkId ? pendingUploads.get(chunkId) : null;
+          if (!upload) {
+            ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: 'Upload session not found' }));
+            break;
+          }
+          if (!Number.isInteger(chunkIndex) || chunkIndex < 0 || chunkIndex >= upload.totalChunks || typeof chunkData !== 'string') {
+            pendingUploads.delete(chunkId);
+            ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: 'Invalid upload chunk', fileName: upload.fileName }));
+            break;
+          }
+          const chunkBytes = Buffer.byteLength(chunkData, 'base64');
+          const previousBytes = upload.chunks[chunkIndex] ? Buffer.byteLength(upload.chunks[chunkIndex], 'base64') : 0;
+          upload.receivedBytes += chunkBytes - previousBytes;
+          if (upload.receivedBytes > uploadLimitBytes) {
+            pendingUploads.delete(chunkId);
+            ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: `File too large, limit ${uploadLimitBytes} bytes`, fileName: upload.fileName }));
+            break;
+          }
+          if (upload.chunks[chunkIndex] === undefined) upload.receivedChunks++;
+          upload.chunks[chunkIndex] = chunkData;
+          // 每 10 个 chunk 反馈一次进度
+          if (upload.receivedChunks % 10 === 0 || upload.receivedChunks === upload.totalChunks) {
+            ws.send(JSON.stringify({ type: 'file-upload-progress', uploadId: chunkId, received: upload.receivedChunks, total: upload.totalChunks }));
+          }
+          break;
+        }
+
+        case 'file-upload-end': {
+          // 分块上传 - 结束，拼接并 SFTP 写入
+          const { uploadId: endId } = data || {};
+          const endUpload = endId ? pendingUploads.get(endId) : null;
+          if (!endUpload) {
+            console.error(`[WS] file-upload-end: upload session not found: ${endId}`);
+            ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: 'Upload session not found' }));
+            break;
+          }
+          try {
+            console.log(`[WS] Chunked upload end: id=${endId}, file=${endUpload.fileName}, received=${endUpload.receivedChunks}/${endUpload.totalChunks}`);
+            // 检查是否收到所有 chunk
+            const missingChunks = endUpload.chunks.reduce((acc, c, i) => c === undefined ? [...acc, i] : acc, []);
+            if (missingChunks.length > 0) {
+              console.error(`[WS] Missing chunks: ${missingChunks.join(',')}`);
+              ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: `Missing ${missingChunks.length} chunks`, fileName: endUpload.fileName }));
+              pendingUploads.delete(endId);
+              break;
+            }
+            const fullB64 = endUpload.chunks.join('');
+            console.log(`[WS] Joined ${endUpload.totalChunks} chunks -> b64len=${fullB64.length}, calling SFTP upload...`);
+            const bytes = await sshService.uploadFileViaSftp(endUpload.sessionId, endUpload.fileName, Buffer.from(fullB64, 'base64'));
+            console.log(`[WS] Chunked upload SFTP DONE: ${endUpload.fileName}, ${bytes} bytes, wsReady=${ws.readyState}`);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'file-upload-result', success: true, bytes, fileName: endUpload.fileName }));
+            }
+          } catch (err) {
+            console.error(`[WS] Chunked upload ERROR: ${err.message}`, err.stack);
+            if (ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'file-upload-result', success: false, error: err.message, fileName: endUpload.fileName }));
+            }
+          } finally {
+            pendingUploads.delete(endId);
+          }
+          break;
+        }
+
+        case 'ai-agent-stop': {
+          // 停止 AI Agent
+          const { aiSessionId: stopSid } = data || {};
+          if (stopSid) {
+            const { aiService } = serverModule;
+            if (aiService) {
+              aiService.stopAgent(stopSid);
+              console.log(`[WS] AI Agent stop requested: ${stopSid}`);
+            }
+          }
+          break;
+        }
+
+        default:
+          ws.send(JSON.stringify({ type: 'error', data: `Unknown message type: ${type}` }));
+      }
+    } catch (err) {
+      console.error('[WS] Error processing message:', err);
+      ws.send(JSON.stringify({ type: 'error', data: err.message || '服务端异常' }));
+    }
+  });
+
+  ws.on('close', () => {
+    console.log(`[WS] Client disconnected, sessionId: ${sessionId}`);
+    // 移除 sessionId -> ws 映射
+    if (sessionId) {
+      wsBySessionId.delete(sessionId);
+      try {
+        const serverModule = require('./dist/server/index.js');
+        // 停止该会话的监控
+        if (serverModule.monitorService) {
+          serverModule.monitorService.stopSessionMonitors(sessionId);
+        }
+        serverModule.sshService.closeSession(sessionId);
+      } catch (e) {
+        // ignore
+      }
+    }
+  });
+
+  ws.on('error', (err) => {
+    // EAGAIN 等可恢复错误仅警告，不中断连接
+    if (err && (err.code === 'EAGAIN' || err.code === 'ECONNRESET' || err.code === 'EPIPE')) {
+      console.warn('[WS] Recoverable socket error (code=%s): %s', err.code, err.message);
+      return;
+    }
+    console.error('[WS] WebSocket error:', err);
+  });
+
+  // 捕获底层 socket 的 error 事件，防止 EAGAIN 等错误成为未捕获异常导致进程崩溃
+  if (ws._socket) {
+    ws._socket.on('error', (err) => {
+      if (err && (err.code === 'EAGAIN' || err.code === 'ECONNRESET' || err.code === 'EPIPE')) {
+        console.warn('[WS] Socket recoverable error (code=%s): %s', err.code, err.message);
+      } else {
+        console.error('[WS] Socket error:', err);
+      }
+    });
+  }
+});
+
+// 解析命令行参数获取端口
+let portFromArgs;
+for (let i = 0; i < process.argv.length; i++) {
+  if ((process.argv[i] === '--port' || process.argv[i] === '-p') && process.argv[i + 1]) {
+    portFromArgs = parseInt(process.argv[i + 1]);
+    break;
+  }
+}
+
+// 启动服务器
+const PORT = portFromArgs || process.env.PORT || 9802;
+const HOST = process.env.HOST || process.env.AETHEROPS_HOST || '127.0.0.1';
+
+// PID 文件路径：按端口区分，避免多实例（桌面端 / CLI / 多个 VSCode 窗口）互相覆盖
+// （多个进程监听不同端口，共用同一数据目录时，同名 PID 文件会导致 stop 杀错对象）
+const pidFilePath = getDataPath('aetherops.server.' + PORT + '.pid');
+
+// 进程退出时清理 PID 文件
+function cleanupPid() {
+  try { if (fs.existsSync(pidFilePath)) fs.unlinkSync(pidFilePath); } catch {}
+}
+server.listen(PORT, HOST, () => {
+  fs.writeFileSync(pidFilePath, process.pid.toString());
+  console.log(`PID ${process.pid} written to ${pidFilePath}`);
+  console.log(`aetherops Server is running on ${HOST}:${PORT}`);
+  console.log(`http://localhost:${PORT}/?token=${accessToken}`);
+});
+
+// 进程退出处理
+process.on('exit', () => { cleanupPid(); logStream.end(); });
+process.on('SIGTERM', () => { cleanupPid(); process.exit(0); });
+process.on('SIGINT', () => { cleanupPid(); process.exit(0); });
+process.on('uncaughtException', (err) => {
+  // EAGAIN 等可恢复错误不退出进程
+  if (err && (err.code === 'EAGAIN' || err.code === 'ECONNRESET' || err.code === 'EPIPE')) {
+    console.warn('[Process] Recoverable socket error (code=%s): %s', err.code, err.message);
+    return;
+  }
+  console.error('Uncaught exception:', err);
+  try { cleanupPid(); } catch(e) {}
+  try { logStream.end(); } catch(e) {}
+  process.exit(1);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+  try { cleanupPid(); } catch(e) {}
+  try { logStream.end(); } catch(e) {}
+  process.exit(1);
+});

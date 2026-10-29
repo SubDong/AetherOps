@@ -1,0 +1,158 @@
+{
+  "name": "aetherops",
+  "displayName": "%displayName%",
+  "description": "%description%",
+  "version": "0.1.25",
+  "publisher": "subdong",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SubDong/AetherOps"
+  },
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other",
+    "AI"
+  ],
+  "keywords": [
+    "ssh",
+    "terminal",
+    "ai",
+    "agent",
+    "remote"
+  ],
+  "icon": "resources/activity-icon.png",
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onView:aetherops.explorer",
+    "onCommand:aetherops.openTerminal",
+    "onCommand:aetherops.refresh"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "aetherops",
+          "title": "AetherOps",
+          "icon": "resources/activity-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "aetherops": [
+        {
+          "id": "aetherops.explorer",
+          "name": "终端"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "aetherops.openTerminal",
+        "title": "打开终端",
+        "category": "AetherOps",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "aetherops.refresh",
+        "title": "刷新连接",
+        "category": "AetherOps",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "aetherops.addConnection",
+        "title": "新增连接",
+        "category": "AetherOps",
+        "icon": "$(add)"
+      },
+      {
+        "command": "aetherops.editConnection",
+        "title": "编辑连接",
+        "category": "AetherOps",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "aetherops.deleteConnection",
+        "title": "删除连接",
+        "category": "AetherOps",
+        "icon": "$(trash)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "aetherops.addConnection",
+          "when": "view == aetherops.explorer",
+          "group": "navigation@1"
+        },
+        {
+          "command": "aetherops.refresh",
+          "when": "view == aetherops.explorer",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "aetherops.openTerminal",
+          "when": "view == aetherops.explorer && viewItem == connection",
+          "group": "inline"
+        },
+        {
+          "command": "aetherops.editConnection",
+          "when": "view == aetherops.explorer && viewItem == connection",
+          "group": "connection@1"
+        },
+        {
+          "command": "aetherops.deleteConnection",
+          "when": "view == aetherops.explorer && viewItem == connection",
+          "group": "connection@2"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "aetherops.openTerminal"
+        },
+        {
+          "command": "aetherops.editConnection",
+          "when": "false"
+        },
+        {
+          "command": "aetherops.deleteConnection",
+          "when": "false"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "AetherOps",
+      "properties": {
+        "aetherops.dataDir": {
+          "type": "string",
+          "default": "",
+          "description": "AetherOps 的数据目录（连接配置 / 会话 / AI 配置 / 审计日志）。留空则复用桌面端 / CLI 的 ~/.aetherops，与独立运行的 AetherOps 共用同一份 connections.json 等文件。"
+        },
+        "aetherops.startPort": {
+          "type": "number",
+          "default": 9802,
+          "description": "VSCode 内启动 AetherOps 服务时使用的起始端口（如被占用会自动向后寻找可用端口）。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "node esbuild.js --production",
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "type-check": "tsc --noEmit",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "@types/vscode": "^1.75.0",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.23.1",
+    "ovsx": "^1.2.0"
+  }
+}

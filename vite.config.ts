@@ -1,0 +1,821 @@
+import { fileURLToPath, URL } from 'node:url';
+import * as http from "node:http";
+import * as url from "node:url";
+import { defineConfig, type Connect, type PluginOption } from 'vite';
+
+import vue from '@vitejs/plugin-vue';
+import vueJsx from '@vitejs/plugin-vue-jsx';
+import CopyPlugin from 'vite-plugin-files-copy';
+import ViteNunjucksPlugin from '@fefeding/vite-nunjucks-plugin';
+import * as path from 'path';
+import * as fs from 'fs';
+
+// 直接导入服务端代码（开发模式不再依赖编译产物）
+import { ConnectionService } from './server/service/connection.service';
+import { SSHService } from './server/service/ssh.service';
+import { AIService } from './server/service/ai.service';
+import { SkillService } from './server/service/skill.service';
+import { AuditService } from './server/service/audit.service';
+import { MonitorService } from './server/service/monitor.service';
+import { BatchService } from './server/service/batch.service';
+import { getAccessToken, getCookieHeader, extractTokenFromHeaders, isValidToken, isAllowedOrigin, requiresToken, normalizeUploadName, maxUploadBytes } from './server/utils/security';
+
+const urlPrefix = process.env.PREFIX ? `/${process.env.PREFIX}` : '';
+const devUploadLimitBytes = maxUploadBytes();
+
+// 共享服务实例（延迟初始化）
+let connectionService: ConnectionService | null = null;
+let sshService: SSHService | null = null;
+let skillService: SkillService | null = null;
+let auditService: AuditService | null = null;
+let monitorService: MonitorService | null = null;
+let batchService: BatchService | null = null;
+let aiService: AIService | null = null;
+
+// 初始化服务实例（仅在开发服务器启动时调用）
+function initServices() {
+  if (connectionService) return; // 已经初始化过了
+  
+  connectionService = new ConnectionService();
+  connectionService.init();
+  sshService = new SSHService(connectionService);
+  skillService = new SkillService();
+  auditService = new AuditService();
+  monitorService = new MonitorService(connectionService);
+  batchService = new BatchService(sshService, connectionService);
+  aiService = new AIService(sshService, skillService, auditService);
+}
+
+const defaultInitState = {
+    "config": {"prefix": urlPrefix, "apiUrl": process.env.API_URL||""},
+    "title": process.env.TITLE || 'aetherops Terminal'
+};
+
+const nunjucksPlugin = ViteNunjucksPlugin({
+    variables: {
+        prefix: '',
+        viteTarget: '',
+        __DEFAULTINITIAL_STATE__: JSON.stringify(defaultInitState),
+    }
+});
+
+const viewDir = path.resolve(__dirname, './src');
+
+const config = defineConfig({
+    publicDir: false,
+    plugins: [
+        vue() as PluginOption,
+        vueJsx() as PluginOption,
+        // @ts-ignore
+        CopyPlugin({ patterns: [] }),
+        nunjucksPlugin,
+        {
+            name: 'copy-server-files',
+            writeBundle: async () => {
+                const serverSrcDir = path.resolve(__dirname, './server');
+                const serverDistDir = path.resolve(__dirname, './dist/server');
+                if (!fs.existsSync(serverDistDir)) {
+                    fs.mkdirSync(serverDistDir, { recursive: true });
+                }
+                const copyRecursiveSync = (src: string, dest: string) => {
+                    const exists = fs.existsSync(src);
+                    const stats = exists ? fs.statSync(src) : null;
+                    const isDirectory = exists && stats && stats.isDirectory();
+                    if (isDirectory) {
+                        if (!fs.existsSync(dest)) fs.mkdirSync(dest);
+                        fs.readdirSync(src).forEach(childItemName => {
+                            copyRecursiveSync(path.join(src, childItemName), path.join(dest, childItemName));
+                        });
+                    } else {
+                        if (src.endsWith('.ts') || src.endsWith('.js')) fs.copyFileSync(src, dest);
+                    }
+                };
+                copyRecursiveSync(serverSrcDir, serverDistDir);
+                console.log('Server files copied to', serverDistDir);
+            }
+        },
+        {
+            name: 'fix-html-paths',
+            writeBundle: async () => {
+                const publicDir = path.resolve(__dirname, './dist/public');
+                // 产物文件名为固定 [name].js（无内容哈希），WebView 极易缓存旧版本 JS，
+                // 导致重建后前端改动迟迟不生效；这里给静态资源引用加上构建时间戳强制失效缓存。
+                const assetVersion = Date.now().toString(36);
+                // HTML 输出路径随源目录变化：src/index.html -> dist/public/src/index.html
+                const htmlPath = path.join(publicDir, 'src/index.html');
+                if (fs.existsSync(htmlPath)) {
+                    let html = fs.readFileSync(htmlPath, 'utf-8');
+                    html = html.replace(/\.\.\/([a-zA-Z0-9_-]+\.(js|css|woff|woff2|png|jpg|jpeg|gif|svg|ico))/g, '/public/$1?v=' + assetVersion);
+                    fs.writeFileSync(htmlPath, html);
+                }
+                // 纯终端页（VSCode 扩展 WebView 用）：留在 src/ 下被静态服务，
+                // 仅重写 ../ 资源引用为 /public/ 绝对路径
+                const termHtmlPath = path.join(publicDir, 'src/term.html');
+                if (fs.existsSync(termHtmlPath)) {
+                    let termHtml = fs.readFileSync(termHtmlPath, 'utf-8');
+                    termHtml = termHtml.replace(/\.\.\/([a-zA-Z0-9_-]+\.(js|css|woff|woff2|png|jpg|jpeg|gif|svg|ico))/g, '/public/$1?v=' + assetVersion);
+                    fs.writeFileSync(termHtmlPath, termHtml);
+                }
+                // VSCode 扩展 WebView 专用终端页（复用 TerminalTab，含 AI 对话 / 文件浏览）
+                const vscodeHtmlPath = path.join(publicDir, 'src/vscode-term.html');
+                if (fs.existsSync(vscodeHtmlPath)) {
+                    let vscodeHtml = fs.readFileSync(vscodeHtmlPath, 'utf-8');
+                    vscodeHtml = vscodeHtml.replace(/\.\.\/([a-zA-Z0-9_-]+\.(js|css|woff|woff2|png|jpg|jpeg|gif|svg|ico))/g, '/public/$1?v=' + assetVersion);
+                    fs.writeFileSync(vscodeHtmlPath, vscodeHtml);
+                }
+                // VSCode 扩展「新增 / 编辑连接」专用页（复用 ConnectionEditor）
+                const vscodeEditHtmlPath = path.join(publicDir, 'src/vscode-edit.html');
+                if (fs.existsSync(vscodeEditHtmlPath)) {
+                    let vscodeEditHtml = fs.readFileSync(vscodeEditHtmlPath, 'utf-8');
+                    vscodeEditHtml = vscodeEditHtml.replace(/\.\.\/([a-zA-Z0-9_-]+\.(js|css|woff|woff2|png|jpg|jpeg|gif|svg|ico))/g, '/public/$1?v=' + assetVersion);
+                    fs.writeFileSync(vscodeEditHtmlPath, vscodeEditHtml);
+                }
+                const viewHtmlPath = path.join(publicDir, 'src/index.html');
+                const destViewDir = path.resolve(__dirname, './dist/view');
+                const destViewHtmlPath = path.join(destViewDir, 'index.html');
+                if (fs.existsSync(viewHtmlPath)) {
+                    if (!fs.existsSync(destViewDir)) fs.mkdirSync(destViewDir, { recursive: true });
+                    let html = fs.readFileSync(viewHtmlPath, 'utf-8');
+                    fs.writeFileSync(destViewHtmlPath, html);
+                    fs.unlinkSync(viewHtmlPath);
+                    // 清理空的 src 目录
+                    const srcDir = path.join(publicDir, 'src');
+                    if (fs.existsSync(srcDir) && fs.readdirSync(srcDir).length === 0) {
+                        fs.rmdirSync(srcDir);
+                    }
+                }
+            }
+        },
+        {
+            name: 'vite-plugin-spa-fallback-with-nunjucks',
+            configureServer(server) {
+                return () => {
+                    server.middlewares.use(async (req: http.IncomingMessage, res: http.ServerResponse, next: Connect.NextFunction) => {
+                        const requestUrl = req.url || '';
+                        if (requestUrl.startsWith('/api/') || requestUrl.startsWith('/ws/')) return next();
+                        if (requestUrl.startsWith('/@vite/') || requestUrl.startsWith('/__vite_')) return next();
+                        if (req.headers.upgrade === 'websocket') return next();
+                        if (requestUrl !== '/index.html' && (/\.[a-zA-Z0-9]{1,4}(\?.*)?$/.test(requestUrl) || requestUrl.includes('@vite/client'))) return next();
+                        const accept = req.headers.accept || '';
+                        if (!accept.includes('text/html')) return next();
+                        try {
+                            const indexPath = path.resolve(viewDir, 'index.html');
+                            if (!fs.existsSync(indexPath)) return next();
+                            let html = fs.readFileSync(indexPath, 'utf-8');
+                            html = await nunjucksPlugin.transformIndexHtml(html, { path: indexPath });
+                            res.statusCode = 200;
+                            res.setHeader('Content-Type', 'text/html');
+                            res.end(html);
+                        } catch (e: any) {
+                            return next(e);
+                        }
+                    });
+                };
+            },
+        },
+        {
+            name: 'server-api',
+            configureServer(server) {
+                // 只在开发服务器启动时初始化服务
+                initServices();
+                server.middlewares.use((req: Connect.IncomingMessage, res: http.ServerResponse, next: Connect.NextFunction) => {
+                    const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+                    if (!isAllowedOrigin(req.headers.origin, req.headers.host)) {
+                        res.statusCode = 403;
+                        res.end('Forbidden origin');
+                        return;
+                    }
+                    const queryToken = requestUrl.searchParams.get('token');
+                    if (queryToken && isValidToken(queryToken)) {
+                        res.setHeader('Set-Cookie', getCookieHeader(queryToken, false));
+                        if (requestUrl.pathname === '/') {
+                            res.writeHead(302, { Location: '/' });
+                            res.end();
+                            return;
+                        }
+                    }
+                    if ((requestUrl.pathname.startsWith('/api/') || requestUrl.pathname.startsWith('/ws/')) && requiresToken(req.headers.origin, req.headers.host) && !isValidToken(extractTokenFromHeaders(req.headers))) {
+                        res.statusCode = 401;
+                        res.setHeader('Content-Type', 'application/json');
+                        res.end(JSON.stringify({ ret: 401, msg: 'Unauthorized' }));
+                        return;
+                    }
+                    if (req.url?.startsWith('/api/')) {
+                        if (!serverRoute(req, res, next)) {
+                            res.statusCode = 404;
+                            res.end('Not Found');
+                        }
+                    } else {
+                        next();
+                    }
+                });
+            },
+        },
+        {
+            name: 'server-ws',
+            async configureServer(server) {
+                // 只在开发服务器启动时初始化服务
+                initServices();
+                try {
+                    console.log('[WS] SSH service initialized from source');
+
+                    const WebSocket = require('ws');
+                    // 使用 noServer: true 避免和 Vite 的 HMR WebSocket 冲突
+                    const wss = new WebSocket.Server({ noServer: true, maxPayload: Math.ceil(devUploadLimitBytes * 1.4) });
+                    console.log('[WS] WebSocket server (noServer) ready for /ws/terminal');
+
+                    // 手动处理 upgrade，只拦截 /ws/terminal 路径
+                    server.httpServer.on('upgrade', (req, socket, head) => {
+                        const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+                        if (requestUrl.pathname === '/ws/terminal') {
+                            const upgradeToken = requestUrl.searchParams.get('token') || extractTokenFromHeaders(req.headers);
+                            if (!isAllowedOrigin(req.headers.origin, req.headers.host) || (requiresToken(req.headers.origin, req.headers.host) && !isValidToken(upgradeToken))) {
+                                socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+                                socket.destroy();
+                                return;
+                            }
+                            wss.handleUpgrade(req, socket, head, (ws) => {
+                                wss.emit('connection', ws, req);
+                            });
+                        }
+                        // 其他 WebSocket 请求（如 Vite HMR）不处理，自动放行
+                    });
+
+                    wss.on('connection', async (ws: any) => {
+                        console.log('[WS] Client connected to Vite dev WebSocket');
+                        let sessionId: string | null = null;
+
+                        // 捕获底层 socket 的 error 事件，防止 EAGAIN 等错误成为未捕获异常导致进程崩溃
+                        if (ws._socket) {
+                            ws._socket.on('error', (err: any) => {
+                                if (err && (err.code === 'EAGAIN' || err.code === 'ECONNRESET' || err.code === 'EPIPE')) {
+                                    console.warn('[WS] Socket recoverable error (code=%s): %s', err.code, err.message);
+                                } else {
+                                    console.error('[WS] Socket error:', err);
+                                }
+                            });
+                        }
+                        ws.on('error', (err: any) => {
+                            if (err && (err.code === 'EAGAIN' || err.code === 'ECONNRESET' || err.code === 'EPIPE')) {
+                                console.warn('[WS] Recoverable socket error (code=%s): %s', err.code, err.message);
+                                return;
+                            }
+                            console.error('[WS] WebSocket error:', err);
+                        });
+
+                        // 安全发送 WebSocket 消息：捕获 EAGAIN 等写入异常，防止未处理的 'error' 事件导致进程崩溃
+                        // highFreq=true 时启用背压检测，缓冲区超过阈值则丢弃该消息（终端输出可丢帧，不影响连接）
+                        const WS_BACKPRESSURE_LIMIT = 4 * 1024 * 1024; // 4MB
+                        const safeSend = (data: string, highFreq = false) => {
+                            if (ws.readyState !== WebSocket.OPEN) return;
+                            if (highFreq && ws.bufferedAmount > WS_BACKPRESSURE_LIMIT) {
+                                console.warn(`[WS] Backpressure: dropping message (buffered: ${ws.bufferedAmount} bytes)`);
+                                return;
+                            }
+                            try {
+                                ws.send(data);
+                            } catch (err: any) {
+                                // EAGAIN / ECONNRESET / EPIPE 等 — 记录但不崩溃
+                                console.warn(`[WS] safeSend error (code=${err.code}): ${err.message}`);
+                            }
+                        };
+
+                        ws.on('message', async (raw: Buffer) => {
+                            let msg: any;
+                            try {
+                                msg = JSON.parse(raw.toString());
+                            } catch (e) {
+                                safeSend(JSON.stringify({ type: 'error', data: 'Invalid message format' }));
+                                return;
+                            }
+
+                            const { type, sessionId: sid, data } = msg;
+                            switch (type) {
+                                case 'create': {
+                                    const { connectionId, cols, rows, name } = data || {};
+                                    if (!connectionId) {
+                                        safeSend(JSON.stringify({ type: 'error', data: 'Missing connectionId' }));
+                                        return;
+                                    }
+                                    sessionId = sid || `ssh-${Date.now()}-${Math.random().toString(36).substr(2, 8)}`;
+                                    try {
+                                        // SSH 连接过程日志推送到前端终端信息流（绕过 ZMODEM sentry）
+                                        const sendLog = (msg: string) => {
+                                            safeSend(JSON.stringify({ type: 'conn-log', sessionId, data: msg }));
+                                        };
+
+                                        const sshSession = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog);
+
+                                        // 根据会话类型设置数据接收
+                                        const sendOutput = (chunk: any) => {
+                                            const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(typeof chunk === 'string' ? chunk : chunk);
+                                            const hasBinary = buf.some((b: number) => b > 127);
+                                            // 通知输出监听器（用于 Agent 捕获输出）
+                                            if (!hasBinary) {
+                                                try { sshService.notifyOutput(sessionId!, buf.toString('utf-8')); } catch(e) {}
+                                            }
+                                            const zmSig = Buffer.from([42, 42, 24, 66]);
+                                            if (buf.length >= 4 && buf.includes(zmSig)) {
+                                                console.log('[WS-DEBUG] ZMODEM sig in SSH output! buf.length:', buf.length,
+                                                    'hasBinary:', hasBinary,
+                                                    'first 30 bytes:', Array.from(buf.slice(0, 30)).join(','));
+                                            }
+                                            if (hasBinary) {
+                                                safeSend(JSON.stringify({ type: 'terminal', sessionId, data: buf.toString('base64'), binary: true }), true);
+                                            } else {
+                                                safeSend(JSON.stringify({ type: 'terminal', sessionId, data: buf.toString('utf-8') }), true);
+                                            }
+                                        };
+                                        const sendClose = (source: string) => () => {
+                                            safeSend(JSON.stringify({ type: 'close', sessionId }));
+                                        };
+
+                                        if (sshSession.pty) {
+                                            // node-pty 模式
+                                            sshSession.pty.onData(sendOutput);
+                                            sshSession.pty.onExit(sendClose('Local PTY'));
+                                        } else if (sshSession.childProcess) {
+                                            // child_process 降级模式
+                                            sshSession.childProcess.stdout?.on('data', sendOutput);
+                                            sshSession.childProcess.stderr?.on('data', sendOutput);
+                                            sshSession.childProcess.on('exit', sendClose('Local shell'));
+                                        } else if (sshSession.stream) {
+                                            // SSH 模式
+                                            sshSession.stream.on('data', sendOutput);
+                                            sshSession.stream.on('close', sendClose('SSH stream'));
+                                        }
+
+                                        safeSend(JSON.stringify({ type: 'status', sessionId, data: 'connected' }));
+                                    } catch (err: any) {
+                                        safeSend(JSON.stringify({ type: 'error', sessionId, data: err.message || '连接失败' }));
+                                    }
+                                    break;
+                                }
+                                case 'terminal': {
+                                    if (sid && data) {
+                                        if (msg.binary) {
+                                            // 二进制数据（ZMODEM等）
+                                            sshService.writeData(sid, Buffer.from(data, 'base64'));
+                                        } else {
+                                            sshService.writeData(sid, data);
+                                        }
+                                    }
+                                    break;
+                                }
+                                case 'resize': {
+                                    if (sid) sshService.resize(sid, data.cols, data.rows);
+                                    break;
+                                }
+                                case 'close': {
+                                    if (sid) sshService.closeSession(sid);
+                                    break;
+                                }
+                                case 'ai-agent-run': {
+                                    const { aiSessionId, message, context, skillId, locale } = data || {};
+                                    if (!aiSessionId || !message) {
+                                        safeSend(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params' } }));
+                                        break;
+                                    }
+                                    aiService.agentRun(aiSessionId, message, context, (event: any) => {
+                                        safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, event }));
+                                    }, skillId, locale).catch((err: any) => {
+                                        safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, event: { type: 'error', error: err.message } }));
+                                    });
+                                    break;
+                                }
+                                case 'ai-agent-stop': {
+                                    const { aiSessionId: stopSid } = data || {};
+                                    if (stopSid) aiService.stopAgent(stopSid);
+                                    break;
+                                }
+                            }
+                        });
+
+                        ws.on('close', () => {
+                            if (sessionId) sshService.closeSession(sessionId);
+                        });
+                    });
+                } catch (e) {
+                    console.error('[WS] Failed to start WebSocket server:', e);
+                }
+            },
+        },
+    ],
+    resolve: {
+        alias: {
+            '@': fileURLToPath(new URL('./src', import.meta.url)),
+            '#': fileURLToPath(new URL('../', import.meta.url)),
+        },
+    },
+    build: {
+        outDir: 'dist/public',
+        assetsInlineLimit: 4096,
+        manifest: true,
+        minify: false,
+        modulePreload: true,
+        rollupOptions: {
+            external: ['../../server/index', './server/index'],
+            input: getViewInputs(viewDir),
+            output: {
+                entryFileNames: '[name].js',
+                chunkFileNames: '[name].js',
+                assetFileNames: '[name].[ext]',
+                manualChunks(id) {
+                    const ms = [...id.matchAll(/\/node_modules\/([^\/]+)\//ig)];
+                    if (ms && ms.length) {
+                        const m = ms[ms.length - 1];
+                        if (m && m[1]) {
+                            if (m[1].includes('@vue') || m[1].includes('vue-') || m[1] == 'vue') return 'vue';
+                            if (m[1].includes('bootstrap')) return 'bootstrap';
+                            if (m[1].includes('xterm')) return 'xterm';
+                        }
+                    }
+                }
+            }
+        },
+    },
+    base: urlPrefix,
+    server: {
+        host: process.env.HOST || process.env.AETHEROPS_HOST || '127.0.0.1',
+        port: +`${process.env.VITE_PORT}` || 9801,
+        cors: false,
+    },
+});
+export default config;
+
+function getViewInputs(dir: string): { [key: string]: string } {
+    const entries = fs.readdirSync(dir);
+    const htmlFiles = entries.filter(filename => filename.endsWith('.html'));
+    const inputObj: { [key: string]: string } = {};
+    for (const file of htmlFiles) {
+        const name = path.basename(file, '.html');
+        inputObj[name] = path.resolve(dir, file);
+    }
+    return inputObj;
+}
+
+async function serverRoute(req: Connect.IncomingMessage, res: http.ServerResponse, next: Connect.NextFunction) {
+  // 确保服务已初始化
+  if (!connectionService || !sshService || !aiService || !skillService || !auditService || !monitorService || !batchService) {
+    return next();
+  }
+    try {
+        if (!req.url?.startsWith('/api/')) return next();
+        const parsedUrl = url.parse(req.url, true);
+        const pathname = parsedUrl.pathname || '';
+        const method = req.method?.toLowerCase();
+
+        // 文件上传端点：接收原始二进制数据，通过 SFTP 写入远程服务器
+        if (pathname === '/api/file-upload') {
+            const sessionId = req.headers['x-session-id'] as string;
+            let fileName: string;
+            try {
+                fileName = normalizeUploadName(req.headers['x-file-name'] as string);
+            } catch (err: any) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: err.message || 'Invalid file name' }));
+                return true;
+            }
+            if (!sessionId || !fileName) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'Missing X-Session-Id or X-File-Name header' }));
+                return true;
+            }
+            const chunks: Buffer[] = [];
+            let receivedBytes = 0;
+            let aborted = false;
+            req.on('data', (chunk: Buffer) => {
+                receivedBytes += chunk.length;
+                if (receivedBytes > devUploadLimitBytes) {
+                    aborted = true;
+                    res.writeHead(413, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: `File too large, limit ${devUploadLimitBytes} bytes`, fileName }));
+                    req.destroy();
+                    return;
+                }
+                chunks.push(chunk);
+            });
+            req.on('end', async () => {
+                if (aborted) return;
+                try {
+                    const fileBuffer = Buffer.concat(chunks);
+                    console.log(`[HTTP-Upload] Received ${fileBuffer.length} bytes, calling SFTP...`);
+                    const bytes = await sshService!.uploadFileViaSftp(sessionId, fileName, fileBuffer);
+                    console.log(`[HTTP-Upload] SFTP done: ${fileName}, ${bytes} bytes`);
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: true, bytes, fileName }));
+                } catch (err: any) {
+                    console.error(`[HTTP-Upload] Error: ${err.message}`);
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ success: false, error: err.message, fileName }));
+                }
+            });
+            req.on('error', (err: Error) => {
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: err.message }));
+            });
+            return true;
+        }
+
+        // 查询当前终端所在目录（dev 模式：上传前由前端拉取，确保文件落到当前目录）
+        // zmodem=1 表示远端 rz 正在等待接收文件：禁止注入式探测，避免打断 rz
+        if (pathname === '/api/cwd' && method === 'get') {
+            const sessionId = (req.headers['x-session-id'] as string) || (parsedUrl.query.sessionId as string);
+            if (!sessionId) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: 'Missing sessionId' }));
+                return true;
+            }
+            const zmodem = parsedUrl.query.zmodem === '1' || parsedUrl.query.zmodem === 'true';
+            const force = parsedUrl.query.force === '1' || parsedUrl.query.force === 'true';
+            try {
+                const { cwd, reliable } = await sshService!.getSessionCwdDetailed(String(sessionId), {
+                    allowShellProbe: !zmodem,
+                    preferTransferProcess: !!zmodem,
+                    force,
+                });
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true, cwd, reliable }));
+            } catch (err: any) {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, cwd: '', error: err.message || String(err) }));
+            }
+            return true;
+        }
+
+        if (method !== 'post') {
+            res.writeHead(405, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ret: 405, msg: 'Only POST method is allowed' }));
+            return true;
+        }
+        const body = await getRequestBody(req);
+        if (pathname.startsWith('/api/connection/') || pathname.startsWith('/api/terminal/') || pathname.startsWith('/api/ai/') || pathname.startsWith('/api/audit/') || pathname.startsWith('/api/monitor/') || pathname.startsWith('/api/batch/') || pathname.startsWith('/api/file/')) {
+            try {
+                const data = await handleRoute(pathname, body);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ret: 0, msg: 'success', data }));
+            } catch (error: any) {
+                console.error(error);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ret: 500, msg: error?.message || '系统异常' }));
+            }
+        } else {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ret: 404, msg: 'API not found' }));
+        }
+    } catch (error: any) {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ret: 500, msg: error.message || 'Internal server error' }));
+    }
+    return true;
+
+    async function getRequestBody(req: http.IncomingMessage): Promise<any> {
+        return new Promise((resolve, reject) => {
+            let body = '';
+            req.on('data', chunk => { body += chunk.toString(); });
+            req.on('end', () => { try { resolve(body ? JSON.parse(body) : {}); } catch (e) { reject(e); } });
+            req.on('error', reject);
+        });
+    }
+}
+
+async function handleRoute(pathname: string, body: any) {
+  // 确保服务已初始化
+  if (!connectionService || !sshService || !aiService || !skillService || !auditService || !monitorService || !batchService) {
+    throw new Error('Services not initialized');
+  }
+
+  // ========== 连接管理 ==========
+  if (pathname === '/api/connection/getConnections') {
+    return await connectionService!.getAllConnections();
+  }
+  if (pathname === '/api/connection/getConnection') {
+    const { id } = body;
+    if (!id) throw new Error('Missing parameter: id');
+    return await connectionService!.getConnectionById(id);
+  }
+  if (pathname === '/api/connection/addConnection') {
+    return await connectionService!.addConnection(body);
+  }
+  if (pathname === '/api/connection/updateConnection') {
+    const { id, ...updates } = body;
+    if (!id) throw new Error('Missing parameter: id');
+    return await connectionService!.updateConnection(id, updates);
+  }
+  if (pathname === '/api/connection/deleteConnection') {
+    const { id } = body;
+    if (!id) throw new Error('Missing parameter: id');
+    await connectionService!.deleteConnection(id);
+    return true;
+  }
+  if (pathname === '/api/connection/testConnection') {
+    return await connectionService!.testConnection(body);
+  }
+
+  // ========== 终端管理 ==========
+  if (pathname === '/api/terminal/getSessions') {
+    return sshService!.getSessions();
+  }
+  if (pathname === '/api/terminal/renameSession') {
+    const { sessionId, name } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    sshService!.renameSession(sessionId, name);
+    return true;
+  }
+  if (pathname === '/api/terminal/deleteSession') {
+    const { sessionId } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    sshService!.deleteSession(sessionId);
+    return true;
+  }
+  if (pathname === '/api/terminal/closeSession') {
+    const { sessionId } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    sshService!.closeSession(sessionId);
+    return true;
+  }
+  if (pathname === '/api/terminal/closeAllSessions') {
+    sshService!.closeAllSessions();
+    return true;
+  }
+
+  // ========== AI 配置 ==========
+
+  // 获取 AI 配置
+  if (pathname === '/api/ai/getConfig') {
+    return aiService!.getConfig();
+  }
+  // 更新 AI 配置
+  if (pathname === '/api/ai/updateConfig') {
+    return aiService!.updateConfig(body);
+  }
+  // 测试 AI 配置
+  if (pathname === '/api/ai/testConfig') {
+    return await aiService!.testConfig(body);
+  }
+  // AI 对话（非流式）
+  if (pathname === '/api/ai/chat') {
+    const { sessionId, message, context } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    if (!message) throw new Error('Missing parameter: message');
+    return await aiService!.chat(sessionId, message, context);
+  }
+  // 清空 AI 对话历史
+  if (pathname === '/api/ai/clearHistory') {
+    const { sessionId } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    aiService!.clearHistory(sessionId);
+    return true;
+  }
+  // 获取 Session 的系统环境信息
+  if (pathname === '/api/ai/getSystemContext') {
+    const { sessionId } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    return await sshService!.getSystemContext(sessionId);
+  }
+  // 获取 AI 对话显示历史
+  if (pathname === '/api/ai/getDisplayHistory') {
+    const { sessionId } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    return aiService!.loadDisplayHistory(sessionId);
+  }
+  // 保存 AI 对话显示历史
+  if (pathname === '/api/ai/saveDisplayHistory') {
+    const { sessionId, messages, sessionName } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    if (!messages) throw new Error('Missing parameter: messages');
+    aiService!.saveDisplayHistory(sessionId, messages, sessionName);
+    return true;
+  }
+  // 列出所有历史对话
+  if (pathname === '/api/ai/listHistories') {
+    return aiService!.listDisplayHistories();
+  }
+  // 加载指定历史对话
+  if (pathname === '/api/ai/loadHistory') {
+    const { sessionId } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    return aiService!.loadDisplayHistory(sessionId);
+  }
+  // 删除指定历史对话
+  if (pathname === '/api/ai/deleteHistory') {
+    const { sessionId } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    aiService!.deleteDisplayHistoryFile(sessionId);
+    return true;
+  }
+  // 获取 Skills 列表
+  if (pathname === '/api/ai/getSkills') {
+    return skillService!.getSkills();
+  }
+  // 获取指定 Skill
+  if (pathname === '/api/ai/getSkill') {
+    const { id } = body;
+    if (!id) throw new Error('Missing parameter: id');
+    const skill = skillService!.getSkill(id);
+    if (!skill) throw new Error('Skill not found: ' + id);
+    return skill;
+  }
+
+  // ========== 审计日志 ==========
+  if (pathname === '/api/audit/list') {
+    return auditService!.getLogs(body);
+  }
+  if (pathname === '/api/audit/stats') {
+    return auditService!.getStats(body?.date);
+  }
+  if (pathname === '/api/audit/export') {
+    const { startDate, endDate, format } = body;
+    if (!startDate || !endDate) throw new Error('Missing parameters: startDate, endDate');
+    return auditService!.exportLogs(startDate, endDate, format || 'json');
+  }
+  if (pathname === '/api/audit/dates') {
+    return auditService!.getAvailableDates();
+  }
+
+  // ========== 日志监控 ==========
+  if (pathname === '/api/monitor/start') {
+    const { sessionId, connectionId, logPath, pattern } = body;
+    if (!sessionId || !logPath) throw new Error('Missing parameters: sessionId, logPath');
+    return await monitorService!.startMonitor(sessionId, connectionId || '', logPath, pattern);
+  }
+  if (pathname === '/api/monitor/stop') {
+    const { monitorId } = body;
+    if (!monitorId) throw new Error('Missing parameter: monitorId');
+    return monitorService!.stopMonitor(monitorId);
+  }
+  if (pathname === '/api/monitor/list') {
+    return monitorService!.getActiveMonitors(body?.sessionId);
+  }
+  if (pathname === '/api/monitor/alerts') {
+    const { monitorId, limit } = body;
+    if (!monitorId) throw new Error('Missing parameter: monitorId');
+    return monitorService!.getAlerts(monitorId, limit);
+  }
+  if (pathname === '/api/monitor/lines') {
+    const { monitorId, limit } = body;
+    if (!monitorId) throw new Error('Missing parameter: monitorId');
+    return monitorService!.getRecentLines(monitorId, limit);
+  }
+  if (pathname === '/api/monitor/analyze') {
+    const { monitorId } = body;
+    if (!monitorId) throw new Error('Missing parameter: monitorId');
+    return monitorService!.getBatchForAnalysis(monitorId);
+  }
+
+  // ========== 批量操作 ==========
+  if (pathname === '/api/batch/execute') {
+    const { sessionIds, command, timeout } = body;
+    if (!sessionIds || !Array.isArray(sessionIds) || sessionIds.length === 0) {
+      throw new Error('Missing parameter: sessionIds (non-empty array)');
+    }
+    if (!command) throw new Error('Missing parameter: command');
+    return await batchService!.executeBatch(sessionIds, command, timeout);
+  }
+  if (pathname === '/api/batch/result') {
+    const { taskId } = body;
+    if (!taskId) throw new Error('Missing parameter: taskId');
+    return batchService!.getTask(taskId);
+  }
+  if (pathname === '/api/batch/tasks') {
+    return batchService!.getTasks();
+  }
+
+  // ========== 文件管理（SFTP / 本地 fs） ==========
+
+  // 列出目录内容
+  if (pathname === '/api/file/list') {
+    const { sessionId, path: remotePath } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    return await sshService!.listDirectory(sessionId, remotePath || '/');
+  }
+  // 创建目录
+  if (pathname === '/api/file/mkdir') {
+    const { sessionId, path: remotePath } = body;
+    if (!sessionId || !remotePath) throw new Error('Missing parameter: sessionId, path');
+    await sshService!.makeDirectory(sessionId, remotePath);
+    return true;
+  }
+  // 删除文件或目录
+  if (pathname === '/api/file/remove') {
+    const { sessionId, path: remotePath } = body;
+    if (!sessionId || !remotePath) throw new Error('Missing parameter: sessionId, path');
+    await sshService!.removePath(sessionId, remotePath);
+    return true;
+  }
+  // 重命名 / 移动
+  if (pathname === '/api/file/rename') {
+    const { sessionId, oldPath, newPath } = body;
+    if (!sessionId || !oldPath || !newPath) throw new Error('Missing parameter: sessionId, oldPath, newPath');
+    await sshService!.renamePath(sessionId, oldPath, newPath);
+    return true;
+  }
+  // 获取会话默认目录（home）
+  if (pathname === '/api/file/defaultDir') {
+    const { sessionId } = body;
+    if (!sessionId) throw new Error('Missing parameter: sessionId');
+    return await sshService!.getDefaultDirectory(sessionId);
+  }
+
+  throw new Error('API endpoint not found');
+}

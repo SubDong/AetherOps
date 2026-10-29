@@ -1,0 +1,50 @@
+# 统一换行符策略
+#
+# 为什么需要：本机是 Windows，git 的 core.autocrlf 会在检出时把 LF 转成 CRLF。
+# 对 shell 脚本是致命的——bin/dev.sh、bin/build.sh 带 CRLF 后在 Docker / Linux 下
+# 会报 "bash\r: No such file or directory"，Dockerfile 里 COPY 进去同样坏。
+#
+# 策略：仓库内一律存 LF（text=auto），检出时按类型决定：
+#   - 脚本类强制 LF（跨平台执行）
+#   - Windows 批处理强制 CRLF
+#   - 其余文本由 git 自动判断，二进制不做转换
+* text=auto
+
+# 必须在 Linux/macOS/Docker 内执行的脚本：永远 LF
+*.sh text eol=lf
+*.bash text eol=lf
+Dockerfile text eol=lf
+.tpl.env text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+*.mjs text eol=lf
+
+# 只在本机/CI 的 Windows 上跑的批处理：永远 CRLF
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制：不做任何换行符处理，也不计入 diff
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.pdf binary
+*.vsix binary
+*.node binary
+*.exe binary
+*.dll binary
+
+# 语言与代码风格约定（供 GitHub / review 使用）
+*.ts text diff=ts
+*.js text diff=js
+*.vue text
+*.md text
+*.json text
+*.yaml text
+*.yml text
