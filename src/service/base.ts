@@ -2,6 +2,7 @@ import * as requestHelper from '@/utils/request';
 import type { AxiosRequestConfig } from 'axios';
 import config from '../base/config';
 import { isElectron } from '@/base/detect';
+import { getToken, redirectToLogin } from '@/utils/auth';
 
 export function getRequestUrl(api: string) {
     if (/^(http(s)?:)?\/\//.test(api)) return api;
@@ -17,8 +18,10 @@ export async function requestServer(url: string, data?: any, option?: AxiosReque
         try {
             const apiPath = url.replace(/^(http(s)?:)?\/\//, '').replace(/.*?\/api\//, '/api/');
             console.log(`[requestServer] Calling API via IPC: ${apiPath}`);
-            const res = await window.electronAPI?.api.request(apiPath, data);
-            return { status: 200, statusText: 'OK', data: res };
+            // 令牌一并送过去：主进程要用它 authenticate 出 ctx，再决定数据归属
+            const res = await window.electronAPI?.api.request(apiPath, data, getToken());
+            if (res?.status === 401) redirectToLogin();
+            return { status: res?.status ?? 500, statusText: 'OK', data: res?.data };
         } catch (error: any) {
             console.error(`[requestServer] ERROR: ${error.message}`);
             console.error(error.stack);

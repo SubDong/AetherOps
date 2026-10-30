@@ -5,6 +5,15 @@ import * as crypto from 'crypto';
 import { ConnectionEntity } from '../model/connection.entity';
 import { getDataPath } from '../utils/data-dir';
 import { loadConfig } from '../utils/config';
+import {
+  listConnections,
+  getConnectionById as getConnectionRow,
+  insertConnection,
+  replaceConnection,
+  deleteConnectionRow,
+  isConnectionNameTaken,
+} from '../db/repositories/connection.repo';
+import { query } from '../db/pool';
 import { execSync } from 'child_process';
 
 const ENCRYPTED_PREFIX = 'enc:v1:';
@@ -12,112 +21,71 @@ const SECRET_FIELDS: Array<keyof ConnectionEntity> = ['password', 'privateKey', 
 
 /**
  * SSH 连接管理服务
- * 负责管理 SSH 连接配置的 CRUD，数据存储在本地 JSON 文件中
+ * 负责管理 SSH 连接配置的 CRUD，数据存在 MySQL 的 connections 表。
+ * 敏感字段仍是「入库前用 connections.key 加密」：数据库不再等于本机，
+ * 把明文密码放进去等于把风险从文件权限上升到整个实例。
  */
 export class ConnectionService {
 
-  /**
-   * 连接配置文件路径
-   * 优先使用环境变量 AETHEROPS_DATA_DIR，否则使用用户主目录下的 .aetherops 目录
-   */
-  private readonly configPath: string;
   private cachedKey: Buffer | null = null;
 
-  constructor() {
-    this.configPath = getDataPath('connections.json');
-    console.log(`[ConnectionService] configPath: ${this.configPath}`);
-  }
-
   /**
-   * 初始化服务，创建配置目录
+   * 初始化：库连接与建表已在启动阶段完成（server.js -> ensureDatabaseReady），
+   * 这里只做一次可用性确认，不再创建/检查本地目录。
    */
   async init() {
-    const configDir = path.dirname(this.configPath);
-    console.log(`[ConnectionService] init: configDir=${configDir}`);
-    try {
-      if (!fs.existsSync(configDir)) {
-        fs.mkdirSync(configDir, { recursive: true });
-        console.log(`[ConnectionService] Created config directory: ${configDir}`);
-      }
-      // 检查目录是否可写
-      fs.accessSync(configDir, fs.constants.W_OK);
-      console.log(`[ConnectionService] Config directory is writable`);
-    } catch (e: any) {
-      console.error(`[ConnectionService] init failed: ${e.message}`);
-      console.error(`[ConnectionService] configDir exists: ${fs.existsSync(configDir)}`);
-      try {
-        const stats = fs.statSync(configDir);
-        console.error(`[ConnectionService] configDir mode: ${stats.mode.toString(8)}, uid: ${stats.uid}, gid: ${stats.gid}`);
-        console.error(`[ConnectionService] current uid: ${process.getuid?.()}, gid: ${process.getgid?.()}`);
-      } catch (_) {}
-    }
+    // 启动时还没人登录，不能按 owner 查；这里只需要确认表可读
+    const rows = await query<any>('SELECT COUNT(*) AS n FROM connections');
+    console.log(`[ConnectionService] init: connections 表可读，现有 ${Number(rows[0]?.n || 0)} 条连接`);
   }
 
   /**
-   * 获取所有 SSH 连接配置
+   * 获取当前账号的所有 SSH 连接配置
    */
-  async getAllConnections(): Promise<ConnectionEntity[]> {
-    try {
-      console.log(`[ConnectionService] getAllConnections: reading ${this.configPath}`);
-      if (!fs.existsSync(this.configPath)) {
-        console.log(`[ConnectionService] Config file does not exist, returning empty`);
-        return [];
-      }
-      const data = fs.readFileSync(this.configPath, 'utf8');
-      const connections = JSON.parse(data) as ConnectionEntity[];
-      const decryptedConnections = connections.map(conn => this.decryptConnection(conn));
-      console.log(`[ConnectionService] Loaded ${decryptedConnections.length} connections`);
-      return decryptedConnections;
-    } catch (error: any) {
-      console.error(`[ConnectionService] Failed to read config: ${error.message}`);
-      return [];
-    }
+  async getAllConnections(ownerId: string): Promise<ConnectionEntity[]> {
+    const rows = await listConnections(ownerId);
+    return rows.map(conn => this.decryptConnection(conn));
   }
 
   /**
-   * 根据 ID 获取 SSH 连接配置
+   * 根据 ID 获取 SSH 连接配置（限本账号）
    */
-  async getConnectionById(id: string): Promise<ConnectionEntity | null> {
-    const connections = await this.getAllConnections();
-    return connections.find(conn => conn.id === id) || null;
+  async getConnectionById(ownerId: string, id: string): Promise<ConnectionEntity | null> {
+    const row = await getConnectionRow(ownerId, id);
+    return row ? this.decryptConnection(row) : null;
   }
 
   /**
    * 添加 SSH 连接配置
    */
-  async addConnection(connection: ConnectionEntity): Promise<ConnectionEntity> {
-    const connections = await this.getAllConnections();
-
-    // 检查名称是否重复
-    if (connections.find(conn => conn.name === connection.name)) {
+  async addConnection(ownerId: string, connection: ConnectionEntity): Promise<ConnectionEntity> {
+    // 名称判重改成带条件的 COUNT：判重范围限本账号
+    if (connection.name && await isConnectionNameTaken(ownerId, connection.name)) {
       throw new Error('连接名称已存在');
     }
 
-    // 生成 ID 并设置时间戳
-    connection.id = this.generateId();
-    connection.createdAt = new Date();
-    connection.updatedAt = new Date();
-    connection.enabled = connection.enabled !== undefined ? connection.enabled : true;
+    const created: ConnectionEntity = {
+      ...connection,
+      id: this.generateId(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      enabled: connection.enabled !== undefined ? connection.enabled : true,
+    } as ConnectionEntity;
 
-    connections.push(connection);
-    await this.saveConnections(connections);
-
-    return connection;
+    await insertConnection(ownerId, this.encryptConnection(created));
+    return created;
   }
 
   /**
-   * 更新 SSH 连接配置
+   * 更新 SSH 连接配置（限本账号）
    */
-  async updateConnection(id: string, updates: Partial<ConnectionEntity>): Promise<ConnectionEntity> {
-    const connections = await this.getAllConnections();
-    const index = connections.findIndex(conn => conn.id === id);
-
-    if (index === -1) {
+  async updateConnection(ownerId: string, id: string, updates: Partial<ConnectionEntity>): Promise<ConnectionEntity> {
+    const existing = await getConnectionRow(ownerId, id);
+    if (!existing) {
       throw new Error('连接配置不存在');
     }
 
-    // 检查名称重复
-    if (updates.name && connections.find((conn, idx) => conn.name === updates.name && idx !== index)) {
+    if (updates.name && updates.name !== existing.name && await isConnectionNameTaken(ownerId, updates.name, id)) {
       throw new Error('连接名称已存在');
     }
 
@@ -129,23 +97,22 @@ export class ConnectionService {
       }
     }
 
-    connections[index] = { ...connections[index], ...updates, updatedAt: new Date() } as ConnectionEntity;
-    await this.saveConnections(connections);
-    return connections[index];
+    // existing 里的密文字段直接沿用：没被 updates 覆盖的就保持原密文，
+    // 不需要先解密再加密（避免密钥不可用时把密文写坏）
+    const merged: ConnectionEntity = { ...existing, ...updates, id, updatedAt: new Date() } as ConnectionEntity;
+    if (!merged.terminal) merged.terminal = existing.terminal;
+    await replaceConnection(ownerId, this.encryptConnection(merged));
+    return this.decryptConnection(merged);
   }
 
   /**
-   * 删除 SSH 连接配置
+   * 删除 SSH 连接配置（限本账号）
    */
-  async deleteConnection(id: string): Promise<void> {
-    const connections = await this.getAllConnections();
-    const filteredConnections = connections.filter(conn => conn.id !== id);
-
-    if (filteredConnections.length === connections.length) {
+  async deleteConnection(ownerId: string, id: string): Promise<void> {
+    const affected = await deleteConnectionRow(ownerId, id);
+    if (!affected) {
       throw new Error('连接配置不存在');
     }
-
-    await this.saveConnections(filteredConnections);
   }
 
   /**
@@ -417,35 +384,6 @@ export class ConnectionService {
     } catch (e) {
       log(`ssh-keygen 转换失败: ${(e as Error).message}`);
       return null;
-    }
-  }
-
-  /**
-   * 保存连接配置到文件
-   */
-  private async saveConnections(connections: ConnectionEntity[]): Promise<void> {
-    try {
-      const dir = path.dirname(this.configPath);
-      console.log(`[ConnectionService] saveConnections: ${connections.length} items -> ${this.configPath}`);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-        console.log(`[ConnectionService] Created directory: ${dir}`);
-      }
-      // 检查可写性
-      try {
-        fs.accessSync(dir, fs.constants.W_OK);
-      } catch (e: any) {
-        console.error(`[ConnectionService] Directory NOT writable: ${dir}, error: ${e.message}`);
-      }
-      const encryptedConnections = connections.map(conn => this.encryptConnection(conn));
-      fs.writeFileSync(this.configPath, JSON.stringify(encryptedConnections, null, 2), { encoding: 'utf8', mode: 0o600 });
-      try { fs.chmodSync(this.configPath, 0o600); } catch (_) { /* ignore */ }
-      console.log(`[ConnectionService] saveConnections: done`);
-    } catch (error: any) {
-      console.error(`[ConnectionService] saveConnections FAILED: ${error.message}`);
-      console.error(`[ConnectionService] configPath: ${this.configPath}`);
-      console.error(`[ConnectionService] stack: ${error.stack}`);
-      throw error;
     }
   }
 

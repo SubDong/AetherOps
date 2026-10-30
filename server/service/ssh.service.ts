@@ -6,9 +6,9 @@ import { execSync } from 'child_process';
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
-import { getDataPath } from '../utils/data-dir';
 import { shellQuote } from '../utils/shell';
 import { stripAnsiEscapes } from '../utils/ansi';
+import { listSessionMeta, upsertSessionMeta, deleteSessionMeta } from '../db/repositories/session.repo';
 
 // 尝试加载 node-pty，如果可用则使用 PTY 模式
 let nodePty: any = null;
@@ -209,6 +209,8 @@ const SESSION_PROBE_SCRIPT = [
 /** Session 元数据（用于在 server 端持久化 tab 信息） */
 interface SessionMetadata {
   sessionId: string;
+  /** 归属账号：列表、重命名、删除、文件操作都按它过滤 */
+  ownerId: string;
   connectionId: string;
   type: 'ssh' | 'local';
   name: string;
@@ -257,8 +259,6 @@ export class SSHService {
   private outputListeners: Map<string, (data: string) => void> = new Map();
   /** SSH 会话 MOTD 捕获 Promise（连接后自动后台采集） */
   private pendingMOTDCaptures: Map<string, Promise<string>> = new Map();
-  /** Session 元数据持久化文件路径 */
-  private sessionsFilePath: string;
   /** 是否曾在本实例创建过 session（用于区分主进程/渲染进程实例，仅主进程实例执行定时清理） */
   private hasCreatedSession: boolean = false;
   /** 定时清理僵尸 session 的定时器 */
@@ -268,19 +268,30 @@ export class SSHService {
 
   constructor(connectionService: ConnectionService) {
     this.connectionService = connectionService;
-    this.sessionsFilePath = getDataPath('sessions.json');
-    this.loadSessionsFromDisk();
     this.startPeriodicCleanup();
+  }
+
+  /**
+   * 从 MySQL 载入 session 元数据。
+   * 原先在构造函数里同步读 sessions.json，落表后必须等库就绪，
+   * 所以拆出 init()，由 initServices() 在 request 之前 await 完成。
+   */
+  async init(): Promise<void> {
+    await this.loadSessionsFromDb();
   }
 
   /**
    * 创建会话（自动判断 SSH 或本地 shell）
    */
-  async createSession(sessionId: string, connectionId: string, cols: number = 80, rows: number = 24, name?: string, onLog?: (msg: string) => void): Promise<TerminalSession> {
+  async createSession(sessionId: string, connectionId: string, cols: number = 80, rows: number = 24, name?: string, onLog?: (msg: string) => void, ownerId: string = ''): Promise<TerminalSession> {
     // 标记本实例曾创建过 session（用于定时清理判断）
     this.hasCreatedSession = true;
-    // 如果已存在同 ID 的会话，先关闭
-    if (this.sessions.has(sessionId)) {
+    // 如果已存在同 ID 的会话，先关闭；但别人的 sessionId 不能被覆盖
+    if (this.sessions.has(sessionId) || this.sessionMetadata.has(sessionId)) {
+      const existingOwner = this.sessionMetadata.get(sessionId)?.ownerId;
+      if (existingOwner && existingOwner !== ownerId) {
+        throw new Error('会话 ID 已被占用');
+      }
       this.closeSession(sessionId);
     }
 
@@ -305,17 +316,18 @@ export class SSHService {
       // 保存 session 元数据到 server 端
       this.sessionMetadata.set(sessionId, {
         sessionId,
+        ownerId,
         connectionId,
         type: localSession.type,
         name: localSession.name,
         createdAt: localSession.createdAt,
         systemContext: this.collectLocalSystemInfo(),
       });
-      this.saveSessionsToDisk();
+      await this.persistSession(sessionId);
       return localSession;
     }
 
-    const connection = await this.connectionService.getConnectionById(connectionId);
+    const connection = await this.connectionService.getConnectionById(ownerId, connectionId);
     if (!connection) {
       throw new Error('连接配置不存在');
     }
@@ -330,13 +342,14 @@ export class SSHService {
     // 保存 session 元数据（SSH 会话的 systemContext 通过 MOTD 自动采集）
     this.sessionMetadata.set(sessionId, {
       sessionId,
+      ownerId,
       connectionId,
       type: session.type,
       name: session.name,
       createdAt: session.createdAt,
       systemContext: session.type === 'local' ? this.collectLocalSystemInfo() : '',
     });
-    this.saveSessionsToDisk();
+    await this.persistSession(sessionId);
 
     // SSH 会话：后台自动捕获 MOTD 作为系统信息
     if (session.type === 'ssh') {
@@ -601,11 +614,12 @@ export class SSHService {
   }
 
   /**
-   * 获取所有会话信息列表（从 sessionMetadata 读取）
+   * 获取会话信息列表（只返回当前账号的）
    */
-  getSessions(): SessionInfo[] {
+  getSessions(ownerId?: string): SessionInfo[] {
     const sessions: SessionInfo[] = [];
     for (const [_, meta] of this.sessionMetadata) {
+      if (ownerId && meta.ownerId && meta.ownerId !== ownerId) continue;
       sessions.push({
         sessionId: meta.sessionId,
         connectionId: meta.connectionId,
@@ -616,6 +630,11 @@ export class SSHService {
       });
     }
     return sessions;
+  }
+
+  /** 会话归属账号；未知名返回 undefined（调用方据此判断“不属于任何人/不存在”） */
+  getSessionOwner(sessionId: string): string | undefined {
+    return this.sessionMetadata.get(sessionId)?.ownerId;
   }
 
   /**
@@ -631,26 +650,23 @@ export class SSHService {
     const meta = this.sessionMetadata.get(sessionId);
     if (meta) {
       meta.name = name;
-      this.saveSessionsToDisk();
+      void this.persistSession(sessionId);
     }
   }
 
   /**
-   * 删除会话（关闭进程并从 server 端移除 metadata）
-   * 注意：由于 Electron 主进程和渲染进程各自有独立的模块实例，
-   * 渲染进程实例的 sessionMetadata 可能不含主进程创建的 session，
-   * 因此先从磁盘重新加载以确保同步，再执行删除。
+   * 删除会话（关闭进程并从 DB 移除 metadata）
+   *
+   * 不再是 Electron 双进程各自持一份文件的那个结构（那才需要「先读文件再删」），
+   * 现在库是唯一事实来源，直接删行即可。
    */
-  deleteSession(sessionId: string): void {
+  async deleteSession(sessionId: string, ownerId?: string): Promise<void> {
     // 先关闭进程
     this.closeSession(sessionId);
-    // 从磁盘重新加载元数据（确保与主进程实例同步）
-    this.loadSessionsFromDisk();
-    // 再删除元数据
     const had = this.sessionMetadata.has(sessionId);
     this.sessionMetadata.delete(sessionId);
-    console.log(`[SSH] deleteSession: ${sessionId}, had=${had}, remaining: ${this.sessionMetadata.size}, keys=[${Array.from(this.sessionMetadata.keys()).join(', ')}]`);
-    this.saveSessionsToDisk();
+    await deleteSessionMeta(sessionId, ownerId);
+    console.log(`[SSH] deleteSession: ${sessionId}, had=${had}, remaining: ${this.sessionMetadata.size}`);
   }
 
   /**
@@ -663,49 +679,50 @@ export class SSHService {
   // ========== Session 元数据持久化 ==========
 
   /**
-   * 从磁盘加载 session 元数据
+   * 从 MySQL 载入 session 元数据
    */
-  private loadSessionsFromDisk(): void {
+  private async loadSessionsFromDb(): Promise<void> {
     try {
-      if (fs.existsSync(this.sessionsFilePath)) {
-        const raw = fs.readFileSync(this.sessionsFilePath, 'utf-8');
-        const list: any[] = JSON.parse(raw);
-        this.sessionMetadata.clear();
-        for (const item of list) {
-          this.sessionMetadata.set(item.sessionId, {
-            sessionId: item.sessionId,
-            connectionId: item.connectionId,
-            type: item.type,
-            name: item.name,
-            createdAt: new Date(item.createdAt),
-            systemContext: item.systemContext,
-          });
-        }
-        console.log(`[SSH] Loaded ${list.length} session(s) from disk, ids=[${list.map(i => i.sessionId).join(', ')}]`);
+      const list = await listSessionMeta();
+      this.sessionMetadata.clear();
+      for (const item of list) {
+        this.sessionMetadata.set(item.sessionId, {
+          sessionId: item.sessionId,
+          ownerId: item.ownerId,
+          connectionId: item.connectionId,
+          type: item.type,
+          name: item.name,
+          createdAt: item.createdAt,
+          systemContext: item.systemContext,
+        });
       }
-    } catch (error) {
-      console.error('[SSH] Failed to load sessions from disk:', error);
+      console.log(`[SSH] Loaded ${list.length} session(s) from MySQL`);
+    } catch (error: any) {
+      console.error('[SSH] Failed to load sessions from MySQL:', error.message);
     }
   }
 
   /**
-   * 将 session 元数据写入磁盘
+   * 持久化单条 session 元数据（不存在则插入）
+   *
+   * 失败只记日志：调用点大多是「名字改了」「MOTD 采到了」这类附带动作，
+   * 写库失败不该把已经建好的终端给废掉。
    */
-  private saveSessionsToDisk(): void {
+  private async persistSession(sessionId: string): Promise<void> {
+    const meta = this.sessionMetadata.get(sessionId);
+    if (!meta) return;
     try {
-      const list = Array.from(this.sessionMetadata.values()).map(m => ({
-        sessionId: m.sessionId,
-        connectionId: m.connectionId,
-        type: m.type,
-        name: m.name,
-        createdAt: m.createdAt instanceof Date ? m.createdAt.toISOString() : m.createdAt,
-        systemContext: m.systemContext,
-      }));
-      const json = JSON.stringify(list, null, 2);
-      console.log(`[SSH] saveSessionsToDisk: ${list.length} session(s), path=${this.sessionsFilePath}`);
-      fs.writeFileSync(this.sessionsFilePath, json, 'utf-8');
-    } catch (error) {
-      console.error('[SSH] Failed to save sessions to disk:', error);
+      await upsertSessionMeta({
+        sessionId: meta.sessionId,
+        ownerId: meta.ownerId,
+        connectionId: meta.connectionId,
+        type: meta.type === 'local' ? 'local' : 'ssh',
+        name: meta.name || '',
+        systemContext: meta.systemContext || '',
+        createdAt: meta.createdAt instanceof Date ? meta.createdAt : new Date(meta.createdAt),
+      });
+    } catch (error: any) {
+      console.error(`[SSH] Failed to persist session ${sessionId}:`, error.message);
     }
   }
 
@@ -723,7 +740,7 @@ export class SSHService {
     let isJumpHost = false;
     if (meta?.connectionId) {
       try {
-        const conn = await this.connectionService.getConnectionById(meta.connectionId);
+        const conn = await this.connectionService.getConnectionById(meta.ownerId, meta.connectionId);
         isJumpHost = !!conn?.startupScript?.trim();
       } catch { /* ignore */ }
     }
@@ -744,7 +761,7 @@ export class SSHService {
       const info = await this.activeCollectRemoteSystemInfo(sessionId);
       if (info && meta) {
         meta.systemContext = info;
-        this.saveSessionsToDisk();
+        await this.persistSession(sessionId);
       }
       return info;
     }
@@ -760,7 +777,7 @@ export class SSHService {
       const info = await pending;
       if (meta) {
         meta.systemContext = info;
-        this.saveSessionsToDisk();
+        await this.persistSession(sessionId);
       }
       this.pendingMOTDCaptures.delete(sessionId);
       return info;
@@ -776,7 +793,7 @@ export class SSHService {
     }
     if (meta) {
       meta.systemContext = info;
-      this.saveSessionsToDisk();
+      await this.persistSession(sessionId);
     }
     return info;
   }
@@ -791,7 +808,7 @@ export class SSHService {
       const meta = this.sessionMetadata.get(sessionId);
       if (meta && !meta.systemContext && info) {
         meta.systemContext = info;
-        this.saveSessionsToDisk();
+        void this.persistSession(sessionId);
       }
     }).catch(() => {});
   }
@@ -1624,9 +1641,12 @@ Write-Output "__DOCKER__: $dockerVer"
 
   /**
    * 关闭所有会话
+   * 传 ownerId 时只关这个账号的会话：这是「关闭全部」按钮的实现，
+   * 不传的调用方只允许是进程退出/销毁（全量清理）。
    */
-  closeAllSessions(): void {
+  closeAllSessions(ownerId?: string): void {
     for (const [sessionId] of this.sessions) {
+      if (ownerId && this.sessionMetadata.get(sessionId)?.ownerId !== ownerId) continue;
       this.closeSession(sessionId);
     }
   }
@@ -2044,11 +2064,7 @@ Write-Output "__DOCKER__: $dockerVer"
   private startPeriodicCleanup(): void {
     const CLEANUP_INTERVAL = 30000; // 30 秒
     this.cleanupTimer = setInterval(() => {
-      try {
-        this.cleanupZombieSessions();
-      } catch (e) {
-        console.error('[SSH] Periodic cleanup error:', e);
-      }
+      this.cleanupZombieSessions().catch((e) => console.error('[SSH] Periodic cleanup error:', e));
     }, CLEANUP_INTERVAL);
     // 避免定时器阻止 Node.js 进程正常退出
     if (this.cleanupTimer && typeof this.cleanupTimer === 'object' && 'unref' in this.cleanupTimer) {
@@ -2057,17 +2073,17 @@ Write-Output "__DOCKER__: $dockerVer"
   }
 
   /**
-   * 清理僵尸 session：从磁盘重新加载，移除进程已不存在的条目
+   * 清理僵尸 session：从库里重新加载，移除进程已不存在的条目
    */
-  private cleanupZombieSessions(): void {
+  private async cleanupZombieSessions(): Promise<void> {
     // 仅当本实例曾创建过 session 时才执行清理（主进程实例）
-    // 渲染进程实例从不创建 session（创建通过 IPC 在主进程完成），跳过以避免误删
+    // 不曾经创建过的实例（如预加载进程）跳过，避免误删
     if (!this.hasCreatedSession) return;
 
-    // 从磁盘重新加载最新状态
-    this.loadSessionsFromDisk();
+    // 从库里重新加载最新状态
+    await this.loadSessionsFromDb();
 
-    // 找出磁盘上有但进程已不存在的 session
+    // 找出库里有但进程已不存在的 session
     const toRemove: string[] = [];
     for (const sid of this.sessionMetadata.keys()) {
       if (!this.sessions.has(sid)) {
@@ -2078,8 +2094,8 @@ Write-Output "__DOCKER__: $dockerVer"
     if (toRemove.length > 0) {
       for (const sid of toRemove) {
         this.sessionMetadata.delete(sid);
+        await deleteSessionMeta(sid);
       }
-      this.saveSessionsToDisk();
       console.log(`[SSH] Periodic cleanup: removed ${toRemove.length} zombie session(s): ${toRemove.join(', ')}`);
     }
   }

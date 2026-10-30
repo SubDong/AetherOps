@@ -1,7 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import * as os from 'os';
-import { getDataPath } from '../utils/data-dir';
+import { listUserSkills, findUserSkill, upsertUserSkill, deleteUserSkillRow } from '../db/repositories/skill.repo';
 
 /**
  * Skill 定义接口
@@ -17,50 +16,50 @@ export interface Skill {
 
 /**
  * Skill 服务 - 管理和加载 Skills
- * 
- * Skills 存储位置：
+ *
+ * 存储位置：
  * - 系统内置：<project>/data/skills/*.md
- * - 用户自定义：~/.aetherops/skills/*.md
+ *   随代码发布的资产，仍从文件读（跟 git 走、可 review），不进库。
+ * - 用户自定义：MySQL 的 skills 表（source='user'）。原先是 ~/.aetherops/skills/*.md。
+ *
+ * 多账号后不能再用「全局合并后的 Map」做缓存：用户技能是账号私有的，
+ * 一个进程里同时有多个登录人，缓存合并结果等于把 A 的技能给 B 看。
+ * 所以内存里只留内置技能（全局共享且只读），用户技能每次按 ownerId 查库——
+ * 技能数量很小，省略缓存换掉一类越权风险是划算的。
  */
 export class SkillService {
-  private skills: Map<string, Skill> = new Map();
+  private systemSkills: Map<string, Skill> = new Map();
   private systemSkillsDir: string;
-  private userSkillsDir: string;
 
   constructor(systemSkillsDir?: string) {
     // 系统 Skills 目录：项目根目录下的 data/skills
     this.systemSkillsDir = systemSkillsDir || path.join(process.cwd(), 'data', 'skills');
-    // 用户 Skills 目录：统一通过 getDataPath 获取
-    this.userSkillsDir = getDataPath('skills');
-    this.loadSkills();
   }
 
   /**
-   * 加载所有 Skills
+   * 载入内置技能（文件）。用户技能不再在启动时载入。
+   * 必须在数据库就绪后调用，由 initServices() 负责时机。
    */
-  loadSkills(): void {
-    this.skills.clear();
-
-    // 加载系统 Skills
-    this.loadFromDir(this.systemSkillsDir, 'system');
-    // 加载用户 Skills（同名会覆盖系统 Skill）
-    this.loadFromDir(this.userSkillsDir, 'user');
-
-    console.log(`[SkillService] Loaded ${this.skills.size} skills`);
+  async init(): Promise<void> {
+    const loaded = this.loadSystemSkills();
+    console.log(`[SkillService] Loaded ${loaded} system skills (user skills are per-account, queried on demand)`);
   }
 
   /**
-   * 从目录加载 Skills
+   * 加载内置 Skills（data/skills/*.md）
    */
-  private loadFromDir(dir: string, source: 'system' | 'user'): void {
+  private loadSystemSkills(): number {
+    this.systemSkills.clear();
+    return this.loadFromDir(this.systemSkillsDir);
+  }
+
+  /**
+   * 从目录加载 md 技能文件
+   */
+  private loadFromDir(dir: string): number {
+    let count = 0;
     try {
-      if (!fs.existsSync(dir)) {
-        // 自动创建目录（用户目录）
-        if (source === 'user') {
-          fs.mkdirSync(dir, { recursive: true });
-        }
-        return;
-      }
+      if (!fs.existsSync(dir)) return 0;
 
       const files = fs.readdirSync(dir);
       for (const file of files) {
@@ -71,9 +70,10 @@ export class SkillService {
 
         try {
           const raw = fs.readFileSync(filePath, 'utf-8');
-          const skill = this.parseSkillFile(id, raw, source);
+          const skill = this.parseSkillFile(id, raw, 'system');
           if (skill) {
-            this.skills.set(id, skill);
+            this.systemSkills.set(id, skill);
+            count++;
           }
         } catch (err) {
           console.error(`[SkillService] Failed to parse skill: ${file}`, err);
@@ -82,6 +82,7 @@ export class SkillService {
     } catch (err) {
       console.error(`[SkillService] Failed to load skills from ${dir}:`, err);
     }
+    return count;
   }
 
   /**
@@ -139,60 +140,47 @@ export class SkillService {
   }
 
   /**
-   * 获取所有 Skills 列表
+   * 获取该账号可见的所有 Skills：内置 + 自己的用户技能（同名时用户版覆盖内置）。
    */
-  getSkills(): Skill[] {
-    return Array.from(this.skills.values());
+  async getSkills(ownerId: string): Promise<Skill[]> {
+    const merged = new Map<string, Skill>(this.systemSkills);
+    const userSkills = await listUserSkills(ownerId);
+    for (const skill of userSkills) merged.set(skill.id, skill);
+    return Array.from(merged.values());
   }
 
   /**
-   * 获取指定 Skill
+   * 获取指定 Skill：先查该账号的用户技能，再回落内置。
+   * 异步是故意的——不想为了同步签名在内存里缓存「某人的技能」。
    */
-  getSkill(id: string): Skill | undefined {
-    return this.skills.get(id);
+  async getSkill(ownerId: string, id: string): Promise<Skill | undefined> {
+    const userSkill = await findUserSkill(ownerId, id);
+    if (userSkill) return userSkill;
+    return this.systemSkills.get(id);
   }
 
   /**
    * 保存用户 Skill（创建或更新）
    */
-  saveUserSkill(skill: Omit<Skill, 'source'>): Skill {
-    const filePath = path.join(this.userSkillsDir, `${skill.id}.md`);
-    
-    // 确保目录存在
-    if (!fs.existsSync(this.userSkillsDir)) {
-      fs.mkdirSync(this.userSkillsDir, { recursive: true });
-    }
-
-    // 构建文件内容
-    const tagsStr = skill.tags.length > 0 ? `[${skill.tags.join(', ')}]` : '[]';
-    const content = `---\nname: ${skill.name}\ndescription: ${skill.description}\ntags: ${tagsStr}\n---\n\n${skill.content}\n`;
-
-    fs.writeFileSync(filePath, content, 'utf-8');
-
+  async saveUserSkill(ownerId: string, skill: Omit<Skill, 'source'>): Promise<Skill> {
     const fullSkill: Skill = { ...skill, source: 'user' };
-    this.skills.set(skill.id, fullSkill);
+    await upsertUserSkill(ownerId, fullSkill);
     return fullSkill;
   }
 
   /**
-   * 删除用户 Skill
+   * 删除用户 Skill。
+   * 不需要回填缓存：删掉后名字回落内置版本是查询时自然发生的。
    */
-  deleteUserSkill(id: string): boolean {
-    const skill = this.skills.get(id);
-    if (!skill || skill.source !== 'user') return false;
-
-    const filePath = path.join(this.userSkillsDir, `${id}.md`);
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-    this.skills.delete(id);
-    return true;
+  async deleteUserSkill(ownerId: string, id: string): Promise<boolean> {
+    const affected = await deleteUserSkillRow(ownerId, id);
+    return affected > 0;
   }
 
   /**
-   * 重新加载 Skills
+   * 重新加载内置 Skills（文件可能在运行期被改动）
    */
-  reload(): void {
-    this.loadSkills();
+  async reload(): Promise<void> {
+    await this.init();
   }
 }

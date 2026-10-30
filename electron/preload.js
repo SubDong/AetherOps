@@ -47,24 +47,27 @@ const updater = {
   },
 };
 
+// 生产模式没有本地 HTTP 网关，IPC 就是唯一的门禁：每个调用都要带令牌，
+// 主进程据此解析账号、校验权限与会话归属
 const api = {
-  request(pathname, body) {
-    return ipcRenderer.invoke('api:request', { pathname, body });
+  request(pathname, body, token) {
+    return ipcRenderer.invoke('api:request', { pathname, body, token });
   },
   /**
    * 文件上传（app:// 协议下 fetch 不可用，通过 IPC 上传到主进程）
    * @param {string} sessionId
    * @param {string} fileName
    * @param {ArrayBuffer|Uint8Array} fileData
+   * @param {string} token
    */
-  uploadFile(sessionId, fileName, fileData) {
-    return ipcRenderer.invoke('file:upload', { sessionId, fileName, fileData });
+  uploadFile(sessionId, fileName, fileData, token) {
+    return ipcRenderer.invoke('file:upload', { sessionId, fileName, fileData, token });
   },
-  getCwd(sessionId, zmodem, force) {
-    return ipcRenderer.invoke('terminal:get-cwd', { sessionId, zmodem, force });
+  getCwd(sessionId, zmodem, force, token) {
+    return ipcRenderer.invoke('terminal:get-cwd', { sessionId, zmodem, force, token });
   },
-  downloadFile(sessionId, remotePath, fileName) {
-    return ipcRenderer.invoke('file:download', { sessionId, remotePath, fileName });
+  downloadFile(sessionId, remotePath, fileName, token) {
+    return ipcRenderer.invoke('file:download', { sessionId, remotePath, fileName, token });
   },
 };
 

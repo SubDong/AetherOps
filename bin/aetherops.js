@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-const crypto = require('crypto');
 const { exec, spawn, execSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -91,24 +90,6 @@ const pidFileFor = (port) => getDataPath(`aetherops.server.${port}.pid`);
 const readPid = (port) => {
   const f = pidFileFor(port);
   return fs.existsSync(f) ? parseInt(fs.readFileSync(f, 'utf8')) : null;
-};
-const getAccessToken = () => {
-  // loadConfig 已经把 AETHEROPS_ACCESS_TOKEN 等环境变量合进来了，优先用配置结果
-  const cfg = getRuntimeConfig();
-  const configured = cfg ? cfg.auth.accessToken : process.env.AETHEROPS_ACCESS_TOKEN;
-  if (configured) return configured;
-  ensureDataDir();
-  const f = getDataPath('access-token');
-  try {
-    if (fs.existsSync(f)) {
-      const token = fs.readFileSync(f, 'utf8').trim();
-      if (token) return token;
-    }
-  } catch { /* ignore */ }
-  const token = crypto.randomBytes(32).toString('base64url');
-  fs.writeFileSync(f, token, { encoding: 'utf8', mode: 0o600 });
-  try { fs.chmodSync(f, 0o600); } catch { /* ignore */ }
-  return token;
 };
 const writePid = (pid, port) => {
   ensureDataDir();
@@ -203,10 +184,10 @@ async function startProject() {
   child.unref();
   writePid(child.pid, startPort);
 
-  const accessToken = getAccessToken();
-  const startUrl = `http://localhost:${startPort}/?token=${encodeURIComponent(accessToken)}`;
+  // 不再把访问令牌拼进 URL：现在登录后才拿得到令牌，浏览器直接打开根路径即可
+  const startUrl = `http://localhost:${startPort}/`;
   console.log('Server started with PID:', child.pid);
-  console.log(`aetherops is running at http://localhost:${startPort}`);
+  console.log(`aetherops is running at ${startUrl}`);
   openBrowser(startUrl);
 }
 

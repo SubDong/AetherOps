@@ -7,10 +7,11 @@ declare interface Window {
     isPackaged: boolean;
     platform: string;
     api: {
-      request(pathname: string, body?: any): Promise<any>;
-      uploadFile(sessionId: string, fileName: string, fileData: ArrayBuffer | Uint8Array): Promise<{ success: boolean; bytes?: number; fileName?: string; error?: string }>;
-      getCwd(sessionId: string, zmodem?: boolean, force?: boolean): Promise<{ cwd?: string; reliable?: boolean; error?: string }>;
-      downloadFile(sessionId: string, remotePath: string, fileName?: string): Promise<{ success: boolean; canceled?: boolean; filePath?: string; size?: number; error?: string }>;
+      /** 业务 / 账号接口；token 由主进程 authenticate，返回 { status, data } */
+      request(pathname: string, body?: any, token?: string): Promise<{ status: number; data: any }>;
+      uploadFile(sessionId: string, fileName: string, fileData: ArrayBuffer | Uint8Array, token?: string): Promise<{ success: boolean; bytes?: number; fileName?: string; error?: string }>;
+      getCwd(sessionId: string, zmodem?: boolean, force?: boolean, token?: string): Promise<{ cwd?: string; reliable?: boolean; error?: string }>;
+      downloadFile(sessionId: string, remotePath: string, fileName?: string, token?: string): Promise<{ success: boolean; canceled?: boolean; filePath?: string; size?: number; error?: string }>;
     };
 
     /** 远程文件信息（文件管理面板） */

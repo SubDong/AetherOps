@@ -1,4 +1,5 @@
 import { request, getRequestUrl } from '@/service/base';
+import { authHeaders, getToken } from '@/utils/auth';
 
 export interface RemoteFileInfo {
   name: string;
@@ -58,7 +59,7 @@ export async function uploadFile(
   if (isElectronProduction()) {
     const api = (window as any).electronAPI.api;
     const buf = await file.arrayBuffer();
-    const res = await api.uploadFile(sessionId, remotePath, buf);
+    const res = await api.uploadFile(sessionId, remotePath, buf, getToken());
     if (!res || !res.success) throw new Error(res?.error || '上传失败');
     return;
   }
@@ -69,6 +70,7 @@ export async function uploadFile(
       'X-Session-Id': sessionId,
       'X-File-Name': remotePath,
       'Content-Type': 'application/octet-stream',
+      ...authHeaders(),
     },
     body: file,
     credentials: 'include',
@@ -87,15 +89,15 @@ export async function downloadFile(
 ): Promise<void> {
   if (isElectronProduction()) {
     const api = (window as any).electronAPI.api;
-    const res = await api.downloadFile(sessionId, remotePath, fileName);
+    const res = await api.downloadFile(sessionId, remotePath, fileName, getToken());
     if (res && res.canceled) return;
     if (!res || !res.success) throw new Error(res?.error || '下载失败');
     return;
   }
-  // Web 模式：使用 fetch + Blob 下载，确保携带认证 cookie
+  // Web 模式：使用 fetch + Blob 下载；令牌在 Authorization 里（不再是 cookie）
   const params = new URLSearchParams({ sessionId, path: remotePath });
   const url = getRequestUrl('/api/file/download') + '?' + params.toString();
-  const resp = await fetch(url, { credentials: 'include' });
+  const resp = await fetch(url, { credentials: 'include', headers: authHeaders() });
   if (!resp.ok) {
     const errData = await resp.json().catch(() => ({}));
     throw new Error(errData.error || errData.msg || `下载失败 (${resp.status})`);

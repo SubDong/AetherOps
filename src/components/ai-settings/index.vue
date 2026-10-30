@@ -35,6 +35,9 @@
               :placeholder="t('ai.apiKeyPlaceholder')"
               required
             >
+            <button type="button" class="btn btn-outline-secondary" :title="t('context.copy')" @click="copyApiKey">
+              <i class="bi bi-clipboard"></i>
+            </button>
             <button type="button" class="btn btn-outline-secondary" @click="showApiKey = !showApiKey">
               <i :class="showApiKey ? 'bi bi-eye-slash' : 'bi bi-eye'"></i>
             </button>
@@ -110,11 +113,14 @@ import { useI18n } from 'vue-i18n';
 import Modal from '@/components/modal/index.vue';
 import * as aiService from '@/service/ai';
 import { toast } from '@/utils/toast';
+import { copy } from '@/utils/clipboard';
 
 const { t } = useI18n();
 
 const aiSettingsModal = ref();
-const showApiKey = ref(false);
+// 账号隔离后配置只属于本人，服务端也不再下发掩码值，
+// 默认就按原样显示，方便核对与随手复制；需要防肩窥时点眼睛切回密码框
+const showApiKey = ref(true);
 const testing = ref(false);
 const saving = ref(false);
 
@@ -154,6 +160,14 @@ async function open() {
 
 function close() {
   aiSettingsModal.value?.hide();
+}
+
+async function copyApiKey() {
+  if (!form.apiKey) {
+    toast.warning(t('ai.apiKeyRequired'));
+    return;
+  }
+  if (await copy(form.apiKey)) toast.success(t('ai.copied'));
 }
 
 function handleModalClose() {

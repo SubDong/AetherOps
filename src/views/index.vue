@@ -21,6 +21,10 @@
       <button v-if="store.sidebarCollapsed" class="sidebar-toggle-btn" @click="store.toggleSidebar()" :title="t('sidebar.expand')">
         <i class="bi bi-chevron-right"></i>
       </button>
+      <!-- 未授权提示：账号能登录，但所有功能都被权限拦下，得在这里说清楚原因 -->
+      <div v-if="accountPending" class="pending-banner">
+        <i class="bi bi-exclamation-triangle"></i>{{ t('auth.pendingBanner') }}
+      </div>
       <!-- Tab 栏 -->
       <div v-if="store.tabs.length > 0" class="tab-bar" style="height: var(--tab-bar-height);" @contextmenu.prevent>
         <div
@@ -51,7 +55,7 @@
             <i class="bi bi-x"></i>
           </span>
         </div>
-        <button class="tab-add-btn" @click="handleOpenLocalShell" :title="t('app.newLocalShell')">
+        <button v-if="canUseTerminal" class="tab-add-btn" @click="handleOpenLocalShell" :title="t('app.newLocalShell')">
           <i class="bi bi-plus"></i>
         </button>
       </div>
@@ -83,10 +87,10 @@
           <div style="font-size: 18px;">{{ t('app.emptyTitle') }}</div>
           <div style="font-size: 13px;">{{ t('app.emptyDesc') }}</div>
           <div class="d-flex gap-2 mt-3 justify-content-center">
-            <button class="btn-empty-action" @click="openEditor()">
+            <button v-if="canManageConnections" class="btn-empty-action" @click="openEditor()">
               <i class="bi bi-plus"></i>{{ t('app.addConnection') }}
             </button>
-            <button class="btn-empty-action btn-empty-success" @click="handleOpenLocalShell()">
+            <button v-if="canUseTerminal" class="btn-empty-action btn-empty-success" @click="handleOpenLocalShell()">
               <i class="bi bi-terminal"></i>{{ t('app.openLocalShell') }}
             </button>
           </div>
@@ -154,8 +158,14 @@ import ConnectionEditor from '@/components/connection-editor/index.vue';
 import AISettings from '@/components/ai-settings/index.vue';
 import BatchPanel from '@/components/batch-panel/index.vue';
 import type { ConnectionEntity, TerminalTab as TerminalTabType } from '@/typings/connection';
+import { hasPermission, isPending } from '@/utils/auth';
 
 const { t } = useI18n();
+
+// 权限是登录时下发的快照：管理员改权限会踢人，重新登录才生效（与后端一致）
+const canUseTerminal = hasPermission('terminal');
+const canManageConnections = hasPermission('connections');
+const accountPending = isPending();
 
 const store = useTerminalStore();
 const connectionEditorRef = ref<InstanceType<typeof ConnectionEditor>>();
@@ -476,6 +486,17 @@ async function restoreOrCreateTabs() {
   background-color: rgb(var(--border-strong-rgb) / 95%);
   color: var(--accent);
   width: 24px;
+}
+
+.pending-banner {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: #ffb4ad;
+  background: rgba(248, 81, 73, 0.12);
+  border-bottom: 1px solid rgba(248, 81, 73, 0.3);
 }
 
 .terminal-area {

@@ -62,8 +62,12 @@
 </template>
 
 <script lang="ts" setup>
-import { ref, computed } from 'vue';
+import { ref, computed, onMounted } from 'vue';
 import { useI18n } from 'vue-i18n';
+import {
+  listSnippets, saveSnippet as apiSaveSnippet, deleteSnippet as apiDeleteSnippet, type Snippet,
+} from '@/service/snippet';
+import { toast } from '@/utils/toast';
 
 const { t } = useI18n();
 
@@ -72,41 +76,22 @@ const emit = defineEmits<{
   (e: 'close'): void;
 }>();
 
-interface Snippet {
-  id: string;
-  name: string;
-  command: string;
-}
-
-const STORAGE_KEY = 'aetherops-snippets-v1';
-
-function loadFromStorage(): Snippet[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const list = raw ? JSON.parse(raw) : [];
-    return Array.isArray(list) ? list.filter(s => s?.name && s?.command) : [];
-  } catch {
-    return [];
-  }
-}
-
-function persist() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(snippets.value));
-  } catch {
-    /* 存储失败忽略 */
-  }
-}
-
-const snippets = ref<Snippet[]>(loadFromStorage());
+// 片段原先存在 localStorage（换浏览器就丢），现在统一走服务端的 snippets 表
+const snippets = ref<Snippet[]>([]);
 const showForm = ref(false);
 const editingId = ref<string | null>(null);
 const form = ref({ name: '', command: '' });
 
 const canSave = computed(() => form.value.name.trim() !== '' && form.value.command.trim() !== '');
 
-function genId(): string {
-  return (crypto as any)?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+onMounted(loadSnippets);
+
+async function loadSnippets() {
+  try {
+    snippets.value = await listSnippets();
+  } catch (e: any) {
+    toast.error(e?.message || 'Failed to load snippets');
+  }
 }
 
 function openAdd() {
@@ -127,26 +112,36 @@ function cancelForm() {
   form.value = { name: '', command: '' };
 }
 
-function saveSnippet() {
+async function saveSnippet() {
   const name = form.value.name.trim();
   const command = form.value.command.trim();
   if (!name || !command) return;
-  if (editingId.value) {
-    const target = snippets.value.find(s => s.id === editingId.value);
-    if (target) {
-      target.name = name;
-      target.command = command;
+
+  try {
+    if (editingId.value) {
+      const saved = await apiSaveSnippet({ id: editingId.value, name, command });
+      const target = snippets.value.find(s => s.id === saved.id);
+      if (target) {
+        target.name = saved.name;
+        target.command = saved.command;
+      }
+    } else {
+      const saved = await apiSaveSnippet({ name, command });
+      snippets.value.unshift(saved);
     }
-  } else {
-    snippets.value.unshift({ id: genId(), name, command });
+    cancelForm();
+  } catch (e: any) {
+    toast.error(e?.message || 'Failed to save snippet');
   }
-  persist();
-  cancelForm();
 }
 
-function removeSnippet(id: string) {
-  snippets.value = snippets.value.filter(s => s.id !== id);
-  persist();
+async function removeSnippet(id: string) {
+  try {
+    await apiDeleteSnippet(id);
+    snippets.value = snippets.value.filter(s => s.id !== id);
+  } catch (e: any) {
+    toast.error(e?.message || 'Failed to delete snippet');
+  }
 }
 
 async function copySnippet(s: Snippet) {

@@ -111,7 +111,6 @@ Open **Settings → Extensions → AetherOps** (or add to `settings.json`):
 
 - `AETHEROPS_NODE`: Path to the `node` executable used to launch the backend. By default the extension prefers the VSCode host runtime (Electron), then falls back to nvm / Homebrew / system node. Set this only if auto-detection fails.
 - `AETHEROPS_DATA_DIR`: Overrides the data directory for connections / sessions / AI config / audit logs (default `~/.aetherops`). Takes precedence over `aetherops.dataDir` setting.
-- `AETHEROPS_AUTH_DISABLED`: Set to `1` to disable local token authentication (rarely needed).
 
 > The local-shell entry uses the special connection id `__local__`, which makes the backend spawn a local terminal session directly.
 

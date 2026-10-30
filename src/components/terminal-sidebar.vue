@@ -6,7 +6,7 @@
         <i class="bi bi-terminal me-1"></i>aetherops
       </span>
       <div class="d-flex gap-1">
-        <button class="btn-toolbar" @click="$emit('add-connection')" :title="t('app.addConnection')">
+        <button v-if="canManageConnections" class="btn-toolbar" @click="$emit('add-connection')" :title="t('app.addConnection')">
           <i class="bi bi-plus-lg"></i>
         </button>
         <button class="btn-toolbar" @click="$emit('refresh')" :title="t('common.refresh')">
@@ -37,7 +37,7 @@
       <div v-else-if="filteredConnections.length === 0" class="text-center p-4" style="color: var(--text-secondary);">
         <i class="bi bi-inbox" style="font-size: 24px;"></i>
         <div class="mt-2">{{ t('sidebar.noConnections') }}</div>
-        <button class="btn btn-sm btn-outline-primary mt-2" @click="$emit('add-connection')">
+        <button v-if="canManageConnections" class="btn btn-sm btn-outline-primary mt-2" @click="$emit('add-connection')">
           <i class="bi bi-plus me-1"></i>{{ t('sidebar.addConnection') }}
         </button>
       </div>
@@ -57,13 +57,13 @@
             </div>
           </div>
           <div class="d-flex gap-1" @click.stop>
-            <button class="btn-conn" @click="$emit('connect', conn)" :title="t('sidebar.connect')">
+            <button v-if="canUseTerminal" class="btn-conn" @click="$emit('connect', conn)" :title="t('sidebar.connect')">
               <i class="bi bi-play-fill"></i>
             </button>
-            <button class="btn-conn" @click="$emit('edit-connection', conn)" :title="t('common.edit')">
+            <button v-if="canManageConnections" class="btn-conn" @click="$emit('edit-connection', conn)" :title="t('common.edit')">
               <i class="bi bi-pencil"></i>
             </button>
-            <button class="btn-conn btn-conn-danger" @click="$emit('delete-connection', conn)" :title="t('common.delete')">
+            <button v-if="canManageConnections" class="btn-conn btn-conn-danger" @click="$emit('delete-connection', conn)" :title="t('common.delete')">
               <i class="bi bi-trash"></i>
             </button>
           </div>
@@ -75,15 +75,16 @@
     <div class="p-2 text-center d-flex align-items-center justify-content-between" style="font-size: 11px; color: var(--text-secondary); border-top: 1px solid var(--border-color);">
       <span>{{ connections.length }} {{ t('sidebar.connectionCount') }}</span>
       <div class="d-flex gap-1 align-items-center">
-        <button class="btn-ai-settings" @click="$emit('open-ai-settings')" :title="t('ai.settings')">
+        <button v-if="canUseAi" class="btn-ai-settings" @click="$emit('open-ai-settings')" :title="t('ai.settings')">
           <i class="bi bi-robot"></i>
         </button>
-        <button class="btn-ai-settings" @click="$emit('open-batch')" :title="t('batch.title')">
+        <button v-if="canUseTerminal" class="btn-ai-settings" @click="$emit('open-batch')" :title="t('batch.title')">
           <i class="bi bi-hdd-rack"></i>
         </button>
         <button class="btn-lang-switch" @click="toggleLocale" :title="currentLocale === 'zh-CN' ? 'Switch to English' : '切换到中文'">
           {{ currentLocale === 'zh-CN' ? 'EN' : '中' }}
         </button>
+        <AccountMenu />
       </div>
     </div>
   </div>
@@ -94,8 +95,15 @@ import { ref, computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import type { ConnectionEntity } from '@/typings/connection';
 import { setLocale, getLocale } from '@/utils/i18n';
+import { hasPermission } from '@/utils/auth';
+import AccountMenu from '@/components/account-menu/index.vue';
 
 const { t } = useI18n();
+
+// 权限只在页面加载时算一次：管理员改权限会踢人下线，重新登录后才生效
+const canUseTerminal = hasPermission('terminal');
+const canUseAi = hasPermission('ai');
+const canManageConnections = hasPermission('connections');
 
 const currentLocale = ref(getLocale());
 

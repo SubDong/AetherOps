@@ -11,39 +11,68 @@ import * as path from 'path';
 import * as fs from 'fs';
 
 // 直接导入服务端代码（开发模式不再依赖编译产物）
-import { ConnectionService } from './server/service/connection.service';
-import { SSHService } from './server/service/ssh.service';
-import { AIService } from './server/service/ai.service';
-import { SkillService } from './server/service/skill.service';
-import { AuditService } from './server/service/audit.service';
-import { MonitorService } from './server/service/monitor.service';
-import { BatchService } from './server/service/batch.service';
-import { getAccessToken, getCookieHeader, extractTokenFromHeaders, isValidToken, isAllowedOrigin, requiresToken, normalizeUploadName, maxUploadBytes } from './server/utils/security';
+//
+// 服务实例一律复用 server/index 的：自己再 new 一份，会出现「WS 在实例 A 上建会话、
+// REST 在实例 B 上查不到」这种只在 dev 才复现的怪问题。
+// 初始化时机与 server.js 完全一致：ensureDatabaseReady -> probeRedis -> initServices。
+import {
+  initServices as initServerServices,
+  handleRoutes,
+  connectionService,
+  sshService,
+  skillService,
+  auditService,
+  monitorService,
+  batchService,
+  aiService,
+  snippetService,
+  type AuthContext,
+} from './server/index';
+import { authenticate } from './server/service/auth.service';
+import { PUBLIC_PATHS, handleAccountRoutes } from './server/routes/auth.routes';
+import { extractBearerToken, isAllowedOrigin, normalizeUploadName, maxUploadBytes } from './server/utils/security';
 
 const urlPrefix = process.env.PREFIX ? `/${process.env.PREFIX}` : '';
 const devUploadLimitBytes = maxUploadBytes();
 
-// 共享服务实例（延迟初始化）
-let connectionService: ConnectionService | null = null;
-let sshService: SSHService | null = null;
-let skillService: SkillService | null = null;
-let auditService: AuditService | null = null;
-let monitorService: MonitorService | null = null;
-let batchService: BatchService | null = null;
-let aiService: AIService | null = null;
+let servicesReady: Promise<void> | null = null;
+function initServices(): Promise<void> {
+  if (!servicesReady) {
+    servicesReady = initServerServices().catch((e: any) => {
+      // dev 模式把原因说清楚：这是「没连上库/Redis」而不是「页面白屏」
+      console.error(`[dev] 服务初始化失败: ${e && e.message ? e.message : e}`);
+      servicesReady = null;
+      throw e;
+    });
+  }
+  return servicesReady;
+}
 
-// 初始化服务实例（仅在开发服务器启动时调用）
-function initServices() {
-  if (connectionService) return; // 已经初始化过了
-  
-  connectionService = new ConnectionService();
-  connectionService.init();
-  sshService = new SSHService(connectionService);
-  skillService = new SkillService();
-  auditService = new AuditService();
-  monitorService = new MonitorService(connectionService);
-  batchService = new BatchService(sshService, connectionService);
-  aiService = new AIService(sshService, skillService, auditService);
+/** 读取 JSON 请求体：dev 模式没有 express.json() */
+function readJsonBody(req: http.IncomingMessage): Promise<any> {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', (chunk) => { raw += chunk.toString(); });
+    req.on('end', () => { try { resolve(raw ? JSON.parse(raw) : {}); } catch (e) { reject(e); } });
+    req.on('error', reject);
+  });
+}
+
+/**
+ * 独立端点（上传 / 取 cwd）不走 handleRoutes，
+ * 所以权限点与会话归属要自己校一遍——与 server.js 的 assertSessionAccess 保持一致。
+ */
+function assertSessionAccess(ctx: AuthContext | null, sessionId: string, permissionKeys: string[]) {
+  if (!ctx) return { ok: false, status: 401, error: 'Unauthorized' };
+  const permissions = (ctx.permissions || {}) as Record<string, boolean>;
+  if (!permissionKeys.some((k) => permissions[k])) {
+    return { ok: false, status: 403, error: 'Forbidden: missing permission' };
+  }
+  const owner = sshService.getSessionOwner(String(sessionId));
+  if (owner && owner !== ctx.userId) {
+    return { ok: false, status: 403, error: 'Forbidden: session belongs to another user' };
+  }
+  return { ok: true };
 }
 
 const defaultInitState = {
@@ -175,33 +204,71 @@ const config = defineConfig({
         },
         {
             name: 'server-api',
-            configureServer(server) {
+            async configureServer(server) {
                 // 只在开发服务器启动时初始化服务
-                initServices();
-                server.middlewares.use((req: Connect.IncomingMessage, res: http.ServerResponse, next: Connect.NextFunction) => {
+                await initServices();
+                server.middlewares.use(async (req: Connect.IncomingMessage, res: http.ServerResponse, next: Connect.NextFunction) => {
                     const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+                    const pathname = requestUrl.pathname;
                     if (!isAllowedOrigin(req.headers.origin, req.headers.host)) {
                         res.statusCode = 403;
                         res.end('Forbidden origin');
                         return;
                     }
-                    const queryToken = requestUrl.searchParams.get('token');
-                    if (queryToken && isValidToken(queryToken)) {
-                        res.setHeader('Set-Cookie', getCookieHeader(queryToken, false));
-                        if (requestUrl.pathname === '/') {
-                            res.writeHead(302, { Location: '/' });
-                            res.end();
-                            return;
+
+                    // 登录态在这里统一解析，后面的路由直接读 ctx，与 server.js 同一套语义：
+                    // HTTP 只认 Bearer，?token= 只留给 WebSocket 升级（URL 里的令牌不该扩散到普通接口）
+                    const token = extractBearerToken(req.headers)
+                        || (pathname.startsWith('/ws/') ? requestUrl.searchParams.get('token') || '' : '');
+                    let user: AuthContext | null = null;
+                    if (token) {
+                        try {
+                            user = await authenticate(token) as unknown as AuthContext;
+                        } catch (err: any) {
+                            // Redis 故障等：不把异常当「已登录」，但要落日志而不是静默 401
+                            console.error('[dev][Auth] 令牌校验失败: ' + (err && err.message ? err.message : err));
                         }
                     }
-                    if ((requestUrl.pathname.startsWith('/api/') || requestUrl.pathname.startsWith('/ws/')) && requiresToken(req.headers.origin, req.headers.host) && !isValidToken(extractTokenFromHeaders(req.headers))) {
+                    (req as any).user = user;
+                    (req as any).authToken = token;
+
+                    // 只有接口需要登录：静态资源与 SPA 必须放行，否则登录页本身打不开
+                    const needsAuth = pathname.startsWith('/api/') || pathname.startsWith('/ws/');
+                    if (needsAuth && !PUBLIC_PATHS.has(pathname) && !user) {
                         res.statusCode = 401;
                         res.setHeader('Content-Type', 'application/json');
-                        res.end(JSON.stringify({ ret: 401, msg: 'Unauthorized' }));
+                        res.end(JSON.stringify({ ret: 401, msg: 'Unauthorized', error: 'unauthorized' }));
                         return;
                     }
-                    if (req.url?.startsWith('/api/')) {
-                        if (!serverRoute(req, res, next)) {
+
+                    // 账号相关端点：直接调 server 侧同一份实现，不在这里再写一遍
+                    if (pathname.startsWith('/api/auth/') || pathname.startsWith('/api/users/') || pathname.startsWith('/oauth/')) {
+                        try {
+                            const body = req.method && req.method.toUpperCase() === 'POST' ? await readJsonBody(req) : {};
+                            const handled = await handleAccountRoutes(pathname, body, {
+                                token,
+                                user: user as any,
+                                ip: String(req.socket?.remoteAddress || '').replace(/^::ffff:/, ''),
+                            });
+                            if (!handled) { next(); return; }
+                            if (handled.headers) {
+                                for (const [k, v] of Object.entries(handled.headers)) res.setHeader(k, v as string);
+                            }
+                            res.statusCode = handled.status;
+                            res.setHeader('Content-Type', 'application/json');
+                            res.end(JSON.stringify(handled.body));
+                        } catch (err: any) {
+                            console.error('[dev] Auth API Error:', err);
+                            res.statusCode = 500;
+                            res.setHeader('Content-Type', 'application/json');
+                            res.end(JSON.stringify({ ret: 500, msg: err?.message || 'Internal server error' }));
+                        }
+                        return;
+                    }
+
+                    if (pathname.startsWith('/api/')) {
+                        // serverRoute 是异步的，必须 await：不 await 拿到的是 Promise，永远为真
+                        if (!(await serverRoute(req, res, next, user))) {
                             res.statusCode = 404;
                             res.end('Not Found');
                         }
@@ -215,7 +282,7 @@ const config = defineConfig({
             name: 'server-ws',
             async configureServer(server) {
                 // 只在开发服务器启动时初始化服务
-                initServices();
+                await initServices();
                 try {
                     console.log('[WS] SSH service initialized from source');
 
@@ -225,24 +292,42 @@ const config = defineConfig({
                     console.log('[WS] WebSocket server (noServer) ready for /ws/terminal');
 
                     // 手动处理 upgrade，只拦截 /ws/terminal 路径
-                    server.httpServer.on('upgrade', (req, socket, head) => {
+                    server.httpServer.on('upgrade', async (req, socket, head) => {
                         const requestUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
                         if (requestUrl.pathname === '/ws/terminal') {
-                            const upgradeToken = requestUrl.searchParams.get('token') || extractTokenFromHeaders(req.headers);
-                            if (!isAllowedOrigin(req.headers.origin, req.headers.host) || (requiresToken(req.headers.origin, req.headers.host) && !isValidToken(upgradeToken))) {
+                            if (!isAllowedOrigin(req.headers.origin, req.headers.host)) {
+                                socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+                                socket.destroy();
+                                return;
+                            }
+                            // 浏览器 WebSocket 带不了自定义请求头，令牌走 ?token=
+                            const upgradeToken = extractBearerToken(req.headers) || requestUrl.searchParams.get('token');
+                            let wsUser: AuthContext | null = null;
+                            try { wsUser = await authenticate(upgradeToken) as unknown as AuthContext; }
+                            catch (err: any) { console.error('[dev][WS] 令牌校验失败: ' + (err && err.message ? err.message : err)); }
+                            if (!wsUser) {
                                 socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
                                 socket.destroy();
                                 return;
                             }
-                            wss.handleUpgrade(req, socket, head, (ws) => {
+                            // 终端权限在门禁处就拦掉，不要等进入 switch 才判
+                            if (!wsUser.permissions || !wsUser.permissions.terminal) {
+                                socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+                                socket.destroy();
+                                return;
+                            }
+                            (req as any).user = wsUser;
+                            wss.handleUpgrade(req, socket, head, (ws: any) => {
                                 wss.emit('connection', ws, req);
                             });
                         }
                         // 其他 WebSocket 请求（如 Vite HMR）不处理，自动放行
                     });
 
-                    wss.on('connection', async (ws: any) => {
-                        console.log('[WS] Client connected to Vite dev WebSocket');
+                    wss.on('connection', async (ws: any, req: any) => {
+                        const wsUser: AuthContext = req.user;
+                        const ownerId = wsUser.userId;
+                        console.log(`[WS] Client connected to Vite dev WebSocket user=${wsUser.username}`);
                         let sessionId: string | null = null;
 
                         // 捕获底层 socket 的 error 事件，防止 EAGAIN 等错误成为未捕获异常导致进程崩溃
@@ -290,6 +375,19 @@ const config = defineConfig({
                             }
 
                             const { type, sessionId: sid, data } = msg;
+
+                            // 会话归属校验：sessionId 由前端传入，必须属于当前登录人，
+                            // 否则猜到别人的 id 就能读写对方终端。type=create 例外（新建）。
+                            const targetSessionId = type === 'ai-agent-run' ? (data && data.aiSessionId) : sid;
+                            if (targetSessionId && type !== 'create') {
+                                const owner = sshService.getSessionOwner(targetSessionId);
+                                if (owner && owner !== ownerId) {
+                                    console.warn(`[WS] 拒绝访问他人会话: user=${wsUser.username} session=${targetSessionId}`);
+                                    safeSend(JSON.stringify({ type: 'error', sessionId: targetSessionId, data: 'Forbidden: session belongs to another user' }));
+                                    return;
+                                }
+                            }
+
                             switch (type) {
                                 case 'create': {
                                     const { connectionId, cols, rows, name } = data || {};
@@ -304,7 +402,7 @@ const config = defineConfig({
                                             safeSend(JSON.stringify({ type: 'conn-log', sessionId, data: msg }));
                                         };
 
-                                        const sshSession = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog);
+                                        const sshSession = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog, ownerId);
 
                                         // 根据会话类型设置数据接收
                                         const sendOutput = (chunk: any) => {
@@ -372,11 +470,15 @@ const config = defineConfig({
                                 }
                                 case 'ai-agent-run': {
                                     const { aiSessionId, message, context, skillId, locale } = data || {};
+                                    if (!wsUser.permissions || !wsUser.permissions.ai) {
+                                        safeSend(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Forbidden: missing permission' } }));
+                                        break;
+                                    }
                                     if (!aiSessionId || !message) {
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params' } }));
                                         break;
                                     }
-                                    aiService.agentRun(aiSessionId, message, context, (event: any) => {
+                                    aiService.agentRun(ownerId, aiSessionId, message, context, (event: any) => {
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, event }));
                                     }, skillId, locale).catch((err: any) => {
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, event: { type: 'error', error: err.message } }));
@@ -385,7 +487,7 @@ const config = defineConfig({
                                 }
                                 case 'ai-agent-stop': {
                                     const { aiSessionId: stopSid } = data || {};
-                                    if (stopSid) aiService.stopAgent(stopSid);
+                                    if (stopSid) aiService.stopAgent(ownerId, stopSid);
                                     break;
                                 }
                             }
@@ -454,11 +556,7 @@ function getViewInputs(dir: string): { [key: string]: string } {
     return inputObj;
 }
 
-async function serverRoute(req: Connect.IncomingMessage, res: http.ServerResponse, next: Connect.NextFunction) {
-  // 确保服务已初始化
-  if (!connectionService || !sshService || !aiService || !skillService || !auditService || !monitorService || !batchService) {
-    return next();
-  }
+async function serverRoute(req: Connect.IncomingMessage, res: http.ServerResponse, next: Connect.NextFunction, ctx: AuthContext | null) {
     try {
         if (!req.url?.startsWith('/api/')) return next();
         const parsedUrl = url.parse(req.url, true);
@@ -479,6 +577,12 @@ async function serverRoute(req: Connect.IncomingMessage, res: http.ServerRespons
             if (!sessionId || !fileName) {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ success: false, error: 'Missing X-Session-Id or X-File-Name header' }));
+                return true;
+            }
+            const uploadAccess = assertSessionAccess(ctx, sessionId, ['files', 'terminal']);
+            if (!uploadAccess.ok) {
+                res.writeHead(uploadAccess.status, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, error: uploadAccess.error, fileName }));
                 return true;
             }
             const chunks: Buffer[] = [];
@@ -528,6 +632,12 @@ async function serverRoute(req: Connect.IncomingMessage, res: http.ServerRespons
             }
             const zmodem = parsedUrl.query.zmodem === '1' || parsedUrl.query.zmodem === 'true';
             const force = parsedUrl.query.force === '1' || parsedUrl.query.force === 'true';
+            const cwdAccess = assertSessionAccess(ctx, sessionId, ['files', 'terminal']);
+            if (!cwdAccess.ok) {
+                res.writeHead(cwdAccess.status, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, cwd: '', error: cwdAccess.error }));
+                return true;
+            }
             try {
                 const { cwd, reliable } = await sshService!.getSessionCwdDetailed(String(sessionId), {
                     allowShellProbe: !zmodem,
@@ -548,274 +658,26 @@ async function serverRoute(req: Connect.IncomingMessage, res: http.ServerRespons
             res.end(JSON.stringify({ ret: 405, msg: 'Only POST method is allowed' }));
             return true;
         }
-        const body = await getRequestBody(req);
-        if (pathname.startsWith('/api/connection/') || pathname.startsWith('/api/terminal/') || pathname.startsWith('/api/ai/') || pathname.startsWith('/api/audit/') || pathname.startsWith('/api/monitor/') || pathname.startsWith('/api/batch/') || pathname.startsWith('/api/file/')) {
-            try {
-                const data = await handleRoute(pathname, body);
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ret: 0, msg: 'success', data }));
-            } catch (error: any) {
-                console.error(error);
-                res.writeHead(200, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ ret: 500, msg: error?.message || '系统异常' }));
-            }
-        } else {
-            res.writeHead(404, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ ret: 404, msg: 'API not found' }));
+        const body = await readJsonBody(req);
+        try {
+            const data = await handleRoutes(pathname, body, ctx as AuthContext);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ret: 0, msg: 'success', data }));
+        } catch (error: any) {
+            console.error(error);
+            // ApiError 自带 statusCode：403 不能报成 500，否则前端分不清「没权限」和「服务异常」
+            const status = error?.statusCode || 500;
+            res.writeHead(status, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ret: status, msg: error?.message || '系统异常' }));
         }
     } catch (error: any) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ret: 500, msg: error.message || 'Internal server error' }));
     }
     return true;
-
-    async function getRequestBody(req: http.IncomingMessage): Promise<any> {
-        return new Promise((resolve, reject) => {
-            let body = '';
-            req.on('data', chunk => { body += chunk.toString(); });
-            req.on('end', () => { try { resolve(body ? JSON.parse(body) : {}); } catch (e) { reject(e); } });
-            req.on('error', reject);
-        });
-    }
 }
 
-async function handleRoute(pathname: string, body: any) {
-  // 确保服务已初始化
-  if (!connectionService || !sshService || !aiService || !skillService || !auditService || !monitorService || !batchService) {
-    throw new Error('Services not initialized');
-  }
+// 业务路由全部走 server/index 的 handleRoutes：
+// 之前 dev 模式自己维护一份 handleRoute，两边签名一改就出现「生产能用、dev 401/500」的差异，
+// 账号体系把 ownerId 串进了每个仓储，两份实现已经无法靠人工保持同步。
 
-  // ========== 连接管理 ==========
-  if (pathname === '/api/connection/getConnections') {
-    return await connectionService!.getAllConnections();
-  }
-  if (pathname === '/api/connection/getConnection') {
-    const { id } = body;
-    if (!id) throw new Error('Missing parameter: id');
-    return await connectionService!.getConnectionById(id);
-  }
-  if (pathname === '/api/connection/addConnection') {
-    return await connectionService!.addConnection(body);
-  }
-  if (pathname === '/api/connection/updateConnection') {
-    const { id, ...updates } = body;
-    if (!id) throw new Error('Missing parameter: id');
-    return await connectionService!.updateConnection(id, updates);
-  }
-  if (pathname === '/api/connection/deleteConnection') {
-    const { id } = body;
-    if (!id) throw new Error('Missing parameter: id');
-    await connectionService!.deleteConnection(id);
-    return true;
-  }
-  if (pathname === '/api/connection/testConnection') {
-    return await connectionService!.testConnection(body);
-  }
-
-  // ========== 终端管理 ==========
-  if (pathname === '/api/terminal/getSessions') {
-    return sshService!.getSessions();
-  }
-  if (pathname === '/api/terminal/renameSession') {
-    const { sessionId, name } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    sshService!.renameSession(sessionId, name);
-    return true;
-  }
-  if (pathname === '/api/terminal/deleteSession') {
-    const { sessionId } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    sshService!.deleteSession(sessionId);
-    return true;
-  }
-  if (pathname === '/api/terminal/closeSession') {
-    const { sessionId } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    sshService!.closeSession(sessionId);
-    return true;
-  }
-  if (pathname === '/api/terminal/closeAllSessions') {
-    sshService!.closeAllSessions();
-    return true;
-  }
-
-  // ========== AI 配置 ==========
-
-  // 获取 AI 配置
-  if (pathname === '/api/ai/getConfig') {
-    return aiService!.getConfig();
-  }
-  // 更新 AI 配置
-  if (pathname === '/api/ai/updateConfig') {
-    return aiService!.updateConfig(body);
-  }
-  // 测试 AI 配置
-  if (pathname === '/api/ai/testConfig') {
-    return await aiService!.testConfig(body);
-  }
-  // AI 对话（非流式）
-  if (pathname === '/api/ai/chat') {
-    const { sessionId, message, context } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    if (!message) throw new Error('Missing parameter: message');
-    return await aiService!.chat(sessionId, message, context);
-  }
-  // 清空 AI 对话历史
-  if (pathname === '/api/ai/clearHistory') {
-    const { sessionId } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    aiService!.clearHistory(sessionId);
-    return true;
-  }
-  // 获取 Session 的系统环境信息
-  if (pathname === '/api/ai/getSystemContext') {
-    const { sessionId } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    return await sshService!.getSystemContext(sessionId);
-  }
-  // 获取 AI 对话显示历史
-  if (pathname === '/api/ai/getDisplayHistory') {
-    const { sessionId } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    return aiService!.loadDisplayHistory(sessionId);
-  }
-  // 保存 AI 对话显示历史
-  if (pathname === '/api/ai/saveDisplayHistory') {
-    const { sessionId, messages, sessionName } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    if (!messages) throw new Error('Missing parameter: messages');
-    aiService!.saveDisplayHistory(sessionId, messages, sessionName);
-    return true;
-  }
-  // 列出所有历史对话
-  if (pathname === '/api/ai/listHistories') {
-    return aiService!.listDisplayHistories();
-  }
-  // 加载指定历史对话
-  if (pathname === '/api/ai/loadHistory') {
-    const { sessionId } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    return aiService!.loadDisplayHistory(sessionId);
-  }
-  // 删除指定历史对话
-  if (pathname === '/api/ai/deleteHistory') {
-    const { sessionId } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    aiService!.deleteDisplayHistoryFile(sessionId);
-    return true;
-  }
-  // 获取 Skills 列表
-  if (pathname === '/api/ai/getSkills') {
-    return skillService!.getSkills();
-  }
-  // 获取指定 Skill
-  if (pathname === '/api/ai/getSkill') {
-    const { id } = body;
-    if (!id) throw new Error('Missing parameter: id');
-    const skill = skillService!.getSkill(id);
-    if (!skill) throw new Error('Skill not found: ' + id);
-    return skill;
-  }
-
-  // ========== 审计日志 ==========
-  if (pathname === '/api/audit/list') {
-    return auditService!.getLogs(body);
-  }
-  if (pathname === '/api/audit/stats') {
-    return auditService!.getStats(body?.date);
-  }
-  if (pathname === '/api/audit/export') {
-    const { startDate, endDate, format } = body;
-    if (!startDate || !endDate) throw new Error('Missing parameters: startDate, endDate');
-    return auditService!.exportLogs(startDate, endDate, format || 'json');
-  }
-  if (pathname === '/api/audit/dates') {
-    return auditService!.getAvailableDates();
-  }
-
-  // ========== 日志监控 ==========
-  if (pathname === '/api/monitor/start') {
-    const { sessionId, connectionId, logPath, pattern } = body;
-    if (!sessionId || !logPath) throw new Error('Missing parameters: sessionId, logPath');
-    return await monitorService!.startMonitor(sessionId, connectionId || '', logPath, pattern);
-  }
-  if (pathname === '/api/monitor/stop') {
-    const { monitorId } = body;
-    if (!monitorId) throw new Error('Missing parameter: monitorId');
-    return monitorService!.stopMonitor(monitorId);
-  }
-  if (pathname === '/api/monitor/list') {
-    return monitorService!.getActiveMonitors(body?.sessionId);
-  }
-  if (pathname === '/api/monitor/alerts') {
-    const { monitorId, limit } = body;
-    if (!monitorId) throw new Error('Missing parameter: monitorId');
-    return monitorService!.getAlerts(monitorId, limit);
-  }
-  if (pathname === '/api/monitor/lines') {
-    const { monitorId, limit } = body;
-    if (!monitorId) throw new Error('Missing parameter: monitorId');
-    return monitorService!.getRecentLines(monitorId, limit);
-  }
-  if (pathname === '/api/monitor/analyze') {
-    const { monitorId } = body;
-    if (!monitorId) throw new Error('Missing parameter: monitorId');
-    return monitorService!.getBatchForAnalysis(monitorId);
-  }
-
-  // ========== 批量操作 ==========
-  if (pathname === '/api/batch/execute') {
-    const { sessionIds, command, timeout } = body;
-    if (!sessionIds || !Array.isArray(sessionIds) || sessionIds.length === 0) {
-      throw new Error('Missing parameter: sessionIds (non-empty array)');
-    }
-    if (!command) throw new Error('Missing parameter: command');
-    return await batchService!.executeBatch(sessionIds, command, timeout);
-  }
-  if (pathname === '/api/batch/result') {
-    const { taskId } = body;
-    if (!taskId) throw new Error('Missing parameter: taskId');
-    return batchService!.getTask(taskId);
-  }
-  if (pathname === '/api/batch/tasks') {
-    return batchService!.getTasks();
-  }
-
-  // ========== 文件管理（SFTP / 本地 fs） ==========
-
-  // 列出目录内容
-  if (pathname === '/api/file/list') {
-    const { sessionId, path: remotePath } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    return await sshService!.listDirectory(sessionId, remotePath || '/');
-  }
-  // 创建目录
-  if (pathname === '/api/file/mkdir') {
-    const { sessionId, path: remotePath } = body;
-    if (!sessionId || !remotePath) throw new Error('Missing parameter: sessionId, path');
-    await sshService!.makeDirectory(sessionId, remotePath);
-    return true;
-  }
-  // 删除文件或目录
-  if (pathname === '/api/file/remove') {
-    const { sessionId, path: remotePath } = body;
-    if (!sessionId || !remotePath) throw new Error('Missing parameter: sessionId, path');
-    await sshService!.removePath(sessionId, remotePath);
-    return true;
-  }
-  // 重命名 / 移动
-  if (pathname === '/api/file/rename') {
-    const { sessionId, oldPath, newPath } = body;
-    if (!sessionId || !oldPath || !newPath) throw new Error('Missing parameter: sessionId, oldPath, newPath');
-    await sshService!.renamePath(sessionId, oldPath, newPath);
-    return true;
-  }
-  // 获取会话默认目录（home）
-  if (pathname === '/api/file/defaultDir') {
-    const { sessionId } = body;
-    if (!sessionId) throw new Error('Missing parameter: sessionId');
-    return await sshService!.getDefaultDirectory(sessionId);
-  }
-
-  throw new Error('API endpoint not found');
-}

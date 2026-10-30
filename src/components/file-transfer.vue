@@ -203,6 +203,7 @@ import { ref, computed } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { Zmodem, formatFileSize, type ZmodemProgress } from '@/utils/zmodem';
 import { toast } from '@/utils/toast';
+import { authHeaders, getToken } from '@/utils/auth';
 
 const { t } = useI18n();
 
@@ -315,14 +316,16 @@ async function queryCwd(zmodem?: boolean, force?: boolean): Promise<{ cwd: strin
     let cwd = '';
     let reliable = false;
     if (electronApi?.api?.getCwd) {
-      const res = await electronApi.api.getCwd(sid, !!zmodem, !!force);
+      const res = await electronApi.api.getCwd(sid, !!zmodem, !!force, getToken());
       cwd = res?.cwd || '';
       reliable = res?.reliable !== false && !!cwd;
       if (!cwd && res?.error) destDirError.value = res.error;
     } else {
       const zmodemParam = zmodem ? '&zmodem=1' : '';
       const forceParam = force ? '&force=1' : '';
-      const resp = await fetch(`/api/cwd?sessionId=${encodeURIComponent(sid)}${zmodemParam}${forceParam}`);
+      const resp = await fetch(`/api/cwd?sessionId=${encodeURIComponent(sid)}${zmodemParam}${forceParam}`, {
+        headers: authHeaders(),
+      });
       const data = await resp.json();
       cwd = data?.cwd || '';
       reliable = data?.reliable !== false && !!cwd;
@@ -854,7 +857,7 @@ async function httpFileUpload(
     try {
       const buffer = await file.arrayBuffer();
       console.log(`[FileTransfer] IPC upload: ${file.name} -> ${remoteName}, size=${file.size}`);
-      const result = await electronApi.api.uploadFile(sessionId || '', remoteName, buffer);
+      const result = await electronApi.api.uploadFile(sessionId || '', remoteName, buffer, getToken());
       console.log(`[FileTransfer] IPC upload result:`, result);
       return result;
     } catch (err: any) {
@@ -872,6 +875,7 @@ async function httpFileUpload(
         'X-Session-Id': sessionId || '',
         'X-File-Name': remoteName,
         'Content-Type': 'application/octet-stream',
+        ...authHeaders(),
       },
       body: file,
     });

@@ -103,8 +103,6 @@ docker-compose up -d
 | `AETHEROPS_CONFIG` | 直接指定配置文件路径（绝对路径，或相对当前工作目录）。设置后**不再**读写数据目录下的 `config.json`，也不会在那边生成模板；指错路径会直接报错退出 | 未设 |
 | `AETHEROPS_DB_HOST` / `AETHEROPS_DB_PORT` / `AETHEROPS_DB_USER` / `AETHEROPS_DB_PASSWORD` / `AETHEROPS_DB_NAME` | 覆盖 `config.json` 里 `database` 段的对应项，用于不想把密码落盘的场景 | 主机/账号/密码为空，库名 `aetherops` |
 | `AETHEROPS_DB_POOL_SIZE` / `AETHEROPS_DB_SSL` / `AETHEROPS_DB_TZ` | 连接池上限 / 是否走 TLS / 驱动时区 | `10` / 未设 / `+00:00` |
-| `AETHEROPS_ACCESS_TOKEN` | 固定访问令牌；未设置则每次启动随机生成并打印到日志 | 随机生成 |
-| `AETHEROPS_AUTH_DISABLED` | 设为 `1` / `true` 关闭令牌校验。仅适用于内网临时调试，对外暴露等于无认证 | 未设 |
 | `AETHEROPS_MAX_UPLOAD_MB` | 单次文件上传上限（同时决定 WS `maxPayload`） | `100` |
 | `AETHEROPS_SSH_DEBUG` | 设为 `1` 时转发远端 `ssh -vvv` 调试输出到前端，便于排障 | 未设 |
 | `AETHEROPS_NODE` | 指定启动后端的 `node` 可执行文件路径（VSCode 扩展宿主使用） | 自动探测 |
@@ -252,7 +250,6 @@ git push origin v0.1.6
 │   └── 2025-06-01.jsonl
 ├── skills/             # 用户自定义技能
 │   └── my-deploy.md
-├── access-token        # 未固定令牌时的随机访问令牌
 ├── server.log          # 服务端日志
 └── .trash/             # 回收站
 ```
@@ -271,13 +268,13 @@ AETHEROPS_DATA_DIR=/data/aetherops node server.js
 |------|------|
 | `server` | 监听端口与地址（对应 `PORT` / `HOST`） |
 | `database` | MySQL 连接参数（主机/端口/账号密码/库名/连接池），待存储层接入后生效 |
-| `auth` | 令牌开关、上传上限 |
+| `auth` | 上传上限、宿主探活令牌（不参与用户鉴权） |
 | `debug` | SSH 调试输出转发 |
 
 优先级：内置默认值 < 配置文件 < 环境变量。因此同一份镜像可以用环境变量临时改行为，
 不必动盘上的文件；把密码写在配置文件里则重启后仍然有效。
 
-环境变量命名见上文 `AETHEROPS_DB_*` / `AETHEROPS_ACCESS_TOKEN` 等条目。文件内容写坏（不是
+环境变量命名见上文 `AETHEROPS_DB_*` / `AETHEROPS_REDIS_*` 等条目。文件内容写坏（不是
 合法 JSON）会直接报错退出，不会静默回到默认值；`database` 段填写完成后，日志会打印
 一行 `user@host:port/dbname` 的连接摘要（不含密码）以便确认到底读到了哪份配置。
 

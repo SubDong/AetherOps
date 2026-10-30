@@ -1,8 +1,7 @@
 import * as fs from 'fs';
-import * as path from 'path';
 import * as os from 'os';
 import * as crypto from 'crypto';
-import { getDataDir, getDataPath, ensureDir } from '../utils/data-dir';
+import { getDataPath } from '../utils/data-dir';
 import { AuditService } from './audit.service';
 import { assessDangerousCommand } from '../utils/shell';
 import {
@@ -14,6 +13,15 @@ import type {
   Message, ToolContext, ToolDefinition,
 } from '@cicctencent/agent-core';
 import { extractTextFromContent } from '@cicctencent/agent-core';
+import { loadAIConfigRow, saveAIConfigRow, DEFAULT_AI_CONFIG_ID } from '../db/repositories/ai-config.repo';
+import {
+  saveHistory, loadHistoryMessages, listHistories, deleteHistory,
+} from '../db/repositories/ai-history.repo';
+import {
+  saveChatMessages as saveChatMessagesRow,
+  loadChatMessages as loadChatMessagesRow,
+  deleteChatMessages as deleteChatMessagesRow,
+} from '../db/repositories/ai-messages.repo';
 
 const ENCRYPTED_PREFIX = 'enc:v1:';
 
@@ -75,11 +83,6 @@ export interface HistoryMeta {
   preview: string;
 }
 
-interface HistoryFile {
-  meta: HistoryMeta;
-  messages: DisplayMessage[];
-}
-
 // ========== 服务依赖接口 ==========
 
 interface ISSHService {
@@ -92,7 +95,7 @@ interface ISSHService {
 }
 
 interface ISkillService {
-  getSkill(id: string): { name: string; content: string } | undefined;
+  getSkill(ownerId: string, id: string): Promise<{ name: string; content: string } | undefined>;
 }
 
 // ========== Agent System Prompt ==========
@@ -175,19 +178,20 @@ Response format (important):
 // ============================================================
 
 export class AIService {
-  // ---- 配置 & 持久化 ----
-  private configDir: string;
-  private configPath: string;
-  private config: AIConfig;
-  private historyDir: string;
-  private messagesDir: string;
+  // ---- 配置（按账号） ----
+  // 不能再用一个 this.config：同进程里多个账号同时在用，谁最后保存谁覆盖所有人。
+  // 除 abortControllers 外，所有状态都以 ownerId 为 key。
+  private configs = new Map<string, AIConfig>();
 
-  // ---- agent-core 组件 ----
-  private llmProvider?: LLMProvider;
+  // ---- agent-core 组件（按账号） ----
+  // engine 绑定的是某个账号的 provider（模型 / Key / BaseURL），所以也必须一人一个
+  private providers = new Map<string, LLMProvider>();
+  private engines = new Map<string, AgentEngine>();
   private toolRegistry: ToolRegistry;
   private contextManager: ContextManager;
   private securityGuard: SecurityGuard;
-  private engine?: AgentEngine;
+  /** key 是 `ownerId:sessionId`：sessionId 由前端传，不能假定跨账号唯一，
+   *  否则拿到别人的 sessionId 就能中止对方的 Agent。 */
   private abortControllers = new Map<string, AbortController>();
 
   // ---- 状态 ----
@@ -199,14 +203,6 @@ export class AIService {
   private readonly MAX_AGENT_ITERATIONS = 15;
 
   constructor(sshService?: ISSHService, skillService?: ISkillService, auditService?: AuditService) {
-    this.configDir = getDataDir();
-    this.configPath = getDataPath('ai-config.json');
-    this.historyDir = getDataPath('ai-history');
-    // 不能用 path.resolve('data', 'messages')：那依赖 process.cwd()，
-    // 在 VSCode 扩展 / Electron 宿主里 cwd 是任意目录，会往用户工作区写 data/messages/。
-    // 统一走数据目录，与 connections.json / ai-history 保持同一位置。
-    this.messagesDir = getDataPath('messages');
-    this.config = this.getDefaultConfig();
     this.sshService = sshService;
     this.skillService = skillService;
     this.auditService = auditService;
@@ -225,39 +221,78 @@ export class AIService {
     // agent-core 0.1.4 已内置 Windows 黑名单（format C:, clear-disk, rd /s, Remove-Item drive root）
     // 无需再手动添加
 
-    this.loadConfig();
-    try { if (!fs.existsSync(this.historyDir)) fs.mkdirSync(this.historyDir, { recursive: true }); } catch (_) { /* ignore */ }
-    ensureDir(this.messagesDir);
     this.registerBuiltinTools();
+  }
+
+  /**
+   * 配置改为按账号懒加载：启动时还不知道谁会登录，
+   * 在这里读任何一条 ai_config 都只是猜。
+   */
+  async init(): Promise<void> {
+    console.log('[AIService] 配置按账号懒加载（登录后首次使用时读取 ai_config）');
+  }
+
+  // ========== 按账号配置 ==========
+
+  /**
+   * 取某个账号的配置：没缓存就读库，库里没记录就用默认值。
+   * 读库失败直接抛：拿默认配置继续跑会让用户以为「Key 丢了」，实际是库连不上。
+   */
+  private async ensureConfig(ownerId: string): Promise<AIConfig> {
+    const cached = this.configs.get(ownerId);
+    if (cached) return cached;
+
+    let config = this.getDefaultConfig();
+    const row = await loadAIConfigRow(ownerId);
+    if (row) {
+      config = {
+        ...config,
+        enabled: row.enabled,
+        provider: row.provider || config.provider,
+        apiKey: this.decryptSecretIfNeeded(row.apiKeyEnc),
+        baseUrl: row.baseUrl || config.baseUrl,
+        model: row.model || config.model,
+        maxTokens: row.maxTokens ?? config.maxTokens,
+        temperature: row.temperature ?? config.temperature,
+      };
+    }
+    this.configs.set(ownerId, config);
+    return config;
   }
 
   // ========== LLM Provider & Engine 懒初始化 ==========
 
-  private ensureLLMProvider(): LLMProvider | undefined {
-    if (!this.config.apiKey) return undefined;
-    if (!this.llmProvider) {
-      this.llmProvider = createLLMProvider({
-        provider: this.config.provider || 'openai',
-        model: this.config.model,
-        apiKey: this.config.apiKey,
-        baseUrl: this.config.baseUrl,
-        temperature: this.config.temperature,
-        maxTokens: this.config.maxTokens,
+  private async ensureLLMProvider(ownerId: string): Promise<LLMProvider | undefined> {
+    const config = await this.ensureConfig(ownerId);
+    if (!config.apiKey) return undefined;
+
+    let provider = this.providers.get(ownerId);
+    if (!provider) {
+      provider = createLLMProvider({
+        provider: config.provider || 'openai',
+        model: config.model,
+        apiKey: config.apiKey,
+        baseUrl: config.baseUrl,
+        temperature: config.temperature,
+        maxTokens: config.maxTokens,
       });
+      this.providers.set(ownerId, provider);
     }
-    return this.llmProvider;
+    return provider;
   }
 
-  private resetProviderAndEngine(): void {
-    this.llmProvider = undefined;
-    this.engine = undefined;
+  private resetProviderAndEngine(ownerId: string): void {
+    this.providers.delete(ownerId);
+    this.engines.delete(ownerId);
   }
 
-  private getEngine(): AgentEngine | undefined {
-    const provider = this.ensureLLMProvider();
+  private async getEngine(ownerId: string): Promise<AgentEngine | undefined> {
+    const provider = await this.ensureLLMProvider(ownerId);
     if (!provider) return undefined;
-    if (!this.engine) {
-      this.engine = new AgentEngine({
+
+    let engine = this.engines.get(ownerId);
+    if (!engine) {
+      engine = new AgentEngine({
         llmProvider: provider,
         toolRegistry: this.toolRegistry,
         contextManager: this.contextManager,
@@ -265,13 +300,14 @@ export class AIService {
         basePrompt: AGENT_SYSTEM_PROMPT,
         maxIterations: this.MAX_AGENT_ITERATIONS,
         maxMessages: this.MAX_MESSAGES,
-        hooks: this.buildHooks(),
+        hooks: this.buildHooks(ownerId),
       });
+      this.engines.set(ownerId, engine);
     }
-    return this.engine;
+    return engine;
   }
 
-  private buildHooks(): import('@cicctencent/agent-core').Hook[] {
+  private buildHooks(ownerId: string): import('@cicctencent/agent-core').Hook[] {
     if (!this.auditService) return [];
     const auditService = this.auditService;
     const sshService = this.sshService;
@@ -283,7 +319,8 @@ export class AIService {
           const command = ctx.tool === 'execute_command'
             ? (ctx.args?.command as string || '')
             : JSON.stringify(ctx.args);
-          const auditEntry = auditService.log({
+          // ownerId 从构造时闭包捕获：hooks 挂在某人的 engine 上，不会串号
+          await auditService.log(ownerId, {
             sessionId: ctx.sessionId,
             sessionName: sshService?.getSession(ctx.sessionId)?.name,
             connectionId: sshService?.getSession(ctx.sessionId)?.connectionId,
@@ -309,38 +346,33 @@ export class AIService {
     };
   }
 
-  private loadConfig(): void {
-    try {
-      if (fs.existsSync(this.configPath)) {
-        const data = fs.readFileSync(this.configPath, 'utf-8');
-        const savedConfig = this.decryptConfig(JSON.parse(data));
-        this.config = { ...this.getDefaultConfig(), ...savedConfig };
-      }
-    } catch (error) { console.error('[AIService] Failed to load config:', error); }
+  /** 密文字段按需解密：数据库里存的永远是 enc:v1: 密文 */
+  private decryptSecretIfNeeded(value: string): string {
+    if (!value) return '';
+    return value.startsWith(ENCRYPTED_PREFIX) ? this.decryptSecret(value) : value;
   }
 
-  private saveConfig(): void {
-    try {
-      if (!fs.existsSync(this.configDir)) fs.mkdirSync(this.configDir, { recursive: true });
-      fs.writeFileSync(this.configPath, JSON.stringify(this.encryptConfig(this.config), null, 2), { encoding: 'utf-8', mode: 0o600 });
-      try { fs.chmodSync(this.configPath, 0o600); } catch (_) { /* ignore */ }
-    } catch (error) { console.error('[AIService] Failed to save config:', error); throw error; }
-  }
-
-  private encryptConfig(config: AIConfig): AIConfig {
-    const encrypted = { ...config };
-    if (encrypted.apiKey && !encrypted.apiKey.startsWith(ENCRYPTED_PREFIX)) {
-      encrypted.apiKey = this.encryptSecret(encrypted.apiKey);
-    }
-    return encrypted;
-  }
-
-  private decryptConfig(config: Partial<AIConfig>): Partial<AIConfig> {
-    const decrypted = { ...config };
-    if (typeof decrypted.apiKey === 'string' && decrypted.apiKey.startsWith(ENCRYPTED_PREFIX)) {
-      decrypted.apiKey = this.decryptSecret(decrypted.apiKey);
-    }
-    return decrypted;
+  /**
+   * 写配置到 MySQL。
+   * 写失败必须抛出去：吞掉会让前端看到「已保存」而库里还是旧值，
+   * 这是最难查的一类不一致。
+   */
+  private async saveConfig(ownerId: string): Promise<void> {
+    const config = await this.ensureConfig(ownerId);
+    const encryptedKey = config.apiKey && !config.apiKey.startsWith(ENCRYPTED_PREFIX)
+      ? this.encryptSecret(config.apiKey)
+      : config.apiKey;
+    await saveAIConfigRow(ownerId, {
+      id: DEFAULT_AI_CONFIG_ID,
+      label: '默认',
+      enabled: config.enabled,
+      provider: config.provider,
+      baseUrl: config.baseUrl,
+      model: config.model,
+      apiKeyEnc: encryptedKey || '',
+      maxTokens: config.maxTokens ?? null,
+      temperature: config.temperature ?? null,
+    });
   }
 
   private getEncryptionKey(): Buffer {
@@ -384,30 +416,31 @@ export class AIService {
 
   // ========== 公共配置 API ==========
 
-  getConfig(): AIConfig {
-    const maskedConfig = { ...this.config };
-    if (maskedConfig.apiKey) {
-      const key = maskedConfig.apiKey;
-      maskedConfig.apiKey = key.substring(0, 8) + '****' + key.substring(key.length - 4);
-    }
-    return maskedConfig;
+  /**
+   * 读取账号自己的 AI 配置。
+   *
+   * apiKey 不做掩码：配置已按账号隔离，读到的必然是调用者本人的 key，
+   * 再打一遍码只会让用户没法核对、也没法把 key 复制出来用。
+   * 需要遮眼时由前端输入框自己的眼睛开关负责，不影响这里原样下发。
+   */
+  async getConfig(ownerId: string): Promise<AIConfig> {
+    return { ...await this.ensureConfig(ownerId) };
   }
 
-  getFullConfig(): AIConfig { return { ...this.config }; }
-
-  updateConfig(updates: Partial<AIConfig>): AIConfig {
-    // 如果传入的 apiKey 是掩码值（包含 ****），则保留原有的真实 apiKey
-    if (updates.apiKey && updates.apiKey.includes('****')) {
-      delete updates.apiKey;
-    }
-    this.config = { ...this.config, ...updates };
-    this.saveConfig();
-    this.resetProviderAndEngine();
-    return this.getConfig();
+  async getFullConfig(ownerId: string): Promise<AIConfig> {
+    return this.getConfig(ownerId);
   }
 
-  async testConfig(config?: Partial<AIConfig>): Promise<{ success: boolean; message: string }> {
-    const testCfg = { ...this.config, ...config };
+  async updateConfig(ownerId: string, updates: Partial<AIConfig>): Promise<AIConfig> {
+    // 入参就是完整配置：读取时不再下发掩码值，前端也就不可能把 **** 回传覆盖掉真实 key
+    this.configs.set(ownerId, { ...await this.ensureConfig(ownerId), ...updates });
+    await this.saveConfig(ownerId);
+    this.resetProviderAndEngine(ownerId);
+    return this.getConfig(ownerId);
+  }
+
+  async testConfig(ownerId: string, config?: Partial<AIConfig>): Promise<{ success: boolean; message: string }> {
+    const testCfg = { ...await this.ensureConfig(ownerId), ...config };
     if (!testCfg.apiKey) return { success: false, message: 'API Key not configured' };
     try {
       const provider = createLLMProvider({
@@ -622,6 +655,7 @@ export class AIService {
   // ========== Agent 核心循环 ==========
 
   async agentRun(
+    ownerId: string,
     sessionId: string,
     userMessage: string,
     context: string | undefined,
@@ -629,7 +663,7 @@ export class AIService {
     skillId?: string,
     locale?: string,
   ): Promise<void> {
-    const engine = this.getEngine();
+    const engine = await this.getEngine(ownerId);
     if (!engine) {
       eventCallback({ type: 'error', error: 'API Key not configured. Please set it in AI settings.' });
       return;
@@ -649,21 +683,21 @@ export class AIService {
     }
 
     if (skillId && this.skillService) {
-      const skill = this.skillService.getSkill(skillId);
+      const skill = await this.skillService.getSkill(ownerId, skillId);
       if (skill) {
         systemPromptOverride += `\n\n## Current Task Instructions (Skill: ${skill.name})\n\n${skill.content}`;
       }
     }
 
     // 加载并注入会话历史
-    const savedHistory = this.loadChatMessages(sessionId);
+    const savedHistory = await this.loadChatMessages(ownerId, sessionId);
     if (savedHistory && savedHistory.length > 0) {
       engine.setHistory(sessionId, savedHistory);
     }
 
     // AbortController 管理
     const ctrl = new AbortController();
-    this.abortControllers.set(sessionId, ctrl);
+    this.abortControllers.set(this.abortKey(ownerId, sessionId), ctrl);
 
     try {
       // 注入 shell 执行器：新版 agent-core 的内置 execute_command/read_terminal 走
@@ -687,20 +721,24 @@ export class AIService {
     } catch (error: any) {
       eventCallback({ type: 'error', error: error.message || 'Agent runtime error' });
     } finally {
-      this.abortControllers.delete(sessionId);
+      this.abortControllers.delete(this.abortKey(ownerId, sessionId));
       // 持久化 LLM 上下文消息
       try {
         const snapshot = engine.getHistorySnapshot(sessionId);
-        if (snapshot && snapshot.length > 0) this.saveChatMessages(sessionId, snapshot);
+        if (snapshot && snapshot.length > 0) await this.saveChatMessages(ownerId, sessionId, snapshot);
       } catch { /* ignore */ }
     }
   }
 
-  stopAgent(sessionId: string): boolean {
-    const ctrl = this.abortControllers.get(sessionId);
+  private abortKey(ownerId: string, sessionId: string): string {
+    return `${ownerId}:${sessionId}`;
+  }
+
+  stopAgent(ownerId: string, sessionId: string): boolean {
+    const ctrl = this.abortControllers.get(this.abortKey(ownerId, sessionId));
     if (ctrl) {
       ctrl.abort();
-      this.engine?.abort(sessionId);
+      this.engines.get(ownerId)?.abort(sessionId);
       return true;
     }
     return false;
@@ -708,11 +746,12 @@ export class AIService {
 
   // ========== 非 Agent 对话 ==========
 
-  async chat(sessionId: string, userMessage: string, context?: string): Promise<string> {
-    const provider = this.ensureLLMProvider();
+  async chat(ownerId: string, sessionId: string, userMessage: string, context?: string): Promise<string> {
+    const provider = await this.ensureLLMProvider(ownerId);
     if (!provider) throw new Error('API Key not configured. Please set it in AI settings.');
+    const config = await this.ensureConfig(ownerId);
 
-    const history = this.loadChatMessages(sessionId) || [];
+    const history = (await this.loadChatMessages(ownerId, sessionId)) || [];
     const messages: Message[] = [{ role: 'system', content: AGENT_SYSTEM_PROMPT }];
     if (context) messages.push({ role: 'system', content: `Recent terminal output:\n\`\`\`\n${context}\n\`\`\`` });
     messages.push(...history);
@@ -722,14 +761,14 @@ export class AIService {
     try {
       const response = await provider.chat({
         messages,
-        maxTokens: this.config.maxTokens,
-        temperature: this.config.temperature,
+        maxTokens: config.maxTokens,
+        temperature: config.temperature,
       });
       const content = response.choices?.[0]?.message?.content;
       if (content) {
         const textContent = extractTextFromContent(content);
         history.push({ role: 'assistant', content: textContent });
-        this.saveChatMessages(sessionId, history);
+        await this.saveChatMessages(ownerId, sessionId, history);
         return textContent;
       }
       throw new Error('AI response is empty');
@@ -740,14 +779,16 @@ export class AIService {
   }
 
   async *chatStream(
+    ownerId: string,
     sessionId: string,
     userMessage: string,
     context?: string,
   ): AsyncGenerator<string, void, unknown> {
-    const provider = this.ensureLLMProvider();
+    const provider = await this.ensureLLMProvider(ownerId);
     if (!provider) throw new Error('API Key not configured. Please set it in AI settings.');
+    const config = await this.ensureConfig(ownerId);
 
-    const history = this.loadChatMessages(sessionId) || [];
+    const history = (await this.loadChatMessages(ownerId, sessionId)) || [];
     const messages: Message[] = [{ role: 'system', content: AGENT_SYSTEM_PROMPT }];
     if (context) messages.push({ role: 'system', content: `Recent terminal output:\n\`\`\`\n${context}\n\`\`\`` });
     messages.push(...history);
@@ -758,8 +799,8 @@ export class AIService {
     try {
       const stream = provider.chatStream({
         messages,
-        maxTokens: this.config.maxTokens,
-        temperature: this.config.temperature,
+        maxTokens: config.maxTokens,
+        temperature: config.temperature,
       });
       for await (const chunk of stream) {
         const content = chunk.delta?.content;
@@ -771,7 +812,7 @@ export class AIService {
       }
       if (fullResponse) {
         history.push({ role: 'assistant', content: fullResponse });
-        this.saveChatMessages(sessionId, history);
+        await this.saveChatMessages(ownerId, sessionId, history);
       }
     } catch (error: any) {
       history.pop();
@@ -781,105 +822,78 @@ export class AIService {
 
   // ========== LLM 上下文消息持久化 ==========
 
-  clearHistory(sessionId: string): void {
+  async clearHistory(ownerId: string, sessionId: string): Promise<void> {
     this.loadedSessions.delete(sessionId);
-    this.deleteDisplayHistoryFile(sessionId);
-    this.deleteChatMessagesFile(sessionId);
-    this.engine?.setHistory(sessionId, []);
+    await Promise.all([
+      deleteHistory(ownerId, sessionId),
+      deleteChatMessagesRow(ownerId, sessionId),
+    ]);
+    this.engines.get(ownerId)?.setHistory(sessionId, []);
   }
 
-  getHistory(sessionId: string): Message[] | null {
-    return this.loadChatMessages(sessionId);
+  async getHistory(ownerId: string, sessionId: string): Promise<Message[] | null> {
+    return this.loadChatMessages(ownerId, sessionId);
   }
 
-  private saveChatMessages(sessionId: string, messages: Message[]): void {
+  private async saveChatMessages(ownerId: string, sessionId: string, messages: Message[]): Promise<void> {
     try {
-      ensureDir(this.messagesDir);
-      const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
-      const filePath = path.join(this.messagesDir, `${safe}.json`);
-      fs.writeFileSync(filePath, JSON.stringify({ sessionId, updatedAt: Date.now(), messages }, null, 2), 'utf-8');
-    } catch { /* 静默失败 */ }
+      await saveChatMessagesRow(ownerId, sessionId, messages.slice(-this.MAX_MESSAGES));
+    } catch (error: any) {
+      // 上下文写失败不该让对话本身失败，但必须留痕：否则下一轮会“失忆”而无从查起
+      console.error('[AIService] Failed to save chat messages:', error.message);
+    }
   }
 
-  private loadChatMessages(sessionId: string): Message[] | null {
+  private async loadChatMessages(ownerId: string, sessionId: string): Promise<Message[] | null> {
     try {
-      if (!fs.existsSync(this.messagesDir)) return null;
-      const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
-      const filePath = path.join(this.messagesDir, `${safe}.json`);
-      if (!fs.existsSync(filePath)) return null;
-      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-      if (data && Array.isArray(data.messages)) return data.messages.slice(-this.MAX_MESSAGES);
+      const messages = await loadChatMessagesRow(ownerId, sessionId);
+      if (!messages || messages.length === 0) return null;
+      return messages.slice(-this.MAX_MESSAGES) as Message[];
+    } catch (error: any) {
+      console.error('[AIService] Failed to load chat messages:', error.message);
       return null;
-    } catch { return null; }
-  }
-
-  private deleteChatMessagesFile(sessionId: string): void {
-    try {
-      const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
-      const filePath = path.join(this.messagesDir, `${safe}.json`);
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    } catch { /* 静默失败 */ }
+    }
   }
 
   // ========== 对话历史持久化（前端显示） ==========
 
-  saveDisplayHistory(sessionId: string, displayMessages: DisplayMessage[], sessionName?: string): void {
+  async saveDisplayHistory(ownerId: string, sessionId: string, displayMessages: DisplayMessage[], sessionName?: string): Promise<void> {
     try {
-      const filePath = path.join(this.historyDir, `${sessionId}.json`);
       const firstUser = displayMessages.find(m => m.role === 'user');
-      const preview = firstUser ? (firstUser.content || '').substring(0, 80) : '';
-      const fileData: HistoryFile = {
-        meta: { sessionId, sessionName: sessionName || '', savedAt: Date.now(), messageCount: displayMessages.length, preview },
+      await saveHistory({
+        ownerId,
+        sessionId,
+        sessionName,
+        messageCount: displayMessages.length,
+        preview: (firstUser?.content || '').substring(0, 80),
         messages: displayMessages,
-      };
-      fs.writeFileSync(filePath, JSON.stringify(fileData, null, 2), 'utf-8');
+        savedAt: Date.now(),
+      });
     } catch (error) { console.error('[AIService] Failed to save display history:', error); }
   }
 
-  loadDisplayHistory(sessionId: string): DisplayMessage[] | null {
+  async loadDisplayHistory(ownerId: string, sessionId: string): Promise<DisplayMessage[] | null> {
     try {
-      const filePath = path.join(this.historyDir, `${sessionId}.json`);
-      if (!fs.existsSync(filePath)) return null;
-      const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-      if (data && Array.isArray(data.messages)) return data.messages;
-      if (Array.isArray(data)) return data;
+      return (await loadHistoryMessages(ownerId, sessionId)) as DisplayMessage[] | null;
+    } catch (error) {
+      console.error('[AIService] Failed to load display history:', error);
       return null;
-    } catch { return null; }
+    }
   }
 
-  listDisplayHistories(): HistoryMeta[] {
-    const results: HistoryMeta[] = [];
+  async listDisplayHistories(ownerId: string): Promise<HistoryMeta[]> {
     try {
-      if (!fs.existsSync(this.historyDir)) return results;
-      const files = fs.readdirSync(this.historyDir).filter(f => f.endsWith('.json'));
-      for (const file of files) {
-        try {
-          const fp = path.join(this.historyDir, file);
-          const data = JSON.parse(fs.readFileSync(fp, 'utf-8'));
-          if (data?.meta) {
-            results.push(data.meta);
-          } else if (Array.isArray(data)) {
-            const sid = path.basename(file, '.json');
-            const firstUser = data.find((m: any) => m.role === 'user');
-            results.push({
-              sessionId: sid, sessionName: '',
-              savedAt: fs.statSync(fp).mtimeMs,
-              messageCount: data.length,
-              preview: firstUser ? (firstUser.content || '').substring(0, 80) : '',
-            });
-          }
-        } catch { /* 跳过损坏的文件 */ }
-      }
-    } catch (error) { console.error('[AIService] Failed to list histories:', error); }
-    results.sort((a, b) => b.savedAt - a.savedAt);
-    return results;
+      return await listHistories(ownerId);
+    } catch (error) {
+      console.error('[AIService] Failed to list histories:', error);
+      return [];
+    }
   }
 
-  deleteDisplayHistoryFile(sessionId: string): void {
+  async deleteDisplayHistoryFile(ownerId: string, sessionId: string): Promise<void> {
     try {
-      const filePath = path.join(this.historyDir, `${sessionId}.json`);
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-      this.deleteChatMessagesFile(sessionId);
+      await deleteHistory(ownerId, sessionId);
+      await deleteChatMessagesRow(ownerId, sessionId);
       this.loadedSessions.delete(sessionId);
     } catch (error) { console.error('[AIService] Failed to delete display history:', error); }
   }

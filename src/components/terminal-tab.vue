@@ -164,6 +164,7 @@ import {
   writeClipboard,
   readClipboard,
 } from '@/utils/vscode-clipboard';
+import { getToken } from '@/utils/auth';
 
 const { t } = useI18n();
 
@@ -597,7 +598,8 @@ function createIPCAdapter(): WebSocket {
   const adapter: any = {
     readyState: 1, // OPEN
     send(msg: string) {
-      ipc.send(JSON.parse(msg));
+      // 每条消息都附上令牌：主进程收到后要解析账号、校验 terminal 权限与会话归属
+      ipc.send({ ...JSON.parse(msg), token: getToken() });
     },
     close() {
       adapter.readyState = 3; // CLOSED
@@ -639,7 +641,9 @@ function connectWebSocket() {
   } else {
     // Web 端：使用 WebSocket
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const token = new URLSearchParams(location.search).get('token');
+    // 浏览器 WebSocket 带不了自定义头，只能把令牌放查询参数；
+    // 不再读 location.search 里的 token：那是旧的全局 access-token 年代的做法
+    const token = getToken();
     const wsUrl = `${protocol}//${location.host}/ws/terminal${token ? `?token=${encodeURIComponent(token)}` : ''}`;
     console.log(`[TerminalTab] Connecting to WebSocket: ${wsUrl}`);
     ws = new WebSocket(wsUrl);

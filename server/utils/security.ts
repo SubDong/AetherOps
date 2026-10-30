@@ -1,77 +1,20 @@
-import * as crypto from 'crypto';
-import * as fs from 'fs';
 import * as path from 'path';
-import { getDataPath, ensureDataDir } from './data-dir';
 import { loadConfig } from './config';
 
-const TOKEN_FILE = 'access-token';
-const COOKIE_NAME = 'aetherops_token';
-
-export function isAuthDisabled(): boolean {
-  return loadConfig().auth.disabled;
-}
-
 /**
- * 访问令牌：优先取配置（环境变量 AETHEROPS_ACCESS_TOKEN 或 config.json 的 auth.accessToken），
- * 都没配则生成一个并落盘（生成的仍然写到 access-token 文件，不把随机值回写进配置，
- * 避免用户手改配置时被随机令牌干扰）。
+ * 从请求头取 Bearer 令牌。
+ *
+ * 账号体系下令牌只有一个来源：`Authorization: Bearer <token>`。
+ * 旧年代的 cookie 与 X-AetherOps-Token 两种通道已移除——留着只会让人
+ * 以为还有第二种鉴权入口。浏览器 WebSocket 带不了自定义头，它的令牌
+ * 由调用方从 `?token=` 取，那是协议限制，不属于这里。
  */
-export function getAccessToken(): string {
-  const configured = loadConfig().auth.accessToken;
-  if (configured) return configured;
-  ensureDataDir();
-  const tokenPath = getDataPath(TOKEN_FILE);
-  try {
-    if (fs.existsSync(tokenPath)) {
-      const token = fs.readFileSync(tokenPath, 'utf-8').trim();
-      if (token) return token;
-    }
-  } catch { /* ignore */ }
-  const token = crypto.randomBytes(32).toString('base64url');
-  fs.writeFileSync(tokenPath, token, { encoding: 'utf-8', mode: 0o600 });
-  try { fs.chmodSync(tokenPath, 0o600); } catch { /* ignore */ }
-  return token;
-}
-
-export function getCookieName(): string {
-  return COOKIE_NAME;
-}
-
-export function parseCookies(cookieHeader?: string | string[]): Record<string, string> {
-  const header = Array.isArray(cookieHeader) ? cookieHeader.join(';') : (cookieHeader || '');
-  const cookies: Record<string, string> = {};
-  for (const part of header.split(';')) {
-    const index = part.indexOf('=');
-    if (index === -1) continue;
-    const key = part.slice(0, index).trim();
-    const value = part.slice(index + 1).trim();
-    if (key) cookies[key] = decodeURIComponent(value);
-  }
-  return cookies;
-}
-
-export function timingSafeEqual(a: string, b: string): boolean {
-  const left = Buffer.from(a || '');
-  const right = Buffer.from(b || '');
-  return left.length === right.length && crypto.timingSafeEqual(left, right);
-}
-
-export function isValidToken(provided?: string | string[]): boolean {
-  if (isAuthDisabled()) return true;
-  const token = getAccessToken();
-  const value = Array.isArray(provided) ? provided[0] : provided;
-  return !!value && timingSafeEqual(value, token);
-}
-
-export function extractTokenFromHeaders(headers: Record<string, any>): string | undefined {
+export function extractBearerToken(headers: Record<string, any>): string {
   const auth = headers.authorization || headers.Authorization;
   if (typeof auth === 'string' && auth.toLowerCase().startsWith('bearer ')) {
     return auth.slice(7).trim();
   }
-  const headerToken = headers['x-aetherops-token'] || headers['X-AetherOps-Token'];
-  if (typeof headerToken === 'string') return headerToken;
-  const cookies = parseCookies(headers.cookie);
-  return cookies[COOKIE_NAME];
+  return '';
 }
 
 export function isLocalHost(host?: string | null): boolean {
@@ -90,31 +33,6 @@ export function isAllowedOrigin(origin?: string | string[], host?: string | stri
   } catch {
     return false;
   }
-}
-
-export function requiresToken(origin?: string | string[], host?: string | string[]): boolean {
-  if (isAuthDisabled()) return false;
-  const value = Array.isArray(origin) ? origin[0] : origin;
-  const hostValue = Array.isArray(host) ? host[0] : host;
-  if (!value) return !isLocalHost(hostValue);
-  try {
-    const originUrl = new URL(value);
-    return originUrl.host !== hostValue;
-  } catch {
-    return true;
-  }
-}
-
-export function getCookieHeader(token: string, secure = false): string {
-  const parts = [
-    `${COOKIE_NAME}=${encodeURIComponent(token)}`,
-    'Path=/',
-    'HttpOnly',
-    'SameSite=Lax',
-    'Max-Age=2592000',
-  ];
-  if (secure) parts.push('Secure');
-  return parts.join('; ');
 }
 
 export function normalizeUploadName(name: string): string {

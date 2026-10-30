@@ -333,7 +333,7 @@ AetherOps 是 [ai-cmd](https://github.com/fefeding/ai-cmd)（AICmd）的 fork，
 
 与上游有意不同的两点：
 
-- **命名**：所有标识均已重命名（`AICMD_*` 环境变量、`~/.aetherops` 数据目录、`aetherops_token` cookie、
-  `X-AetherOps-Token` 请求头、`aetherops.*` VSCode 命令、`__AETHEROPS_SYS__` 终端探测标记）。
+- **命名**：所有标识均已重命名（`AICMD_*` 环境变量、`~/.aetherops` 数据目录、`aetherops.*` VSCode 命令、
+  `__AETHEROPS_SYS__` 终端探测标记）。
   任何按旧名写的部署配置、反代规则、监控脚本都需要同步更新。
 - **数据迁移**：首次启动会自动把已有的 `~/.aicmd/` 搬迁为 `~/.aetherops/`（详见上文「数据存储」）。

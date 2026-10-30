@@ -34,7 +34,15 @@ export interface DatabaseConfig {
   connectTimeoutMs: number;
   charset: string;
   timezone: string;
+  /** 是否启用 TLS。实测服务端支持 TLSv1.2/1.3，开关不影响可用性 */
   ssl: boolean;
+  /**
+   * 是否严格校验服务端证书。默认 false：Ubuntu 的 MySQL 发包时自动自签证书，
+   * 没CA 的情况下严格校验连不上；此时连接仍然加密，但不防中间人。
+   */
+  sslRejectUnauthorized: boolean;
+  /** CA 证书路径（可选）；填了就会用它做严格链校验 */
+  sslCaPath: string;
 }
 
 export interface ServerConfig {
@@ -42,12 +50,28 @@ export interface ServerConfig {
   host: string;
 }
 
+/**
+ * Redis 配置。持有登录令牌（access token）——令牌不进 MySQL，
+ * 因为需要按 TTL 自动过期，用库表做要额外扫表。
+ */
+export interface RedisConfig {
+  /** 完整连接串，如 redis://:password@host:6379/0；填了它则忽略 host/port/password/username/db */
+  url: string;
+  host: string;
+  port: number;
+  /** Redis 6 ACL 用户名，单密码认证时留空 */
+  username: string;
+  /** 密码；留空表示无密码 */
+  password: string;
+  /** 逻辑库 0~15 */
+  db: number;
+  /** key 前缀；与其他业务共用同一实例时靠它隔离命名空间 */
+  keyPrefix: string;
+  connectTimeoutMs: number;
+}
+
 export interface AuthConfig {
-  /** 关闭鉴权（仅限可信内网/本机调试） */
-  disabled: boolean;
-  /** Web 访问令牌；留空则自动生成并落盘 */
-  accessToken: string;
-  /** VSCode/Electron 宿主拉起服务端时的启动令牌 */
+  /** VSCode/Electron 宿主拉起服务端时的探活令牌（只用于 /health，不是用户身份） */
   launchToken: string;
   /** 单次上传体积上限（MB） */
   maxUploadMb: number;
@@ -61,6 +85,7 @@ export interface DebugConfig {
 export interface AppConfig {
   server: ServerConfig;
   database: DatabaseConfig;
+  redis: RedisConfig;
   auth: AuthConfig;
   debug: DebugConfig;
 }
@@ -81,15 +106,28 @@ const DEFAULTS: AppConfig = {
     user: '',
     password: '',
     database: 'aetherops',
-    connectionLimit: 10,
+    // 默认 5，不是原来的 10：实测目标实例 max_connections=50 且同时要服务多个其他业务，
+    // 每个宿主实例吃 10 条连接很容易挤到别人头上。
+    connectionLimit: 5,
     connectTimeoutMs: 10000,
     charset: 'utf8mb4',
     timezone: '+00:00',
     ssl: false,
+    sslRejectUnauthorized: false,
+    sslCaPath: '',
+  },
+  redis: {
+    url: '',
+    host: '',
+    port: 6379,
+    username: '',
+    password: '',
+    db: 0,
+    // 前缀带冒号，拼 key 时直接 `${prefix}token:xxx`
+    keyPrefix: 'aetherops:',
+    connectTimeoutMs: 5000,
   },
   auth: {
-    disabled: false,
-    accessToken: '',
     launchToken: '',
     maxUploadMb: 100,
   },
@@ -137,6 +175,27 @@ function isPlainObject(value: any): boolean {
   return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
+/**
+ * 已废弃的配置项：读到就丢掉并提示一次。
+ * auth.disabled / auth.accessToken 属于旧的单令牌鉴权，现在身份只由账号体系给；
+ * 留在配置文件里要么被当成「还能关鉴权」，要么在合并时刷一条看不懂的未知项警告。
+ */
+const DEPRECATED_KEYS: Record<string, string[]> = {
+  auth: ['disabled', 'accessToken'],
+};
+
+function dropDeprecated(section: string, raw: any): any {
+  const keys = DEPRECATED_KEYS[section];
+  if (!keys || !isPlainObject(raw)) return raw;
+  for (const key of keys) {
+    if (key in raw) {
+      console.warn(`[config] 配置项 ${section}.${key} 已废弃（鉴权改由账号体系负责），可手动删除`);
+      delete raw[key];
+    }
+  }
+  return raw;
+}
+
 /** 逐段深合并，只接受默认值里已存在的键，避免配置文件里的拼写错误悄悄生效 */
 function mergeSection<T extends object>(base: T, override: any): T {
   if (!isPlainObject(override)) return { ...base };
@@ -175,16 +234,10 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
     v === undefined || v === '' ? undefined : v === '1' || v.toLowerCase() === 'true';
   const str = (v: string | undefined) => (v === undefined ? undefined : v);
 
-  if (env.AETHEROPS_AUTH_DISABLED !== undefined) {
-    const b = bool(env.AETHEROPS_AUTH_DISABLED);
-    if (b !== undefined) config.auth.disabled = b;
-  }
-
   const patches: Array<[string, string | number | boolean | undefined]> = [
     // 服务端只读 PORT（server.js: portFromArgs || process.env.PORT || 9802），不另造别名
     ['server.port', num(env.PORT)],
     ['server.host', str(env.HOST ?? env.AETHEROPS_HOST)],
-    ['auth.accessToken', str(env.AETHEROPS_ACCESS_TOKEN)],
     ['auth.launchToken', str(env.AETHEROPS_LAUNCH_TOKEN)],
     ['auth.maxUploadMb', num(env.AETHEROPS_MAX_UPLOAD_MB)],
     ['debug.sshDebug', bool(env.AETHEROPS_SSH_DEBUG)],
@@ -196,6 +249,19 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
     ['database.connectionLimit', num(env.AETHEROPS_DB_POOL_SIZE)],
     ['database.ssl', bool(env.AETHEROPS_DB_SSL)],
     ['database.timezone', str(env.AETHEROPS_DB_TZ)],
+    ['database.sslCaPath', str(env.AETHEROPS_DB_SSL_CA)],
+    // 名为 INSECURE：置 true 表示关掉严格证书校验
+    ['database.sslRejectUnauthorized', env.AETHEROPS_DB_SSL_INSECURE === undefined || env.AETHEROPS_DB_SSL_INSECURE === ''
+      ? undefined
+      : !bool(env.AETHEROPS_DB_SSL_INSECURE)],
+    ['redis.url', str(env.AETHEROPS_REDIS_URL)],
+    ['redis.host', str(env.AETHEROPS_REDIS_HOST)],
+    ['redis.port', num(env.AETHEROPS_REDIS_PORT)],
+    ['redis.username', str(env.AETHEROPS_REDIS_USER)],
+    ['redis.password', str(env.AETHEROPS_REDIS_PASSWORD)],
+    ['redis.db', num(env.AETHEROPS_REDIS_DB)],
+    ['redis.keyPrefix', str(env.AETHEROPS_REDIS_PREFIX)],
+    ['redis.connectTimeoutMs', num(env.AETHEROPS_REDIS_CONNECT_TIMEOUT_MS)],
   ];
 
   for (const [key, value] of patches) {
@@ -243,8 +309,9 @@ function writeDefaultConfig(file: string): void {
   const template = {
     ...DEFAULTS,
     database: { ...DEFAULTS.database },
+    redis: { ...DEFAULTS.redis },
   };
-  const text = JSON.stringify({ _comment: 'AetherOps 配置；数据库账号密码请在此填写。环境变量可覆盖同名项。', ...template }, null, 2);
+  const text = JSON.stringify({ _comment: 'AetherOps 配置；MySQL 与 Redis 的账号密码请在此填写。环境变量可覆盖同名项。', ...template }, null, 2);
   fs.writeFileSync(file, text, { encoding: 'utf8', mode: 0o600 });
   try {
     fs.chmodSync(file, 0o600);
@@ -271,6 +338,23 @@ export function validateConfig(config: AppConfig): string[] {
   }
   if (!Number.isFinite(config.auth.maxUploadMb) || config.auth.maxUploadMb <= 0) {
     problems.push(`auth.maxUploadMb 应大于 0: ${config.auth.maxUploadMb}`);
+  }
+
+  const redis = config.redis;
+  if (!redis.url && !redis.host) problems.push('redis.host 未配置（或改用 redis.url 填完整连接串）');
+  if (!Number.isInteger(redis.port) || redis.port < 1 || redis.port > 65535) problems.push(`redis.port 非法: ${redis.port}`);
+  if (!Number.isInteger(redis.db) || redis.db < 0 || redis.db > 15) problems.push(`redis.db 应在 0~15 之间: ${redis.db}`);
+  if (!redis.keyPrefix) problems.push('redis.keyPrefix 不能为空（为空时容易与其他业务 key 相撞）');
+  if (!redis.url && redis.password === '') {
+    // 不是错误，但有密码的实例漏填会让启动探活报 NOAUTH，先提示一句
+    console.warn('[config] redis.password 为空，将按无密码连接；若实例开了 requirepass 请在配置里补上');
+  }
+
+  // TLS 相关：配了 CA 却没开 ssl 是常见的“我改了为何不生效”，直接当错误报出来
+  if (db.sslCaPath && !db.ssl) problems.push('database.sslCaPath 已配置但 database.ssl 为 false，CA 不会生效');
+  if (db.sslCaPath && !fs.existsSync(db.sslCaPath)) problems.push(`database.sslCaPath 指向的文件不存在: ${db.sslCaPath}`);
+  if (db.ssl && db.sslRejectUnauthorized && !db.sslCaPath) {
+    problems.push('database.ssl 与 sslRejectUnauthorized 同时开启但未提供 sslCaPath：服务端为自签证书时必定握手失败');
   }
   return problems;
 }
@@ -316,7 +400,8 @@ export function loadConfig(force = false): AppConfig {
   const merged: AppConfig = {
     server: mergeSection(DEFAULTS.server, fromFile.server),
     database: mergeSection(DEFAULTS.database, fromFile.database),
-    auth: mergeSection(DEFAULTS.auth, fromFile.auth),
+    redis: mergeSection(DEFAULTS.redis, fromFile.redis),
+    auth: mergeSection(DEFAULTS.auth, dropDeprecated('auth', fromFile.auth)),
     debug: mergeSection(DEFAULTS.debug, fromFile.debug),
   };
 
@@ -337,7 +422,8 @@ export function redactConfig(config: AppConfig = loadConfig()): any {
   const mask = (v: string) => (v ? `${v.slice(0, 2)}***(${v.length} chars)` : '');
   clone.database.password = mask(clone.database.password);
   clone.database.user = clone.database.user || '';
-  clone.auth.accessToken = mask(clone.auth.accessToken);
+  clone.redis.password = mask(clone.redis.password);
+  if (clone.redis.url) clone.redis.url = mask(clone.redis.url);
   clone.auth.launchToken = mask(clone.auth.launchToken);
   return clone;
 }

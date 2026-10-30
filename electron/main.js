@@ -57,6 +57,10 @@ let mainWindow = null;
 // ========== 服务实例（延迟加载） ==========
 let _services = null;
 
+function serverDist(...parts) {
+  return path.join(__dirname, '..', 'dist', 'server', ...parts);
+}
+
 function getServices() {
   if (_services) return _services;
   if (isDev) {
@@ -64,13 +68,14 @@ function getServices() {
     return null;
   }
   try {
-    const serverPath = path.join(__dirname, '..', 'dist', 'server', 'index.js');
+    const serverPath = serverDist('index.js');
     console.log(`[Electron] Loading server module from: ${serverPath}`);
     console.log(`[Electron] __dirname: ${__dirname}`);
     console.log(`[Electron] File exists: ${require('fs').existsSync(serverPath)}`);
     const serverModule = require(serverPath);
     console.log(`[Electron] Server module loaded, keys: ${Object.keys(serverModule).join(', ')}`);
     _services = {
+      serverModule,
       sshService: serverModule.sshService,
       connectionService: serverModule.connectionService,
       aiService: serverModule.aiService,
@@ -88,40 +93,134 @@ function getServices() {
   }
 }
 
+/**
+ * 启动依赖：连库 + 跑迁移 + Redis 探活 + 初始化服务。
+ * 不能只 require 一下就开窗口：表结构 / 初始管理员 / 按账号懒加载的 AI 配置
+ * 都依赖这一步；跳过它的话首次登录会直接报「表不存在」。
+ */
+let servicesReady = null;
+function ensureServicesReady() {
+  if (servicesReady) return servicesReady;
+  servicesReady = (async () => {
+    if (isDev) return null;
+    const { ensureDatabaseReady } = require(serverDist('db', 'migrate.js'));
+    await ensureDatabaseReady();
+    const { probeRedis } = require(serverDist('db', 'redis.js'));
+    await probeRedis();
+    const services = getServices();
+    if (services) {
+      await services.serverModule.initServices();
+      setupMonitorEvents();
+    }
+    return services;
+  })().catch((e) => {
+    console.error('[Electron] 依赖初始化失败: ' + (e && e.message ? e.message : e));
+    servicesReady = null;
+    return null;
+  });
+  return servicesReady;
+}
+
+/* ------------------------------------------------------------------ */
+/* IPC 鉴权                                                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Electron 生产模式没有 HTTP 网关在门口鉴权，IPC 就是唯一门禁。
+ * 每条消息都验一次太贵（终端输入每秒好几条），所以按 sender 缓存 15s：
+ * 单点登录踢人在桌面端的生效延迟最多 15s，这是刻意的取舍。
+ */
+const AUTH_CACHE_MS = 15000;
+const authCache = new Map();
+
+async function resolveUser(token, senderId) {
+  const raw = String(token || '');
+  if (!raw) return null;
+  const cached = senderId != null ? authCache.get(senderId) : null;
+  if (cached && cached.token === raw && Date.now() - cached.at < AUTH_CACHE_MS) return cached.user;
+  try {
+    const { authenticate } = require(serverDist('service', 'auth.service.js'));
+    const user = await authenticate(raw);
+    if (senderId != null) {
+      if (user) authCache.set(senderId, { token: raw, user, at: Date.now() });
+      else authCache.delete(senderId);
+    }
+    return user;
+  } catch (e) {
+    console.error('[IPC] 令牌校验失败: ' + (e && e.message ? e.message : e));
+    return null;
+  }
+}
+
+/** 与 server.js 的 assertSessionAccess 同一套语义 */
+async function assertSessionAccess(token, sessionId, permissionKeys) {
+  const user = await resolveUser(token);
+  if (!user) return { ok: false, status: 401, error: 'Unauthorized' };
+  const permissions = user.permissions || {};
+  if (!permissionKeys.some((k) => permissions[k])) {
+    return { ok: false, status: 403, error: 'Forbidden: missing permission' };
+  }
+  let owner = '';
+  try {
+    const services = getServices();
+    owner = services?.sshService?.getSessionOwner(String(sessionId)) || '';
+  } catch { /* ignore */ }
+  if (owner && owner !== user.userId) {
+    return { ok: false, status: 403, error: 'Forbidden: session belongs to another user' };
+  }
+  return { ok: true };
+}
+
 // ========== API IPC 处理（替代渲染进程 require） ==========
 
 function setupApiIPC() {
   ipcMain.handle('api:request', async (_event, payload) => {
-    const services = getServices();
+    const services = await ensureServicesReady();
     if (!services) {
-      return { ret: 500, msg: 'Services not available' };
+      return { status: 500, data: { ret: 500, msg: 'Services not available' } };
     }
+    const pathname = String(payload?.pathname || '');
+    const body = payload?.body || {};
+    const token = String(payload?.token || '');
+
     try {
-      const serverPath = path.join(__dirname, '..', 'dist', 'server', 'index.js');
-      const serverModule = require(serverPath);
-      const pathname = String(payload?.pathname || '');
-      if (!pathname.startsWith('/api/')) {
-        return { ret: 400, msg: 'Invalid API path' };
+      // 账号相关端点：登录时还没有令牌，必须交给 handleAccountRoutes 自己判
+      if (pathname.startsWith('/api/auth/') || pathname.startsWith('/api/users/') || pathname.startsWith('/oauth/')) {
+        const { handleAccountRoutes } = require(serverDist('routes', 'auth.routes.js'));
+        const user = await resolveUser(token);
+        const result = await handleAccountRoutes(pathname, body, { token, user, ip: 'ipc' });
+        if (!result) return { status: 404, data: { error: 'not_found', error_description: pathname } };
+        return { status: result.status, data: result.body };
       }
-      const data = await serverModule.handleRoutes(pathname, payload?.body || {});
-      return { ret: 0, msg: 'success', data };
+
+      if (!pathname.startsWith('/api/')) {
+        return { status: 400, data: { ret: 400, msg: 'Invalid API path' } };
+      }
+      // 业务接口必须登录：三个参数里第三个就是登录人，所有仓储都按它隔离
+      const user = await resolveUser(token);
+      if (!user) return { status: 401, data: { ret: 401, msg: 'Unauthorized' } };
+      const data = await services.serverModule.handleRoutes(pathname, body, user);
+      return { status: 200, data };
     } catch (err) {
-      console.error('[IPC] API request failed:', err);
-      return { ret: 500, msg: err.message || 'Internal error' };
+      const status = err?.statusCode || err?.status || 500;
+      console.error('[IPC] API request failed:', err?.message || err);
+      return { status, data: { ret: status, msg: err?.message || 'Internal error' } };
     }
   });
 
   // 文件上传 IPC 处理（app:// 协议下 fetch 不可用）
   ipcMain.handle('file:upload', async (_event, payload) => {
-    const services = getServices();
+    const services = await ensureServicesReady();
     if (!services) {
       return { success: false, error: 'Services not available' };
     }
     try {
-      const { sessionId, fileName, fileData } = payload;
+      const { sessionId, fileName, fileData, token } = payload;
       if (!sessionId || !fileName || !fileData) {
         return { success: false, error: 'Missing sessionId, fileName, or fileData' };
       }
+      const access = await assertSessionAccess(token, sessionId, ['files', 'terminal']);
+      if (!access.ok) return { success: false, error: access.error };
       console.log(`[IPC] File upload: session=${sessionId}, file=${fileName}, size=${fileData.byteLength || fileData.length}`);
       const buffer = Buffer.from(fileData);
       const bytes = await services.sshService.uploadFileViaSftp(sessionId, fileName, buffer);
@@ -134,15 +233,17 @@ function setupApiIPC() {
 
   // 文件下载 IPC 处理（app:// 协议下 fetch 不可用；直接在主进程保存到用户选择路径）
   ipcMain.handle('file:download', async (_event, payload) => {
-    const services = getServices();
+    const services = await ensureServicesReady();
     if (!services) {
       return { success: false, error: 'Services not available' };
     }
     try {
-      const { sessionId, remotePath, fileName } = payload || {};
+      const { sessionId, remotePath, fileName, token } = payload || {};
       if (!sessionId || !remotePath) {
         return { success: false, error: 'Missing sessionId or remotePath' };
       }
+      const access = await assertSessionAccess(token, sessionId, ['files', 'terminal']);
+      if (!access.ok) return { success: false, error: access.error };
       const buffer = await services.sshService.downloadFile(sessionId, remotePath);
       const { dialog } = require('electron');
       const defaultName = fileName || path.basename(remotePath) || 'download';
@@ -163,17 +264,19 @@ function setupApiIPC() {
 
   // 查询当前终端所在目录（Electron 模式：上传前由前端拉取，确保文件落到当前目录）
   ipcMain.handle('terminal:get-cwd', async (_event, payload) => {
-    const services = getServices();
+    const services = await ensureServicesReady();
     if (!services) {
       return { cwd: '', error: 'Services not available' };
     }
     try {
       // zmodem=true 表示远端 rz 正在等待接收文件：禁止注入式探测，避免打断 rz
       // force=true 表示忽略缓存重新探测（用户手动重新检测 / 上传前兜底）
-      const { sessionId, zmodem, force } = payload || {};
+      const { sessionId, zmodem, force, token } = payload || {};
       if (!sessionId) {
         return { cwd: '', error: 'Missing sessionId' };
       }
+      const access = await assertSessionAccess(token, sessionId, ['files', 'terminal']);
+      if (!access.ok) return { cwd: '', error: access.error };
       const { cwd, reliable } = await services.sshService.getSessionCwdDetailed(sessionId, {
         allowShellProbe: !zmodem,
         preferTransferProcess: !!zmodem,
@@ -224,6 +327,26 @@ function setupTerminalIPC() {
     const { sshService, aiService, monitorService } = services;
 
     try {
+      // 渲染进程在每条消息里都附了 token：Electron 生产模式没有网关，IPC 就是门禁
+      const user = await resolveUser(msg.token, event.sender.id);
+      if (!user) {
+        send({ type: 'error', sessionId: sid, data: 'Unauthorized' });
+        return;
+      }
+      if (type !== 'ai-agent-run' && type !== 'ai-agent-stop' && !user.permissions?.terminal) {
+        send({ type: 'error', sessionId: sid, data: 'Forbidden: missing permission' });
+        return;
+      }
+      // 会话归属：create 是新建，其余按 sessionId 校（AI 会话用 aiSessionId）
+      const targetSessionId = type === 'ai-agent-run' ? (data && data.aiSessionId) : sid;
+      if (targetSessionId && type !== 'create') {
+        const owner = sshService.getSessionOwner(targetSessionId);
+        if (owner && owner !== user.userId) {
+          send({ type: 'error', sessionId: targetSessionId, data: 'Forbidden: session belongs to another user' });
+          return;
+        }
+      }
+
       switch (type) {
         case 'create': {
           const { connectionId, cols, rows, name } = data || {};
@@ -239,7 +362,7 @@ function setupTerminalIPC() {
 
           const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, (msg) => {
             send({ type: 'conn-log', sessionId, data: msg });
-          });
+          }, user.userId);
 
           // 绑定输出
           const sendOutput = (chunk) => {
@@ -293,7 +416,7 @@ function setupTerminalIPC() {
 
           const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, (msg) => {
             send({ type: 'conn-log', sessionId, data: msg });
-          });
+          }, user.userId);
 
           const sendOutput = (chunk) => {
             if (win.isDestroyed()) return;
@@ -357,11 +480,15 @@ function setupTerminalIPC() {
 
         case 'ai-agent-run': {
           const { aiSessionId, message, context, skillId, locale } = data || {};
+          if (!user.permissions?.ai) {
+            send({ type: 'ai-agent-event', event: { type: 'error', error: 'Forbidden: missing permission' } });
+            return;
+          }
           if (!aiSessionId || !message) {
             send({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params' } });
             return;
           }
-          aiService.agentRun(aiSessionId, message, context, (agentEvent) => {
+          aiService.agentRun(user.userId, aiSessionId, message, context, (agentEvent) => {
             send({ type: 'ai-agent-event', sessionId: aiSessionId, event: agentEvent });
           }, skillId, locale).catch((err) => {
             send({ type: 'ai-agent-event', sessionId: aiSessionId, event: { type: 'error', error: err.message } });
@@ -371,7 +498,8 @@ function setupTerminalIPC() {
 
         case 'ai-agent-stop': {
           const { aiSessionId: stopSid } = data || {};
-          if (stopSid) aiService.stopAgent(stopSid);
+          // 带 ownerId：否则拿到别人的 aiSessionId 就能把对方的 Agent 中止掉
+          if (stopSid) aiService.stopAgent(user.userId, stopSid);
           break;
         }
 
@@ -546,6 +674,13 @@ app.whenReady().then(() => {
     const { pathname } = new URL(request.url);
     // app://local/xxx → 项目根目录/dist/xxx
     const filePath = path.join(__dirname, '..', 'dist', pathname);
+    // 前端是 history 路由：/login、/users 这类地址不是文件，
+    // 不回落就会拿到一个不存在的路径（登录页白屏、刷新白屏）。
+    // Web 那边有 server.js 的 SPA fallback 兼底，桌面端只能在这里自己做。
+    const isFile = path.extname(pathname) !== '';
+    if (!isFile || !fs.existsSync(filePath)) {
+      return net.fetch('file://' + path.join(__dirname, '..', 'dist', 'view', 'index.html'));
+    }
     return net.fetch('file://' + filePath);
   });
 
@@ -555,17 +690,12 @@ app.whenReady().then(() => {
   setupMenu();
 
   // 初始化服务（仅生产模式加载模块，开发模式由 Vite 提供）
-  try {
-    const services = getServices();
-    if (services) {
-      setupMonitorEvents();
-      console.log('[Electron] Services initialized (production mode)');
-    } else {
-      console.log('[Electron] Services skipped (dev mode - using Vite dev server)');
-    }
-  } catch (e) {
-    console.error('[Electron] Failed to initialize services:', e.message);
-  }
+  // 必须等依赖就绪：连库、迁移、Redis、初始管理员都在这一里，
+  // 否则首个登录请求会报「表不存在」或没有初始账号。
+  ensureServicesReady().then((services) => {
+    if (services) console.log('[Electron] Services initialized (production mode)');
+    else console.log('[Electron] Services skipped (dev mode - using Vite dev server)');
+  });
 
   let target;
   if (isDev) {

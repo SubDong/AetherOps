@@ -1,6 +1,7 @@
 import { Client, type ClientChannel } from 'ssh2';
 import { spawn, type ChildProcess } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { ConnectionService } from './connection.service';
 import { ConnectionEntity } from '../model/connection.entity';
@@ -10,6 +11,8 @@ import { ConnectionEntity } from '../model/connection.entity';
  */
 interface MonitorSession {
   id: string;
+  /** 归属账号：监控挂着别人的终端就会漏看对方日志 */
+  ownerId: string;
   sessionId: string;
   connectionId: string;
   logPath: string;
@@ -81,13 +84,13 @@ export class MonitorService {
   /**
    * 启动日志监控
    */
-  async startMonitor(sessionId: string, connectionId: string, logPath: string, pattern?: string): Promise<{ monitorId: string }> {
+  async startMonitor(ownerId: string, sessionId: string, connectionId: string, logPath: string, pattern?: string): Promise<{ monitorId: string }> {
     const isLocal = connectionId === 'local' || connectionId === '';
     const safeLogPath = this.validateLogPath(logPath, isLocal);
 
     // 检查是否已有监控
     for (const [id, m] of this.monitors) {
-      if (m.sessionId === sessionId && m.logPath === safeLogPath && m.running) {
+      if (m.ownerId === ownerId && m.sessionId === sessionId && m.logPath === safeLogPath && m.running) {
         return { monitorId: id };
       }
     }
@@ -95,6 +98,7 @@ export class MonitorService {
     const monitorId = `mon_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const monitor: MonitorSession = {
       id: monitorId,
+      ownerId,
       sessionId,
       connectionId,
       logPath: safeLogPath,
@@ -134,10 +138,12 @@ export class MonitorService {
 
   /**
    * 停止日志监控
+   * ownerId 不是可选参数：monitorId 由服务端签发但会回到前端，
+   * 不校验归属等于「猜到 id 就能停掉别人的监控」。
    */
-  stopMonitor(monitorId: string): boolean {
+  stopMonitor(ownerId: string, monitorId: string): boolean {
     const monitor = this.monitors.get(monitorId);
-    if (!monitor) return false;
+    if (!monitor || monitor.ownerId !== ownerId) return false;
 
     monitor.running = false;
     try {
@@ -166,11 +172,12 @@ export class MonitorService {
 
   /**
    * 停止指定 session 的所有监控
+   * 内部清理用（会话关闭/进程退出），sessionId 本身就带归属，不需要再传 owner
    */
   stopSessionMonitors(sessionId: string) {
     for (const [id, m] of this.monitors) {
       if (m.sessionId === sessionId) {
-        this.stopMonitor(id);
+        this.stopMonitor(m.ownerId, id);
       }
     }
   }
@@ -178,7 +185,7 @@ export class MonitorService {
   /**
    * 获取活跃监控列表
    */
-  getActiveMonitors(sessionId?: string): Array<{
+  getActiveMonitors(ownerId: string, sessionId?: string): Array<{
     monitorId: string;
     sessionId: string;
     connectionId: string;
@@ -189,6 +196,7 @@ export class MonitorService {
   }> {
     const result: any[] = [];
     for (const [id, m] of this.monitors) {
+      if (m.ownerId !== ownerId) continue;
       if (sessionId && m.sessionId !== sessionId) continue;
       result.push({
         monitorId: id,
@@ -206,18 +214,18 @@ export class MonitorService {
   /**
    * 获取监控的告警列表
    */
-  getAlerts(monitorId: string, limit = 50): MonitorAlert[] {
+  getAlerts(ownerId: string, monitorId: string, limit = 50): MonitorAlert[] {
     const monitor = this.monitors.get(monitorId);
-    if (!monitor) return [];
+    if (!monitor || monitor.ownerId !== ownerId) return [];
     return monitor.alertBuffer.slice(-limit);
   }
 
   /**
    * 获取监控的最近输出行
    */
-  getRecentLines(monitorId: string, limit = 100): string[] {
+  getRecentLines(ownerId: string, monitorId: string, limit = 100): string[] {
     const monitor = this.monitors.get(monitorId);
-    if (!monitor) return [];
+    if (!monitor || monitor.ownerId !== ownerId) return [];
     return monitor.lineBuffer.slice(-limit);
   }
 
@@ -285,7 +293,8 @@ export class MonitorService {
    * SSH 远程 tail -f
    */
   private async startSSHTail(monitor: MonitorSession): Promise<void> {
-    const conn = await this.connectionService.getConnectionById(monitor.connectionId);
+    // 按监控的归属人去取连接：SSH 凭据也是账号私有数据
+    const conn = await this.connectionService.getConnectionById(monitor.ownerId, monitor.connectionId);
     if (!conn) throw new Error('Connection not found: ' + monitor.connectionId);
 
     return new Promise((resolve, reject) => {
@@ -348,14 +357,16 @@ export class MonitorService {
         if (conn.passphrase) connectConfig.passphrase = conn.passphrase;
       } else {
         // 自动检测密钥
+        // 用 os.homedir() 而不是 process.env.HOME：
+        // Windows 下 HOME 往往没定义，拼出来是 "undefined/.ssh/id_rsa"，三条路径全部落空。
+        const sshDir = path.join(os.homedir(), '.ssh');
         const keyPaths = [
-          `${process.env.HOME}/.ssh/id_rsa`,
-          `${process.env.HOME}/.ssh/id_ed25519`,
-          `${process.env.HOME}/.ssh/id_ecdsa`,
+          path.join(sshDir, 'id_rsa'),
+          path.join(sshDir, 'id_ed25519'),
+          path.join(sshDir, 'id_ecdsa'),
         ];
         for (const kp of keyPaths) {
           try {
-            const fs = require('fs');
             if (fs.existsSync(kp)) {
               connectConfig.privateKey = fs.readFileSync(kp);
               break;
@@ -449,9 +460,9 @@ export class MonitorService {
   /**
    * 获取待分析的批量行（供 AI 分析接口使用）
    */
-  getBatchForAnalysis(monitorId: string): string[] {
+  getBatchForAnalysis(ownerId: string, monitorId: string): string[] {
     const monitor = this.monitors.get(monitorId);
-    if (!monitor) return [];
+    if (!monitor || monitor.ownerId !== ownerId) return [];
 
     const lines = monitor.lineBuffer.slice(-this.maxBatchLines);
     monitor.lastAnalyzedAt = Date.now();
@@ -547,8 +558,8 @@ export class MonitorService {
       clearInterval(this.analysisTimer);
       this.analysisTimer = null;
     }
-    for (const [id] of this.monitors) {
-      this.stopMonitor(id);
+    for (const [id, m] of this.monitors) {
+      this.stopMonitor(m.ownerId, id);
     }
   }
 }

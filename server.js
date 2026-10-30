@@ -4,6 +4,7 @@ const express = require('express');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
+const os = require('os');
 const WebSocket = require('ws');
 
 // 统一数据目录管理（所有写入文件必须通过此模块获取路径）
@@ -11,16 +12,14 @@ const { ensureDataDir, getDataPath } = require('./dist/server/utils/data-dir');
 // 统一配置入口：优先级 环境变量 > ~/.aetherops/config.json > 内置默认值
 const { loadConfig, validateConfig, describeDatabase, getConfigPath } = require('./dist/server/utils/config');
 const {
-  getAccessToken,
-  getCookieHeader,
-  extractTokenFromHeaders,
-  isValidToken,
   isAllowedOrigin,
-  requiresToken,
+  extractBearerToken,
   normalizeUploadName,
   maxUploadBytes,
 } = require('./dist/server/utils/security');
 const dataDir = ensureDataDir();
+// 账号体系：登录/注册/OAuth2 令牌/账号管理这些端点在两种宿主里共用同一份实现
+const { PUBLIC_PATHS, handleAccountRoutes } = require('./dist/server/routes/auth.routes');
 
 // 配置文件损坏（非法 JSON 等）必须立即退出：继续跑等于拿默认空配置去连库
 let appConfig;
@@ -30,17 +29,17 @@ try {
   console.error('[FATAL] 配置加载失败:', err.message);
   process.exit(1);
 }
-// 数据库配置缺失先只告警：此时存储层尚未切到 MySQL，硬拦会把整个应用拒在门外。
-// DB 接入层落地后（server/db）改为启动即校验失败退出。
+// 数据库配置不完整 = 不起。存储层已切到 MySQL（server/db），没有任何「降级回
+// JSON 文件」的分支：宁可启动失败并打印人话原因，也不要两套存储并存导致
+// 用户以为数据写进了库、实际始终在本地文件里。
 const configProblems = validateConfig(appConfig);
 if (configProblems.length) {
-  console.warn('[config] 数据库配置不完整: ' + configProblems.join('; '));
-  console.warn('[config] 请编辑 ' + getConfigPath());
-} else {
-  console.log('[config] database -> ' + describeDatabase(appConfig.database));
+  console.error('[FATAL] 数据库配置不完整: ' + configProblems.join('; '));
+  console.error('[FATAL] 请编辑 ' + getConfigPath() + '（或用 AETHEROPS_DB_* 环境变量提供）');
+  process.exit(1);
 }
+console.log('[config] database -> ' + describeDatabase(appConfig.database));
 
-const accessToken = getAccessToken();
 const uploadLimitBytes = maxUploadBytes();
 
 // 日志文件路径（写入数据目录，非安装目录）
@@ -87,8 +86,9 @@ if (!process.env.AETHEROPS_BUNDLED && !fs.existsSync(serverIndexPath)) {
   process.exit(1);
 }
 
-// 访问控制：默认仅允许同源/本机来源，并要求本地 token
-app.use((req, res, next) => {
+// 访问控制：改用账号体系的 OAuth2 Bearer 令牌（此前是单一全局 access-token）。
+// 登录态在这里统一解析，后面的 /api/* 与 WebSocket 直接读 req.user / ws.user。
+app.use(async (req, res, next) => {
   const origin = req.headers.origin;
   const host = req.headers.host;
   if (!isAllowedOrigin(origin, host)) {
@@ -101,29 +101,60 @@ app.use((req, res, next) => {
   res.setHeader('Vary', 'Origin');
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id, X-File-Name, X-AetherOps-Token, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Session-Id, X-File-Name, Authorization');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   const requestUrl = new URL(req.url, `http://${host || 'localhost'}`);
-  const queryToken = requestUrl.searchParams.get('token');
-  if (queryToken && isValidToken(queryToken)) {
-    res.setHeader('Set-Cookie', getCookieHeader(queryToken, req.socket.encrypted === true));
-    if (requestUrl.pathname === '/') {
-      res.writeHead(302, { Location: '/' });
-      res.end();
-      return;
+  const pathname = requestUrl.pathname;
+
+  // HTTP 只认 Authorization: Bearer。URL 里的令牌会进日志、浏览记录与 Referer，
+  // 不能扩散到普通接口；浏览器 WebSocket 带不了自定义头，只有 /ws/ 升级才看 ?token=
+  const token = extractBearerToken(req.headers)
+    || (pathname.startsWith('/ws/') ? requestUrl.searchParams.get('token') || '' : '');
+  req.authToken = token;
+  req.user = null;
+  if (token) {
+    try {
+      const { authenticate } = require('./dist/server/service/auth.service');
+      req.user = await authenticate(token);
+    } catch (err) {
+      // Redis 故障等：不把异常当「已登录」，但要让它落日志而不是静默 401
+      console.error('[Auth] 令牌校验失败: ' + (err && err.message ? err.message : err));
     }
   }
 
-  if ((requestUrl.pathname.startsWith('/api/') || requestUrl.pathname.startsWith('/ws/')) && requiresToken(req.headers.origin, req.headers.host) && !isValidToken(extractTokenFromHeaders(req.headers))) {
+  // 只有接口需要登录：静态资源与 SPA 必须放行，否则登录页本身打不开
+  const needsAuth = pathname.startsWith('/api/') || pathname.startsWith('/ws/');
+  const isPublic = PUBLIC_PATHS.has(pathname);
+  if (needsAuth && !isPublic && !req.user) {
     res.statusCode = 401;
     res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ ret: 401, msg: 'Unauthorized' }));
+    // error=unauthorized 时前端清令牌回登录页；session_replaced 由单点登录踢人时区分为同一提示
+    res.end(JSON.stringify({ ret: 401, msg: 'Unauthorized', error: 'unauthorized' }));
     return;
   }
 
   next();
 });
+
+// 独立路由（/api/file-upload、/api/cwd、/api/file/download）不走 handleRoutes，
+// 所以权限点与会话归属要在这里自己校验一遍——否则它们就是绕开权限的侧门。
+function assertSessionAccess(req, sessionId, permissionKeys) {
+  if (!req.user) return { ok: false, status: 401, error: 'Unauthorized' };
+  const permissions = req.user.permissions || {};
+  if (!permissionKeys.some((k) => permissions[k])) {
+    return { ok: false, status: 403, error: 'Forbidden: missing permission' };
+  }
+  try {
+    const owner = require('./dist/server/index.js').sshService.getSessionOwner(String(sessionId));
+    if (owner && owner !== req.user.userId) {
+      return { ok: false, status: 403, error: 'Forbidden: session belongs to another user' };
+    }
+  } catch (err) {
+    return { ok: false, status: 500, error: err.message || 'Access check failed' };
+  }
+  return { ok: true };
+}
 
 // 健康检查端点：供 VSCode 扩展探活。若设置了启动令牌，则必须携带正确 token，
 // 避免端口被其它无关进程占用时被误判为服务已就绪。
@@ -153,6 +184,8 @@ app.post('/api/file-upload', async (req, res) => {
     res.status(400).json({ success: false, error: 'Missing X-Session-Id or X-File-Name header' });
     return;
   }
+  const access = assertSessionAccess(req, sessionId, ['files', 'terminal']);
+  if (!access.ok) { res.status(access.status).json({ success: false, error: access.error, fileName }); return; }
   try {
     const serverModule = require('./dist/server/index.js');
     const { sshService } = serverModule;
@@ -190,6 +223,8 @@ app.get('/api/cwd', async (req, res) => {
   }
   const zmodem = req.query.zmodem === '1' || req.query.zmodem === 'true';
   const force = req.query.force === '1' || req.query.force === 'true';
+  const access = assertSessionAccess(req, sessionId, ['files', 'terminal']);
+  if (!access.ok) { res.status(access.status).json({ success: false, cwd: '', error: access.error }); return; }
   try {
     const serverModule = require('./dist/server/index.js');
     const { sshService } = serverModule;
@@ -211,6 +246,8 @@ app.get('/api/file/download', async (req, res) => {
   if (!sessionId || !filePath) {
     return res.status(400).json({ success: false, error: 'Missing sessionId or path' });
   }
+  const access = assertSessionAccess(req, sessionId, ['files', 'terminal']);
+  if (!access.ok) { return res.status(access.status).json({ success: false, error: access.error }); }
   try {
     const serverModule = require('./dist/server/index.js');
     const { sshService } = serverModule;
@@ -225,17 +262,42 @@ app.get('/api/file/download', async (req, res) => {
   }
 });
 
-// 处理 API 请求
+// 账号相关端点：/api/auth/*（自助）与 /api/users/*（管理员），不分 GET/POST
+app.use(async (req, res, next) => {
+  const pathname = new URL(req.originalUrl, `http://${req.headers.host || 'localhost'}`).pathname;
+  if (!pathname.startsWith('/api/auth/') && !pathname.startsWith('/api/users/') && !pathname.startsWith('/oauth/')) {
+    return next();
+  }
+  try {
+    const handled = await handleAccountRoutes(pathname, req.body, {
+      token: req.authToken || '',
+      user: req.user || null,
+      ip: (req.socket.remoteAddress || '').replace(/^::ffff:/, ''),
+    });
+    if (!handled) return next();
+    if (handled.headers) {
+      for (const [k, v] of Object.entries(handled.headers)) res.setHeader(k, v);
+    }
+    res.status(handled.status).json(handled.body);
+  } catch (error) {
+    console.error('Auth API Error:', error);
+    res.status(500).json({ ret: 500, msg: error.message || 'Internal server error' });
+  }
+});
+
+// 处理业务 API 请求（账号相关端点已在上面先拦掉）
 app.use('/api/', async (req, res, next) => {
   if (req.method === 'POST') {
     try {
       const serverModule = require('./dist/server/index.js');
       const pathname = new URL(req.originalUrl, `http://${req.headers.host || 'localhost'}`).pathname;
-      const result = await serverModule.handleRoutes(pathname, req.body);
+      // 第三个参数是当前登录人：业务层所有查询都必须带 ownerId，不能靠「服务实例里记住上一个用户」
+      const result = await serverModule.handleRoutes(pathname, req.body, req.user);
       res.status(200).json({ ret: 0, msg: 'success', data: result });
     } catch (error) {
       console.error('API Error:', error);
-      res.status(500).json({ ret: 500, msg: error.message || 'Internal server error' });
+      // ApiError 带 statusCode：401/403 不能都报成 500，否则前端无法区分「该重登」和「没权限」
+      res.status(error.statusCode || 500).json({ ret: error.statusCode || 500, msg: error.message || 'Internal server error' });
     }
   } else {
     next();
@@ -282,14 +344,43 @@ try {
 }
 
 wss.on('connection', async (ws, req) => {
+  // 握手完成到鉴权结束之间有一段空窗：authenticate 要走 Redis（远程实例可能几十毫秒到几秒），
+  // 而浏览器是在 onopen 里就把 create 发出来的。ws 在没有任何 'message' 监听器时会把
+  // 到达的帧直接丢掉（EventEmitter 无监听即丢弃，不排队），表现就是连接建立成功、
+  // 终端却永远停在 Connecting。所以握手后第一件事就是挂个缓冲器，
+  // 鉴权通过后再把攒下的消息按到达顺序回放给正式处理器。
+  const earlyMessages = [];
+  const bufferEarlyMessage = (raw) => earlyMessages.push(raw);
+  ws.on('message', bufferEarlyMessage);
+
   const requestUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const wsToken = requestUrl.searchParams.get('token') || extractTokenFromHeaders(req.headers);
-  if (!isAllowedOrigin(req.headers.origin, req.headers.host) || (requiresToken(req.headers.origin, req.headers.host) && !isValidToken(wsToken))) {
+  if (!isAllowedOrigin(req.headers.origin, req.headers.host)) {
+    ws.close(1008, 'Forbidden origin');
+    return;
+  }
+  // 浏览器 WebSocket 带不了自定义请求头，令牌只能走 ?token=（HTTP 那头只认 Bearer）
+  const wsToken = extractBearerToken(req.headers) || requestUrl.searchParams.get('token') || '';
+  let wsUser = null;
+  try {
+    const { authenticate } = require('./dist/server/service/auth.service');
+    wsUser = await authenticate(wsToken);
+  } catch (err) {
+    console.error('[WS] 令牌校验失败: ' + (err && err.message ? err.message : err));
+  }
+  if (!wsUser) {
     ws.close(1008, 'Unauthorized');
     return;
   }
+  // 终端权限在门禁处就拦掉，不要等进入 switch 才判
+  if (!wsUser.permissions || !wsUser.permissions.terminal) {
+    ws.close(1008, 'Forbidden');
+    return;
+  }
+  ws.user = wsUser;
+
   let sessionId = null;
-  console.log(`[WS] Client connected from ${req.socket.remoteAddress}`);
+  const ownerId = wsUser.userId;
+  console.log(`[WS] Client connected from ${req.socket.remoteAddress} user=${wsUser.username}`);
 
   // 安全发送 WebSocket 消息：捕获 EAGAIN 等写入异常，防止未处理的 'error' 事件导致进程崩溃
   // highFreq=true 时启用背压检测，缓冲区超过阈值则丢弃该消息（终端输出可丢帧，不影响连接）
@@ -327,7 +418,7 @@ wss.on('connection', async (ws, req) => {
       safeSend(JSON.stringify({ type: 'conn-log', sessionId, data: msg }));
     };
 
-    const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog);
+    const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog, ownerId);
     console.log(`[WS] SSH session created: ${sessionId}`);
 
     // 根据会话类型绑定输出和关闭事件
@@ -367,7 +458,7 @@ wss.on('connection', async (ws, req) => {
     console.log(`[WS] Session ${sessionId} connected, status sent`);
   }
 
-  ws.on('message', async (raw) => {
+  const handleMessage = async (raw) => {
     console.log(`[WS] Received raw message: ${raw.toString().substring(0, 200)}`);
     let msg;
     try {
@@ -380,7 +471,20 @@ wss.on('connection', async (ws, req) => {
 
     const { type, sessionId: sid, data } = msg;
     console.log(`[WS] Processing message type: ${type}, sessionId: ${sid}`);
-
+    
+    // 会话归属校验：sessionId 是前端传来的，必须确认属于当前登录人，
+    // 否则猜到别人的 sessionId 就能直接读写对方终端。
+    // type=create 例外：那是新建，归属由 createSession 里的 ownerId 决定。
+    const targetSessionId = type === 'ai-agent-run' ? (data && data.aiSessionId) : sid;
+    if (targetSessionId && type !== 'create') {
+      const owner = require('./dist/server/index.js').sshService.getSessionOwner(targetSessionId);
+      if (owner && owner !== ownerId) {
+        console.warn(`[WS] 拒绝访问他人会话: user=${wsUser.username} session=${targetSessionId}`);
+        ws.send(JSON.stringify({ type: 'error', sessionId: targetSessionId, data: 'Forbidden: session belongs to another user' }));
+        return;
+      }
+    }
+    
     try {
       const serverModule = require('./dist/server/index.js');
       const { sshService, connectionService } = serverModule;
@@ -453,6 +557,10 @@ wss.on('connection', async (ws, req) => {
         case 'ai-agent-run': {
           // AI Agent run
           const { aiSessionId, message, context, skillId, locale } = data || {};
+          if (!wsUser.permissions || !wsUser.permissions.ai) {
+            ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Forbidden: missing permission' } }));
+            break;
+          }
           if (!aiSessionId || !message) {
             ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params' } }));
             break;
@@ -463,7 +571,7 @@ wss.on('connection', async (ws, req) => {
             break;
           }
           console.log(`[WS] AI Agent run: session=${aiSessionId}, skill=${skillId || 'none'}, locale=${locale || 'auto'}, message=${message.substring(0, 50)}`);
-          aiService.agentRun(aiSessionId, message, context, (event) => {
+          aiService.agentRun(ownerId, aiSessionId, message, context, (event) => {
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, event }));
             }
@@ -616,7 +724,8 @@ wss.on('connection', async (ws, req) => {
           if (stopSid) {
             const { aiService } = serverModule;
             if (aiService) {
-              aiService.stopAgent(stopSid);
+              // 带 ownerId：否则拿到别人的 aiSessionId 就能把对方的 Agent 中止掉
+              aiService.stopAgent(ownerId, stopSid);
               console.log(`[WS] AI Agent stop requested: ${stopSid}`);
             }
           }
@@ -630,7 +739,14 @@ wss.on('connection', async (ws, req) => {
       console.error('[WS] Error processing message:', err);
       ws.send(JSON.stringify({ type: 'error', data: err.message || '服务端异常' }));
     }
-  });
+  };
+
+  // 鉴权已通过：卸掉缓冲器，换成正式处理器，再把空窗期攒下的消息补处理掉
+  ws.off('message', bufferEarlyMessage);
+  ws.on('message', handleMessage);
+  for (const raw of earlyMessages) {
+    await handleMessage(raw);
+  }
 
   ws.on('close', () => {
     console.log(`[WS] Client disconnected, sessionId: ${sessionId}`);
@@ -693,12 +809,47 @@ const pidFilePath = getDataPath('aetherops.server.' + PORT + '.pid');
 function cleanupPid() {
   try { if (fs.existsSync(pidFilePath)) fs.unlinkSync(pidFilePath); } catch {}
 }
-server.listen(PORT, HOST, () => {
-  fs.writeFileSync(pidFilePath, process.pid.toString());
-  console.log(`PID ${process.pid} written to ${pidFilePath}`);
-  console.log(`aetherops Server is running on ${HOST}:${PORT}`);
-  console.log(`http://localhost:${PORT}/?token=${accessToken}`);
-});
+// 启动前必须让依赖就绪：MySQL 探活 + 跑完迁移 + Redis 探活 + 加载服务配置。
+// 迁移完成后才 listen：服务还没开始接请求就失败退出，
+// 不会出现「端口已开但一查就错」这种更难排查的中间态。
+async function bootstrapDatabase() {
+  try {
+    const { ensureDatabaseReady } = require('./dist/server/db/migrate');
+    await ensureDatabaseReady();
+    // Redis 持有登录令牌，连不上等于没人能登录，同样按硬依赖处理
+    const { probeRedis } = require('./dist/server/db/redis');
+    await probeRedis();
+    // 建表完成后才能读表：服务的初始化（AI 配置、连接列表等）必须在这一步之后
+    const { initServices } = require('./dist/server/index.js');
+    await initServices();
+  } catch (err) {
+    console.error('[FATAL] ' + (err && err.message ? err.message : String(err)));
+    console.error('[FATAL] 依赖服务不可用（MySQL / Redis），服务不启动。校对配置: ' + getConfigPath());
+    try { logStream.end(); } catch (e) { /* ignore */ }
+    process.exit(1);
+  }
+}
+
+function startListening() {
+  server.listen(PORT, HOST, () => {
+    fs.writeFileSync(pidFilePath, process.pid.toString());
+    console.log(`PID ${process.pid} written to ${pidFilePath}`);
+    console.log(`aetherops Server is running on ${HOST}:${PORT}`);
+    // 绑 0.0.0.0 / :: 时 localhost 只在"服务这台机器上"有效，
+    // 直接把各网卡的 IPv4 列出来，省得用户再去 ipconfig 里翻。
+    const lanIps = HOST === '0.0.0.0' || HOST === '::' || HOST === ''
+      ? Object.values(os.networkInterfaces())
+          .flat()
+          .filter((a) => a && a.family === 'IPv4' && !a.internal)
+          .map((a) => a.address)
+      : [HOST];
+    for (const ip of ['127.0.0.1', ...lanIps]) {
+      console.log(`http://${ip}:${PORT}/   （账号登录页；初始管理员见上方 [Auth] 日志）`);
+    }
+  });
+}
+
+bootstrapDatabase().then(startListening);
 
 // 进程退出处理
 process.on('exit', () => { cleanupPid(); logStream.end(); });

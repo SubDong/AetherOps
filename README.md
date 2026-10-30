@@ -364,8 +364,8 @@ terminal, used under the MIT License. The upstream copyright notice is retained 
 Two things differ from upstream on purpose:
 
 - **Naming**: every identifier was renamed (`AICMD_*` env vars, `~/.aetherops` data dir,
-  `aetherops_token` cookie, `X-AetherOps-Token` header, `aetherops.*` VSCode commands, `__AETHEROPS_SYS__`
-  terminal probe marker). Anything written against the old names must be updated.
+  `aetherops.*` VSCode commands, `__AETHEROPS_SYS__` terminal probe marker).
+  Anything written against the old names must be updated.
 - **Data migration**: on first start the server moves an existing `~/.aicmd/` directory to `~/.aetherops/`
   (skipped if the new directory already has content, and never performed when `AETHEROPS_DATA_DIR` is set).
   Because `.key` travels with it, encrypted credentials stay decryptable after the move.

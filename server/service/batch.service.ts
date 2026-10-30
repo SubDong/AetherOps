@@ -20,6 +20,8 @@ export interface BatchResult {
  */
 export interface BatchTask {
   id: string;
+  /** 归属账号：任务列表与结果不跨账号可见 */
+  ownerId: string;
   command: string;
   sessionIds: string[];
   results: BatchResult[];
@@ -64,8 +66,12 @@ export class BatchService {
 
   /**
    * 执行批量命令
+   *
+   * sessionIds 是前端传的，必须逐个确认属于当前账号（或不存在）才继续，
+   * 否则知道别人的 sessionId 就能把命令打到对方服务器上。
    */
   async executeBatch(
+    ownerId: string,
     sessionIds: string[],
     command: string,
     timeout: number = 10000,
@@ -74,9 +80,16 @@ export class BatchService {
     if (!risk.safe) {
       throw new Error(risk.reason || 'Blocked high-risk command');
     }
+    for (const sessionId of sessionIds) {
+      const owner = this.sshService.getSessionOwner(sessionId);
+      if (owner && owner !== ownerId) {
+        throw new Error('Forbidden: session belongs to another user');
+      }
+    }
     const taskId = `batch_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const task: BatchTask = {
       id: taskId,
+      ownerId,
       command,
       sessionIds,
       results: [],
@@ -125,15 +138,17 @@ export class BatchService {
   /**
    * 获取批量任务结果
    */
-  getTask(taskId: string): BatchTask | null {
-    return this.tasks.get(taskId) || null;
+  getTask(ownerId: string, taskId: string): BatchTask | null {
+    const task = this.tasks.get(taskId);
+    if (!task || task.ownerId !== ownerId) return null;
+    return task;
   }
 
   /**
-   * 获取所有批量任务
+   * 获取该账号的批量任务
    */
-  getTasks(limit = 20): BatchTask[] {
-    const tasks = Array.from(this.tasks.values());
+  getTasks(ownerId: string, limit = 20): BatchTask[] {
+    const tasks = Array.from(this.tasks.values()).filter((t) => t.ownerId === ownerId);
     tasks.sort((a, b) => b.startedAt - a.startedAt);
     return tasks.slice(0, limit);
   }

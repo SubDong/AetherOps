@@ -1,7 +1,13 @@
-import * as fs from 'fs';
-import * as path from 'path';
 import * as crypto from 'crypto';
-import { getDataPath, ensureDataDir } from '../utils/data-dir';
+import {
+  insertAuditEvent,
+  queryAuditEvents,
+  listAuditRange,
+  countAuditByStatus,
+  listAuditDates,
+  deleteAuditBefore,
+  toAuditDate,
+} from '../db/repositories/audit.repo';
 
 /**
  * 审计日志条目
@@ -47,26 +53,41 @@ export interface AuditStats {
 
 /**
  * 命令审计服务
- * 记录所有 AI Agent 执行的命令及结果，按日存储为 JSONL 文件
+ * 记录所有 AI Agent 执行的命令及结果，落 MySQL 的 audit_events 表。
+ *
+ * 改成落表后，查询不再受「一次只能读一天文件」的限制：
+ * keyword / status / sessionId 现在可以做真正的跨日过滤与分页。
+ *
+ * 账号隔离：除 init() 的保留期清理（全局策略）外，所有方法第一个参数都是 ownerId，
+ * 不提供「不带 owner 的全局查询」——管理员也没有看别人数据的口子。
  */
 export class AuditService {
-  private auditDir: string;
   private retentionDays: number = 30;
 
-  constructor() {
-    this.auditDir = getDataPath('audit');
+  /**
+   * 过期清理必须等库就绪，所以从构造函数挪到这里，
+   * 由 initServices() 在迁移跑完后调用。
+   */
+  async init(): Promise<void> {
     try {
-      if (!fs.existsSync(this.auditDir)) {
-        fs.mkdirSync(this.auditDir, { recursive: true });
+      const cutoff = new Date();
+      cutoff.setDate(cutoff.getDate() - this.retentionDays);
+      const removed = await deleteAuditBefore(toAuditDate(cutoff));
+      if (removed > 0) {
+        console.log(`[AuditService] 清理过期审计 ${removed} 条（保留 ${this.retentionDays} 天）`);
       }
-    } catch { /* ignore */ }
-    this.cleanupOldLogs();
+    } catch (error: any) {
+      console.error('[AuditService] 清理过期审计失败:', error.message);
+    }
   }
 
   /**
    * 记录审计日志
+   *
+   * 调用方是 agent 的 after_tool 钩子：审计写失败不能影响命令执行结果，
+   * 因此这里吞掉异常只打日志，但仍然把完整条目返回给调用方。
    */
-  log(entry: Omit<AuditEntry, 'id' | 'timestamp'>): AuditEntry {
+  async log(ownerId: string, entry: Omit<AuditEntry, 'id' | 'timestamp'>): Promise<AuditEntry> {
     const fullEntry: AuditEntry = {
       ...entry,
       id: crypto.randomUUID(),
@@ -74,97 +95,42 @@ export class AuditService {
     };
 
     try {
-      const filePath = this.getDateFilePath(this.formatDate(new Date()));
-      const line = JSON.stringify(fullEntry) + '\n';
-      fs.appendFileSync(filePath, line, 'utf-8');
+      await insertAuditEvent({ ...fullEntry, ownerId });
     } catch (e: any) {
-      console.error('[AuditService] Failed to write log:', e.message);
+      console.error('[AuditService] Failed to write audit event:', e.message);
     }
 
     return fullEntry;
   }
 
   /**
-   * 查询审计日志
+   * 查询审计日志（默认查当天）
    */
-  getLogs(query: AuditQuery = {}): { entries: AuditEntry[]; total: number } {
-    const date = query.date || this.formatDate(new Date());
-    const filePath = this.getDateFilePath(date);
-
-    if (!fs.existsSync(filePath)) {
-      return { entries: [], total: 0 };
-    }
-
-    let entries: AuditEntry[] = [];
-    try {
-      const content = fs.readFileSync(filePath, 'utf-8');
-      const lines = content.trim().split('\n').filter(Boolean);
-      entries = lines.map(line => {
-        try { return JSON.parse(line) as AuditEntry; }
-        catch { return null; }
-      }).filter(Boolean) as AuditEntry[];
-    } catch {
-      return { entries: [], total: 0 };
-    }
-
-    // 过滤
-    if (query.sessionId) {
-      entries = entries.filter(e => e.sessionId === query.sessionId);
-    }
-    if (query.status) {
-      entries = entries.filter(e => e.status === query.status);
-    }
-    if (query.keyword) {
-      const kw = query.keyword.toLowerCase();
-      entries = entries.filter(e =>
-        e.command.toLowerCase().includes(kw) ||
-        e.result.toLowerCase().includes(kw) ||
-        e.userMessage.toLowerCase().includes(kw)
-      );
-    }
-
-    // 按时间倒序
-    entries.sort((a, b) => b.timestamp - a.timestamp);
-
-    const total = entries.length;
-    const offset = query.offset || 0;
-    const limit = query.limit || 100;
-    entries = entries.slice(offset, offset + limit);
-
+  async getLogs(ownerId: string, query: AuditQuery = {}): Promise<{ entries: AuditEntry[]; total: number }> {
+    const { entries, total } = await queryAuditEvents({
+      ownerId,
+      date: query.date || toAuditDate(new Date()),
+      sessionId: query.sessionId,
+      keyword: query.keyword,
+      status: query.status,
+      limit: query.limit || 100,
+      offset: query.offset || 0,
+    });
     return { entries, total };
   }
 
   /**
    * 获取多日审计日志（用于导出）
    */
-  getLogsRange(startDate: string, endDate: string): AuditEntry[] {
-    const allEntries: AuditEntry[] = [];
-    const start = new Date(startDate);
-    const end = new Date(endDate);
-
-    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      const dateStr = this.formatDate(d);
-      const filePath = this.getDateFilePath(dateStr);
-      if (!fs.existsSync(filePath)) continue;
-
-      try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        const lines = content.trim().split('\n').filter(Boolean);
-        for (const line of lines) {
-          try { allEntries.push(JSON.parse(line)); } catch { /* skip */ }
-        }
-      } catch { /* skip */ }
-    }
-
-    allEntries.sort((a, b) => b.timestamp - a.timestamp);
-    return allEntries;
+  async getLogsRange(ownerId: string, startDate: string, endDate: string): Promise<AuditEntry[]> {
+    return listAuditRange(ownerId, startDate, endDate);
   }
 
   /**
    * 导出审计日志
    */
-  exportLogs(startDate: string, endDate: string, format: 'json' | 'csv' = 'json'): string {
-    const entries = this.getLogsRange(startDate, endDate);
+  async exportLogs(ownerId: string, startDate: string, endDate: string, format: 'json' | 'csv' = 'json'): Promise<string> {
+    const entries = await this.getLogsRange(ownerId, startDate, endDate);
 
     if (format === 'csv') {
       const header = 'id,timestamp,datetime,sessionId,sessionName,connectionId,userMessage,tool,command,status,duration,rewrittenFrom';
@@ -188,81 +154,31 @@ export class AuditService {
   /**
    * 获取统计信息
    */
-  getStats(date?: string): AuditStats {
-    const targetDate = date || this.formatDate(new Date());
-    const { entries } = this.getLogs({ date: targetDate, limit: 99999 });
+  async getStats(ownerId: string, date?: string): Promise<AuditStats> {
+    const todayDate = toAuditDate(new Date());
+    const targetDate = date || todayDate;
+    const counts = await countAuditByStatus(ownerId, targetDate);
 
-    const stats: AuditStats = {
-      total: entries.length,
-      success: 0,
-      error: 0,
-      blocked: 0,
-      rewritten: 0,
-      today: 0,
+    const total = Object.values(counts).reduce((sum, n) => sum + n, 0);
+    // 「今天」和「目标日」不是同一天时才需要额外查一次
+    const today = targetDate === todayDate
+      ? total
+      : Object.values(await countAuditByStatus(ownerId, todayDate)).reduce((sum, n) => sum + n, 0);
+
+    return {
+      total,
+      success: counts.success || 0,
+      error: counts.error || 0,
+      blocked: counts.blocked || 0,
+      rewritten: counts.rewritten || 0,
+      today,
     };
-
-    const todayStr = this.formatDate(new Date());
-    for (const e of entries) {
-      if (e.status === 'success') stats.success++;
-      else if (e.status === 'error') stats.error++;
-      else if (e.status === 'blocked') stats.blocked++;
-      else if (e.status === 'rewritten') stats.rewritten++;
-
-      if (targetDate === todayStr) stats.today = stats.total;
-      else {
-        // 额外查今天的
-        const todayEntries = this.getLogs({ date: todayStr, limit: 1 });
-        stats.today = todayEntries.total;
-      }
-    }
-
-    return stats;
   }
 
   /**
    * 获取可用日期列表
    */
-  getAvailableDates(): string[] {
-    try {
-      if (!fs.existsSync(this.auditDir)) return [];
-      return fs.readdirSync(this.auditDir)
-        .filter(f => f.endsWith('.jsonl'))
-        .map(f => f.replace('.jsonl', ''))
-        .sort()
-        .reverse();
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * 清理过期日志
-   */
-  private cleanupOldLogs(): void {
-    try {
-      if (!fs.existsSync(this.auditDir)) return;
-      const files = fs.readdirSync(this.auditDir).filter(f => f.endsWith('.jsonl'));
-      const cutoff = new Date();
-      cutoff.setDate(cutoff.getDate() - this.retentionDays);
-      const cutoffStr = this.formatDate(cutoff);
-
-      for (const file of files) {
-        const dateStr = file.replace('.jsonl', '');
-        if (dateStr < cutoffStr) {
-          fs.unlinkSync(path.join(this.auditDir, file));
-        }
-      }
-    } catch { /* ignore */ }
-  }
-
-  private getDateFilePath(date: string): string {
-    return path.join(this.auditDir, `${date}.jsonl`);
-  }
-
-  private formatDate(d: Date): string {
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, '0');
-    const day = String(d.getDate()).padStart(2, '0');
-    return `${y}-${m}-${day}`;
+  async getAvailableDates(ownerId: string): Promise<string[]> {
+    return listAuditDates(ownerId);
   }
 }
