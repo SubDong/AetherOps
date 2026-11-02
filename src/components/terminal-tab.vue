@@ -126,7 +126,7 @@
       <div class="ai-resize-handle" @mousedown="startResize"></div>
       <AIChat
         ref="aiChatRef"
-        :sessionId="aiSessionId || tabId"
+        :sessionId="aiSessionId"
         :sessionName="props.connection.name"
         :connectionId="props.connection.id"
         :isOpen="showAIChat"
@@ -228,7 +228,9 @@ const errorMessage = ref('');
 const showAIChat = ref(false);
 const aiChatRef = ref<InstanceType<typeof AIChat>>();
 // 真正可用于执行命令的终端会话 id。sessionId 是普通变量（不参与响应式），
-// 直接当 prop 传给 AI 面板会拿到连接前的旧值（tabId），命令就落不到正确终端上。
+// 直接当 prop 传给 AI 面板会拿到连接前的旧值，命令就落不到正确终端上。
+// 没连上时就是空串，不要再拿 tabId 顶替：tabId 不是服务端的会话 id，
+// 拿它去查会话只会得出一句误导人的「终端会话已断开」。
 const aiSessionId = ref('');
 
 // 文件管理器相关

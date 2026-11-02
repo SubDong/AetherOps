@@ -72,6 +72,12 @@
       </button>
     </div>
 
+    <!-- 没绑终端就把话说在前面：不说，模型会反复试工具，最后给用户编一句「终端会话已断开」 -->
+    <div v-if="activeTab === 'chat' && !sessionId" class="ai-no-terminal">
+      <i class="bi bi-plug"></i>
+      <span>{{ t('ai.noTerminalBound') }}</span>
+    </div>
+
     <!-- 消息列表 (Chat 模式) -->
     <div v-show="activeTab === 'chat'" class="ai-chat-messages" ref="messagesContainer" @click="handleMessagesClick">
       <div v-if="messages.length === 0" class="ai-chat-empty">
@@ -981,6 +987,9 @@ async function loadDisplayHistory(chatId: string) {
 
 /** 主动获取系统环境信息并展示为第一条消息 */
 async function fetchAndShowSystemInfo() {
+  // 没绑终端时不去拉环境信息：服务端拿不到会话会回落成「跑服务的那台机器」，
+  // 把它当成用户的环境报上去比不报更坑
+  if (!props.sessionId) return;
   try {
     const sysContext = await aiService.getSystemContext(props.sessionId);
     if (sysContext && typeof sysContext === 'string' && sysContext.trim()) {
@@ -2253,6 +2262,19 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
   background-color: var(--bg-input);
   color: var(--accent);
 }
+
+/* 未绑终端的提示条：只说「不能执行命令」，不跟着模型说「会话已断开」 */
+.ai-no-terminal {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  border-bottom: 1px solid var(--border-color);
+  background: rgb(var(--accent-rgb) / 8%);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.ai-no-terminal i { flex-shrink: 0; font-size: 11px; color: var(--warning); }
 
 /* 消息上的模型标识 */
 .ai-msg-model {

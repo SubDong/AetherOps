@@ -480,27 +480,39 @@ function setupTerminalIPC() {
         }
 
         case 'ai-agent-run': {
-          const { aiSessionId, message, context, skillId, locale } = data || {};
+          // 与 server.js / vite.config.ts 的 WS 处理保持同一套参数：
+          // chatId 是对话存储 key，aiSessionId 是命令要跑在哪个终端，两者不是一回事。
+          const { aiSessionId, chatId, message, context, skillId, locale, modelId } = data || {};
           if (!user.permissions?.ai) {
             send({ type: 'ai-agent-event', event: { type: 'error', error: 'Forbidden: missing permission' } });
             return;
           }
-          if (!aiSessionId || !message) {
-            send({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params' } });
+          // aiSessionId 允许为空：终端关掉时纯问答仍然有意义，
+          // 执行命令由 ai.service 的 terminalGuard 拦住并说明「先打开终端」
+          if (!message) {
+            send({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params: message' } });
             return;
           }
-          aiService.agentRun(user.userId, aiSessionId, message, context, (agentEvent) => {
-            send({ type: 'ai-agent-event', sessionId: aiSessionId, event: agentEvent });
-          }, skillId, locale).catch((err) => {
-            send({ type: 'ai-agent-event', sessionId: aiSessionId, event: { type: 'error', error: err.message } });
+          const terminalSid = typeof aiSessionId === 'string' ? aiSessionId : '';
+          const conversationId = chatId || terminalSid;
+          if (!conversationId) {
+            send({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params: chatId' } });
+            return;
+          }
+          console.log(`[IPC] AI Agent run: chat=${conversationId}, terminal=${terminalSid || 'none'}, model=${modelId || 'auto'}, skill=${skillId || 'none'}`);
+          aiService.agentRun(user.userId, conversationId, terminalSid, message, context, (agentEvent) => {
+            send({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event: agentEvent });
+          }, { skillId, locale, modelId }).catch((err) => {
+            send({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event: { type: 'error', error: err.message } });
           });
           break;
         }
 
         case 'ai-agent-stop': {
-          const { aiSessionId: stopSid } = data || {};
-          // 带 ownerId：否则拿到别人的 aiSessionId 就能把对方的 Agent 中止掉
-          if (stopSid) aiService.stopAgent(user.userId, stopSid);
+          const { aiSessionId: stopSid, chatId: stopChatId } = data || {};
+          // 中止的粒度是对话而不是终端；带 ownerId 才不会拿别人的 id 中止对方的 Agent
+          const stopTarget = stopChatId || stopSid;
+          if (stopTarget) aiService.stopAgent(user.userId, stopTarget);
           break;
         }
 

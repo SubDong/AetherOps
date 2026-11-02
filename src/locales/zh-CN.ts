@@ -185,6 +185,7 @@ export default {
     inputResizeHint: '往上拖调整输入框高度，双击恢复自适应',
     executeCommand: '执行命令',
     agentHint: 'AI Agent 可以直接操作你的终端 Shell\n试试说：“帮我查看当前目录” 或 “查找占用 80 端口的进程”',
+    noTerminalBound: '当前没有可用的终端，AI 能回答问题但不能执行命令',
     agentThinking: '思考中...',
     executingCommand: '执行命令',
     stopAgent: '停止',

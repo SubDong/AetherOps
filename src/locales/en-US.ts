@@ -185,6 +185,7 @@ export default {
     inputResizeHint: 'Drag up to resize the input box, double-click to restore auto height',
     executeCommand: 'Execute Command',
     agentHint: 'AI Agent can directly operate your terminal Shell\nTry: "list current directory" or "find process using port 80"',
+    noTerminalBound: 'No terminal is available right now: AI can still answer, but it cannot run commands',
     agentThinking: 'Thinking...',
     executingCommand: 'Executing',
     stopAgent: 'Stop',

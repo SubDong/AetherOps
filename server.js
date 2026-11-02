@@ -567,8 +567,11 @@ wss.on('connection', async (ws, req) => {
             ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Forbidden: missing permission' } }));
             break;
           }
-          if (!aiSessionId || !message) {
-            ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params' } }));
+          // aiSessionId 允许为空：面板开着但终端已经关掉时，纯问答仍然有意义。
+          // 真正的命令执行由 ai.service 里的 terminalGuard 拦住，会给出「先打开终端」的明确说明，
+          // 不会再拿一个查不到的会话 id 得出「终端会话已断开」。
+          if (!message) {
+            ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params: message' } }));
             break;
           }
           const { aiService } = serverModule;
@@ -576,15 +579,20 @@ wss.on('connection', async (ws, req) => {
             ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'AI service unavailable' } }));
             break;
           }
-          const conversationId = chatId || aiSessionId;
-          console.log(`[WS] AI Agent run: chat=${conversationId}, terminal=${aiSessionId}, model=${modelId || 'auto'}, skill=${skillId || 'none'}, locale=${locale || 'auto'}, message=${message.substring(0, 50)}`);
-          aiService.agentRun(ownerId, conversationId, aiSessionId, message, context, (event) => {
+          const terminalSid = typeof aiSessionId === 'string' ? aiSessionId : '';
+          const conversationId = chatId || terminalSid;
+          if (!conversationId) {
+            ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params: chatId' } }));
+            break;
+          }
+          console.log(`[WS] AI Agent run: chat=${conversationId}, terminal=${terminalSid || 'none'}, model=${modelId || 'auto'}, skill=${skillId || 'none'}, locale=${locale || 'auto'}, message=${message.substring(0, 50)}`);
+          aiService.agentRun(ownerId, conversationId, terminalSid, message, context, (event) => {
             if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, chatId: conversationId, event }));
+              ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event }));
             }
           }, { skillId, locale, modelId }).catch((err) => {
             if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, chatId: conversationId, event: { type: 'error', error: err.message } }));
+              ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event: { type: 'error', error: err.message } }));
             }
           });
           break;

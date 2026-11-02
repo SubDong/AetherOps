@@ -189,6 +189,36 @@ interface ISkillService {
   getSkill(ownerId: string, id: string): Promise<{ name: string; content: string } | undefined>;
 }
 
+// ========== 工具与终端会话的绑定 ==========
+
+/** agentRun 每轮通过 context.custom 带进来的「命令在哪个终端跑」的 key */
+const TERMINAL_SESSION_KEY = 'terminalSessionId';
+
+/**
+ * 从工具上下文里取终端会话 ID。
+ *
+ * 这里绝不能退回 ctx.sessionId：engine 把它用作对话上下文的 key（= chatId，形如 chat_xxx），
+ * 拿它去 sshService 的 sessions 里查必然落空，工具只能回一句 not found，
+ * 而模型见到 not found 就对用户说「终端会话已断开」—— 方向完全指错了。
+ * 自建对话以来 chatId 与终端会话就是两件事（见 agentRun 注释），工具要靠 custom 里的显式绑定。
+ */
+function terminalSessionOf(ctx: ToolContext): string {
+  return (ctx.custom?.[TERMINAL_SESSION_KEY] as string) || '';
+}
+
+/** 这一轮压根没绑终端：让模型如实说「先打开终端」，而不是猜一个「断开」 */
+const NO_TERMINAL_MSG = 'NO_TERMINAL: this chat is not bound to any terminal session, so no command can run. '
+  + 'Ask the user to open a terminal (an SSH connection or the Local Shell) and retry. '
+  + 'Do NOT say the terminal session was "disconnected" - there is none attached here. '
+  + 'Do NOT call execute_command / read_terminal again this round.';
+
+/** 传来的 id 在服务端查不到（没开过、或者已经关掉） */
+function unknownTerminalMsg(sessionId: string): string {
+  return `TERMINAL_NOT_FOUND: no terminal session is registered under "${sessionId}" `
+    + '(it was never opened, or it has already been closed). '
+    + 'Ask the user to open or reconnect a terminal, then stop calling tools. Never invent command output.';
+}
+
 // ========== Agent System Prompt ==========
 
 const AGENT_SYSTEM_PROMPT = `You are a powerful AI terminal Agent that can directly operate the user's terminal Shell.
@@ -757,7 +787,8 @@ export class AIService {
   registerTool(name: string, definition: ToolDefinition, executor: ToolExecutor): void {
     this.toolRegistry.register({
       definition,
-      executor: (args, _ctx) => executor(args, _ctx.sessionId),
+      // 终端会话从 context.custom 取：ctx.sessionId 是 chatId，拿它当会话 id 查不到任何终端
+      executor: (args, ctx) => executor(args, terminalSessionOf(ctx)),
       category: 'custom',
     });
     console.log(`[AIService] Tool registered: ${name}`);
@@ -786,7 +817,8 @@ export class AIService {
         },
       },
       executor: async (args: Record<string, unknown>, ctx: ToolContext) => {
-        return this.executeCommand(args.command as string, ctx.sessionId, (args.timeout as number) || 2000);
+        // 会话在不在由 executeCommand 开头的 terminalGuard 统一判，两条工具路不用各写一份
+        return this.executeCommand(args.command as string, terminalSessionOf(ctx), (args.timeout as number) || 2000);
       },
       category: 'builtin',
     });
@@ -802,7 +834,7 @@ export class AIService {
         },
       },
       executor: async (_args: Record<string, unknown>, ctx: ToolContext) => {
-        return this.readTerminal(ctx.sessionId);
+        return this.readTerminal(terminalSessionOf(ctx));
       },
       category: 'builtin',
     });
@@ -857,10 +889,26 @@ export class AIService {
 
   // ========== 工具执行 ==========
 
-  private async executeCommand(command: string, sessionId: string, timeout: number): Promise<string> {
+  /**
+   * 工具动手之前的终端检查。返回 null 表示可以继续。
+   *
+   * 只放在 executeCommand / readTerminal 这两个咽喉处：自有工具、agent-core 内置工具、
+   * 注入给 engine 的 ctx.shell 三条路最终都走到这里，漏不到别处去。
+   * 报的内容必须区分「这轮没绑终端」和「绑的那个已经没了」：
+   * 一句 not found 会让模型对用户编出「终端会话已断开」，而真实原因常常是用户压根没开终端。
+   */
+  private terminalGuard(sessionId: string): string | null {
     if (!this.sshService) return 'Error: SSH service not available';
-    const session = this.sshService.getSession(sessionId);
-    if (!session) return `Error: Session ${sessionId} not found`;
+    if (!sessionId) return NO_TERMINAL_MSG;
+    return this.sshService.getSession(sessionId) ? null : unknownTerminalMsg(sessionId);
+  }
+
+  private async executeCommand(command: string, sessionId: string, timeout: number): Promise<string> {
+    const blocked = this.terminalGuard(sessionId);
+    if (blocked) return blocked;
+    // guard 已经确认过会话存在，这里的判空只是给 TS 看
+    const session = this.sshService?.getSession(sessionId);
+    if (!session) return unknownTerminalMsg(sessionId);
 
     const check = await this.sanitizeCommand(command, sessionId);
     if (!check.safe) return check.reason!;
@@ -894,7 +942,8 @@ export class AIService {
   }
 
   private async readTerminal(sessionId: string): Promise<string> {
-    if (!this.sshService) return 'Error: SSH service not available';
+    const blocked = this.terminalGuard(sessionId);
+    if (blocked) return blocked;
     try {
       // 优先读取会话累积输出缓冲（当前屏幕内容），空闲终端也能拿到结果，
       // 不再依赖「调用后新到达」的采集窗口，避免一直捕不到输出。
@@ -919,7 +968,10 @@ export class AIService {
     return {
       exec: async (command: string, timeoutMs?: number) =>
         this.executeCommand(command, sessionId, timeoutMs || 2000),
+      // 没绑终端时直接丢弃而不是空转：writeData 找不到会话本来也是静默返回，
+      // 但那样模型会以为「已经敲下去了」，接着编造一段并不存在的输出
       write: (data: string) => {
+        if (this.terminalGuard(sessionId)) return;
         this.sshService?.writeData(sessionId, data);
       },
       read: async (_lines?: number) => this.readTerminal(sessionId),
@@ -1007,9 +1059,26 @@ export class AIService {
       systemPromptOverride += `\n\n[User's UI language preference: ${langName} (${locale}). If the user's message language is ambiguous, prefer responding in ${langName}.]`;
     }
 
-    const sysContext = await this.getSessionContext(terminalSessionId);
+    // 终端到不到得在开工前定下来：getSystemContext 拿不到 meta 时会回落成
+    // 「服务端本机」的环境信息，拿着一个已经不存在的会话去问环境，
+    // 等于把跑服务的那台机器当成用户的终端报给他。
+    const terminalLive = !!terminalSessionId && !!this.sshService?.getSession(terminalSessionId);
+    if (!terminalLive) {
+      console.warn(`[AIService] 本轮没有可用的终端会话（terminal=${terminalSessionId || 'none'}），工具将直接返回 NO_TERMINAL`);
+    }
+
+    const sysContext = terminalLive ? await this.getSessionContext(terminalSessionId) : '';
     if (sysContext && sysContext !== 'Failed to collect system info') {
       systemPromptOverride += `\n\n${sysContext}`;
+    }
+
+    // 不先把话说在前面，模型会照着「你是终端 Agent」的设定反复调工具，
+    // 连吃几次 not found 之后就对用户编出「终端会话已断开」。
+    if (!terminalLive) {
+      systemPromptOverride += '\n\n[No live terminal session is attached to this chat right now. '
+        + 'execute_command / read_terminal will not work. '
+        + 'Answer from the information you already have, and tell the user to open a terminal '
+        + '(an SSH connection or the Local Shell) if the task really needs commands.]';
     }
 
     if (opts?.skillId && this.skillService) {
@@ -1049,13 +1118,15 @@ export class AIService {
         try {
           // 注入 shell 执行器：新版 agent-core 的内置 execute_command/read_terminal 走
           // ctx.shell.exec/read，不注入则落到 noop shell（捕不到任何输出）。
+          // terminalSessionId 必须一起放进 custom：ctx.sessionId 是对话 key，不是终端会话。
           const shellExecutor = this.buildShellExecutor(terminalSessionId);
+          const runCustom = { shell: shellExecutor, [TERMINAL_SESSION_KEY]: terminalSessionId };
           const eventStream = engine.run({
             sessionId: chatId,
             message: userMessage,
             context: context
-              ? { sessionId: chatId, terminalOutput: context, custom: { shell: shellExecutor } }
-              : { sessionId: chatId, custom: { shell: shellExecutor } },
+              ? { sessionId: chatId, terminalOutput: context, custom: runCustom }
+              : { sessionId: chatId, custom: runCustom },
             abortSignal: ctrl.signal,
             systemPromptOverride: systemPromptOverride || undefined,
             skillId: opts?.skillId,
