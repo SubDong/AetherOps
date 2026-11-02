@@ -17,6 +17,8 @@ const {
   normalizeUploadName,
   maxUploadBytes,
 } = require('./dist/server/utils/security');
+// 终端 socket 的共享登记表：紧急断开由业务层触发，但它拿不到 wss，只能靠这张表找到人
+const { registerTerminalSocket, unregisterTerminalSocket } = require('./dist/server/utils/socket-registry');
 const dataDir = ensureDataDir();
 // 账号体系：登录/注册/OAuth2 令牌/账号管理这些端点在两种宿主里共用同一份实现
 const { PUBLIC_PATHS, handleAccountRoutes } = require('./dist/server/routes/auth.routes');
@@ -203,7 +205,7 @@ app.post('/api/file-upload', async (req, res) => {
     }
     const fileBuffer = Buffer.concat(chunks);
     console.log(`[HTTP-Upload] Received ${fileBuffer.length} bytes, calling SFTP...`);
-    const bytes = await sshService.uploadFileViaSftp(sessionId, fileName, fileBuffer);
+    const bytes = await sshService.uploadFileTracked(sessionId, fileName, fileBuffer);
     console.log(`[HTTP-Upload] SFTP done: ${fileName}, ${bytes} bytes`);
     res.json({ success: true, bytes, fileName });
   } catch (err) {
@@ -251,7 +253,7 @@ app.get('/api/file/download', async (req, res) => {
   try {
     const serverModule = require('./dist/server/index.js');
     const { sshService } = serverModule;
-    const buf = await sshService.downloadFile(String(sessionId), String(filePath));
+    const buf = await sshService.downloadFileTracked(String(sessionId), String(filePath));
     const baseName = path.basename(String(filePath)) || 'download';
     res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(baseName)}"`);
     res.setHeader('Content-Type', 'application/octet-stream');
@@ -380,6 +382,8 @@ wss.on('connection', async (ws, req) => {
 
   let sessionId = null;
   const ownerId = wsUser.userId;
+  // 按账号登记：管理员在账号管理页点「紧急断开」时要按 ownerId 找到这个人的所有终端 socket
+  registerTerminalSocket(ownerId, ws);
   console.log(`[WS] Client connected from ${req.socket.remoteAddress} user=${wsUser.username}`);
 
   // 安全发送 WebSocket 消息：捕获 EAGAIN 等写入异常，防止未处理的 'error' 事件导致进程崩溃
@@ -555,8 +559,10 @@ wss.on('connection', async (ws, req) => {
         }
 
         case 'ai-agent-run': {
-          // AI Agent run
-          const { aiSessionId, message, context, skillId, locale } = data || {};
+          // 一轮 Agent 执行。
+          // aiSessionId 是命令要跑在哪个终端；chatId 是这一轮属于哪个对话（存储 key）。
+          // 老前端只传 aiSessionId 时退化为「对话 = 终端会话」，不影响可用性。
+          const { aiSessionId, chatId, message, context, skillId, locale, modelId } = data || {};
           if (!wsUser.permissions || !wsUser.permissions.ai) {
             ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Forbidden: missing permission' } }));
             break;
@@ -570,14 +576,15 @@ wss.on('connection', async (ws, req) => {
             ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'AI service unavailable' } }));
             break;
           }
-          console.log(`[WS] AI Agent run: session=${aiSessionId}, skill=${skillId || 'none'}, locale=${locale || 'auto'}, message=${message.substring(0, 50)}`);
-          aiService.agentRun(ownerId, aiSessionId, message, context, (event) => {
+          const conversationId = chatId || aiSessionId;
+          console.log(`[WS] AI Agent run: chat=${conversationId}, terminal=${aiSessionId}, model=${modelId || 'auto'}, skill=${skillId || 'none'}, locale=${locale || 'auto'}, message=${message.substring(0, 50)}`);
+          aiService.agentRun(ownerId, conversationId, aiSessionId, message, context, (event) => {
             if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, event }));
+              ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, chatId: conversationId, event }));
             }
-          }, skillId, locale).catch((err) => {
+          }, { skillId, locale, modelId }).catch((err) => {
             if (ws.readyState === WebSocket.OPEN) {
-              ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, event: { type: 'error', error: err.message } }));
+              ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, chatId: conversationId, event: { type: 'error', error: err.message } }));
             }
           });
           break;
@@ -605,7 +612,7 @@ wss.on('connection', async (ws, req) => {
           }
           try {
             console.log(`[WS] SFTP upload START: session=${sid}, file=${fileName}, bytes=${fileBuffer.length}, wsReady=${ws.readyState}`);
-            const bytes = await sshService.uploadFileViaSftp(sid, fileName, fileBuffer);
+            const bytes = await sshService.uploadFileTracked(sid, fileName, fileBuffer);
             console.log(`[WS] SFTP upload DONE: ${fileName}, ${bytes} bytes, wsReady=${ws.readyState}`);
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'file-upload-result', success: true, bytes, fileName }));
@@ -702,7 +709,7 @@ wss.on('connection', async (ws, req) => {
             }
             const fullB64 = endUpload.chunks.join('');
             console.log(`[WS] Joined ${endUpload.totalChunks} chunks -> b64len=${fullB64.length}, calling SFTP upload...`);
-            const bytes = await sshService.uploadFileViaSftp(endUpload.sessionId, endUpload.fileName, Buffer.from(fullB64, 'base64'));
+            const bytes = await sshService.uploadFileTracked(endUpload.sessionId, endUpload.fileName, Buffer.from(fullB64, 'base64'));
             console.log(`[WS] Chunked upload SFTP DONE: ${endUpload.fileName}, ${bytes} bytes, wsReady=${ws.readyState}`);
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'file-upload-result', success: true, bytes, fileName: endUpload.fileName }));
@@ -719,14 +726,15 @@ wss.on('connection', async (ws, req) => {
         }
 
         case 'ai-agent-stop': {
-          // 停止 AI Agent
-          const { aiSessionId: stopSid } = data || {};
-          if (stopSid) {
+          // 停止 AI Agent：中止的粒度是「对话」，不是终端
+          const { aiSessionId: stopSid, chatId: stopChatId } = data || {};
+          const stopTarget = stopChatId || stopSid;
+          if (stopTarget) {
             const { aiService } = serverModule;
             if (aiService) {
-              // 带 ownerId：否则拿到别人的 aiSessionId 就能把对方的 Agent 中止掉
-              aiService.stopAgent(ownerId, stopSid);
-              console.log(`[WS] AI Agent stop requested: ${stopSid}`);
+              // 带 ownerId：否则拿到别人的 chatId 就能把对方的 Agent 中止掉
+              aiService.stopAgent(ownerId, stopTarget);
+              console.log(`[WS] AI Agent stop requested: ${stopTarget}`);
             }
           }
           break;
@@ -750,6 +758,7 @@ wss.on('connection', async (ws, req) => {
 
   ws.on('close', () => {
     console.log(`[WS] Client disconnected, sessionId: ${sessionId}`);
+    unregisterTerminalSocket(ownerId, ws);
     // 移除 sessionId -> ws 映射
     if (sessionId) {
       wsBySessionId.delete(sessionId);

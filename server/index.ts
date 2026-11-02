@@ -1,11 +1,14 @@
 import { ConnectionService } from './service/connection.service';
-import { SSHService } from './service/ssh.service';
+import { SSHService, TRANSFER_AUDIT_TOOL } from './service/ssh.service';
 import { AIService } from './service/ai.service';
 import { SkillService } from './service/skill.service';
 import { AuditService } from './service/audit.service';
 import { MonitorService } from './service/monitor.service';
 import { BatchService } from './service/batch.service';
 import { SnippetService } from './service/snippet.service';
+import { SystemStatusService } from './service/system-status.service';
+import { kickUser } from './service/auth.service';
+import { closeTerminalSockets, countTerminalSockets } from './utils/socket-registry';
 import { initAccounts } from './routes/auth.routes';
 
 // 初始化服务实例
@@ -17,6 +20,24 @@ const monitorService = new MonitorService(connectionService);
 const batchService = new BatchService(sshService, connectionService);
 const aiService = new AIService(sshService, skillService, auditService);
 const snippetService = new SnippetService();
+const systemStatusService = new SystemStatusService(sshService);
+
+// 传输审计：SSHService 不认识 AuditService，两个实例在这里接起来。
+// 写成注入而不是让 ssh.service 直接 import 审计实例：后者会把 index.ts 拽进一条
+// 循环依赖里，而且传输写入失败的归属判断（ownerId 从哪来）会失去唯一出口。
+sshService.setTransferLogger((record) => {
+  void auditService.log(record.ownerId, {
+    sessionId: record.sessionId,
+    sessionName: record.sessionName,
+    connectionId: record.connectionId,
+    userMessage: record.direction === 'upload' ? '上传文件' : '下载文件',
+    tool: TRANSFER_AUDIT_TOOL,
+    command: `${record.direction === 'upload' ? 'UPLOAD' : 'DOWNLOAD'} ${record.path}`,
+    result: record.ok ? `${record.bytes} bytes` : record.error,
+    duration: record.durationMs,
+    status: record.ok ? 'success' : 'error',
+  });
+});
 
 // 初始化
 //
@@ -60,7 +81,7 @@ export class ApiError extends Error {
 }
 
 type PermissionKey =
-  | 'terminal' | 'ai' | 'connections' | 'aiConfig' | 'files'
+  | 'terminal' | 'batch' | 'ai' | 'connections' | 'aiConfig' | 'files'
   | 'monitor' | 'audit' | 'skills' | 'snippets';
 
 /**
@@ -81,6 +102,10 @@ const EXACT_PERMISSIONS: Record<string, PermissionKey[]> = {
   '/api/ai/getConfig': ['aiConfig'],
   '/api/ai/updateConfig': ['aiConfig'],
   '/api/ai/testConfig': ['aiConfig'],
+  '/api/ai/listProfiles': ['aiConfig'],
+  '/api/ai/saveProfile': ['aiConfig'],
+  '/api/ai/deleteProfile': ['aiConfig'],
+  '/api/ai/testProfile': ['aiConfig'],
   '/api/ai/getSkills': ['skills', 'ai'],
   '/api/ai/getSkill': ['skills', 'ai'],
 };
@@ -88,7 +113,9 @@ const EXACT_PERMISSIONS: Record<string, PermissionKey[]> = {
 const PREFIX_PERMISSIONS: Array<[string, PermissionKey[]]> = [
   ['/api/terminal/', ['terminal']],
   ['/api/file/', ['files', 'terminal']],
-  ['/api/batch/', ['terminal']],
+  // 批量操作单独一个权限位（不再跟 terminal 共用）：一条命令同时打到 N 台主机，
+  // 影响面比单个终端大，管理员必须能只收回这一项。
+  ['/api/batch/', ['batch']],
   ['/api/monitor/', ['monitor']],
   ['/api/audit/', ['audit']],
   ['/api/snippet/', ['snippets']],
@@ -102,6 +129,40 @@ function assertPermission(pathname: string, ctx: AuthContext): void {
   if (!required) return;
   if (required.some((key) => !!ctx.permissions?.[key])) return;
   throw new ApiError('当前账号缺少权限：' + required.join(' / '), 403);
+}
+
+/**
+ * 管理员代管端点：role=admin 才能进，与功能权限位无关。
+ * 这是账号隔离的唯一例外，所以必须逐个端点显式校 role，
+ * 而不是在 assertPermission 里登记一个「adminPermission」权限位。
+ */
+function assertAdmin(ctx: AuthContext): void {
+  if (ctx.role !== 'admin') throw new ApiError('需要管理员权限', 403);
+}
+
+/** 代管端点的目标账号：缺这个参数就退化成「看自己」，宁可直接报错 */
+function requireTargetUserId(body: any): string {
+  const targetId = typeof body?.userId === 'string' ? body.userId.trim() : '';
+  if (!targetId) throw new ApiError('缺少参数: userId', 400);
+  return targetId;
+}
+
+/**
+ * 管理员看别人的连接时只给定位信息。
+ * 与 connection.service 里的 SECRET_FIELDS 保持同一份名单：口令、私钥、passphrase
+ * 在任何「不是本人」的视图里都不能出现，否则代管就变成了凭据泄露。
+ */
+const MEMBER_SECRET_FIELDS = ['password', 'privateKey', 'passphrase'];
+
+function stripSecrets(connection: any): any {
+  const copy: any = { ...connection };
+  let hasSecret = false;
+  for (const field of MEMBER_SECRET_FIELDS) {
+    if (copy[field]) hasSecret = true;
+    delete copy[field];
+  }
+  copy.hasSecret = hasSecret;
+  return copy;
 }
 
 /**
@@ -208,7 +269,101 @@ export async function handleRoutes(pathname: string, body: any, ctx: AuthContext
       return true;
     }
 
-    // ========== AI 配置 ==========
+    // 采集会话所在主机的实时状态（CPU / 内存 / Swap / 磁盘 / 网络）
+    if (pathname === '/api/terminal/getServerStatus') {
+      const { sessionId } = body;
+      if (!sessionId) throw Error('Missing parameter: sessionId');
+      return await systemStatusService.collect(sessionId);
+    }
+
+    // ========== AI 配置（多套模型） ==========
+
+    // 列出全部模型配置
+    if (pathname === '/api/ai/listProfiles') {
+      return await aiService.listProfiles(ownerId);
+    }
+
+    // 新增或保存一套模型配置（无 id 即新增）
+    if (pathname === '/api/ai/saveProfile') {
+      return await aiService.saveProfile(ownerId, body);
+    }
+
+    // 删除一套模型配置
+    if (pathname === '/api/ai/deleteProfile') {
+      const { id } = body;
+      if (!id) throw Error('Missing parameter: id');
+      await aiService.deleteProfile(ownerId, id);
+      return true;
+    }
+
+    // 试连一套模型配置（可传未保存的表单值）
+    if (pathname === '/api/ai/testProfile') {
+      return await aiService.testProfile(ownerId, body);
+    }
+
+    // ========== 对话窗口（与连接绑定） ==========
+
+    // 列出对话：传 connectionId 就只返回该连接下的
+    if (pathname === '/api/ai/listChats') {
+      const connectionId = typeof body?.connectionId === 'string' ? body.connectionId : '';
+      return await aiService.listChats(ownerId, connectionId || undefined);
+    }
+
+    // 单个对话元数据
+    if (pathname === '/api/ai/getChat') {
+      const { chatId } = body;
+      if (!chatId) throw Error('Missing parameter: chatId');
+      return await aiService.getChat(ownerId, chatId);
+    }
+
+    // 新建对话
+    if (pathname === '/api/ai/createChat') {
+      return await aiService.createChat(ownerId, body || {});
+    }
+
+    // 重命名对话 / 切换该对话记住的模型
+    if (pathname === '/api/ai/updateChat') {
+      const { chatId, title, modelId } = body || {};
+      if (!chatId) throw Error('Missing parameter: chatId');
+      return await aiService.updateChat(ownerId, chatId, { title, modelId });
+    }
+
+    // 删除对话（连带消息体）
+    if (pathname === '/api/ai/deleteChat') {
+      const { chatId } = body;
+      if (!chatId) throw Error('Missing parameter: chatId');
+      await aiService.deleteChat(ownerId, chatId);
+      return true;
+    }
+
+    // ========== 成本管控 ==========
+
+    // 重算全部档位与单价（用户主动点击时才等定价目录）
+    if (pathname === '/api/ai/reanalyzeCosts') {
+      return await aiService.reanalyzeCosts(ownerId);
+    }
+
+    // 只体检不写库（设置页打开时调用，不等网络）
+    if (pathname === '/api/ai/checkupCosts') {
+      return await aiService.checkupCosts(ownerId);
+    }
+
+    // 用量与成本洞察（今日 / 单对话 / 按模型 / auto 节省估算）
+    if (pathname === '/api/ai/getCostInsights') {
+      const chatId = typeof body?.chatId === 'string' ? body.chatId : '';
+      return await aiService.getCostInsights(ownerId, { chatId: chatId || undefined });
+    }
+
+    // 预算（0 一律表示不限）
+    if (pathname === '/api/ai/getBudget') {
+      return await aiService.getBudget(ownerId);
+    }
+
+    if (pathname === '/api/ai/updateBudget') {
+      return await aiService.updateBudget(ownerId, body || {});
+    }
+
+    // ========== AI 配置（旧接口，保留兼容） ==========
 
     // 获取 AI 配置
     if (pathname === '/api/ai/getConfig') {
@@ -227,10 +382,10 @@ export async function handleRoutes(pathname: string, body: any, ctx: AuthContext
 
     // AI 对话（非流式）
     if (pathname === '/api/ai/chat') {
-      const { sessionId, message, context } = body;
+      const { sessionId, message, context, modelId } = body;
       if (!sessionId) throw Error('Missing parameter: sessionId');
       if (!message) throw Error('Missing parameter: message');
-      return await aiService.chat(ownerId, sessionId, message, context);
+      return await aiService.chat(ownerId, sessionId, message, context, modelId);
     }
 
     // 清空 AI 对话历史
@@ -406,6 +561,85 @@ export async function handleRoutes(pathname: string, body: any, ctx: AuthContext
     // 获取所有批量任务
     if (pathname === '/api/batch/tasks') {
       return batchService.getTasks(ownerId);
+    }
+
+    // ========== 管理员代管（只看 role=admin，看的是「别人」的数据） ==========
+    //
+    // 这一组端点是账号隔离的唯一例外，所以三条约束必须同时成立：
+    //   1. 入口先 assertAdmin，不靠功能权限位（role 与权限位本来就是两件事）；
+    //   2. 目标账号 id 只能来自参数 userId，绝不从当前登录人推；
+    //   3. 只给读与「删连接 / 断会话」这两类应急处置，不提供改内容、不提供碰对方终端。
+
+    if (pathname === '/api/admin/memberAudit') {
+      assertAdmin(ctx);
+      const targetId = requireTargetUserId(body);
+      return await auditService.getLogs(targetId, {
+        date: body?.date,
+        sessionId: body?.sessionId,
+        keyword: body?.keyword,
+        status: body?.status,
+        tool: body?.tool,
+        limit: body?.limit,
+        offset: body?.offset,
+      });
+    }
+
+    if (pathname === '/api/admin/memberAuditDates') {
+      assertAdmin(ctx);
+      return await auditService.getAvailableDates(requireTargetUserId(body));
+    }
+
+    // 传输记录：审计里 tool=file-transfer 的那一类（方向 / 路径 / 字节数 / 成败）
+    if (pathname === '/api/admin/memberTransfers') {
+      assertAdmin(ctx);
+      const targetId = requireTargetUserId(body);
+      return await auditService.getLogs(targetId, {
+        date: body?.date,
+        keyword: body?.keyword,
+        status: body?.status,
+        tool: TRANSFER_AUDIT_TOOL,
+        limit: body?.limit,
+        offset: body?.offset,
+      });
+    }
+
+    // 成员连接：只读，且凭据一律不下发
+    if (pathname === '/api/admin/memberConnections') {
+      assertAdmin(ctx);
+      const list = await connectionService.getAllConnections(requireTargetUserId(body));
+      return list.map(stripSecrets);
+    }
+
+    if (pathname === '/api/admin/deleteMemberConnection') {
+      assertAdmin(ctx);
+      const targetId = requireTargetUserId(body);
+      const { id } = body;
+      if (!id) throw Error('Missing parameter: id');
+      await connectionService.deleteConnection(targetId, id);
+      return true;
+    }
+
+    // 成员当前在线会话：紧急断开前得看到「他确实还挂着几个终端」
+    if (pathname === '/api/admin/memberSessions') {
+      assertAdmin(ctx);
+      const targetId = requireTargetUserId(body);
+      return {
+        sessions: sshService.getSessions(targetId),
+        sockets: countTerminalSockets(targetId),
+      };
+    }
+
+    // 紧急断开：会话进程 + tab 记录 + WebSocket + 登录令牌一起收。
+    // 只关进程不删行，对方刷新页面就能把 tab 建回来；只删行不吊销令牌，
+    // 他当场点「重连」又能拉一个会话，两者都不是应急想要的效果。
+    if (pathname === '/api/admin/disconnectUser') {
+      assertAdmin(ctx);
+      const targetId = requireTargetUserId(body);
+      const closedSessions = await sshService.forceDisconnectUser(targetId);
+      const closedSockets = closeTerminalSockets(targetId, '管理员已强制断开该账号的终端连接');
+      await kickUser(targetId);
+      console.log(`[Admin] ${ctx.username} 紧急断开账号 ${targetId}: 会话 ${closedSessions} 个, socket ${closedSockets} 条`);
+      return { closedSessions, closedSockets };
     }
 
     // ========== 文件管理（SFTP / 本地 fs） ==========

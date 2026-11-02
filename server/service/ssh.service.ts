@@ -228,6 +228,25 @@ export interface SessionInfo {
   systemContext?: string;
 }
 
+/** 一次文件传输的审计记录（上传/下载都归到 tool=file-transfer 这一类） */
+export interface TransferAuditRecord {
+  ownerId: string;
+  sessionId: string;
+  sessionName: string;
+  connectionId: string;
+  direction: 'upload' | 'download';
+  path: string;
+  bytes: number;
+  durationMs: number;
+  ok: boolean;
+  error: string;
+}
+
+export type TransferAuditLogger = (record: TransferAuditRecord) => void;
+
+/** 传输类审计的 tool 固定值：管理员拉「只看传输记录」时按它过滤 */
+export const TRANSFER_AUDIT_TOOL = 'file-transfer';
+
 /** 远程文件信息（用于文件管理面板） */
 export interface RemoteFileInfo {
   name: string;
@@ -265,6 +284,8 @@ export class SSHService {
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   /** 正在建立中的 SFTP 连接（避免并发重复创建） */
   private sftpPromises: Map<string, Promise<any>> = new Map();
+  /** 传输审计写入器：由 index.ts 注入，本模块不依赖 audit.service 的实例 */
+  private transferLogger: TransferAuditLogger | null = null;
 
   constructor(connectionService: ConnectionService) {
     this.connectionService = connectionService;
@@ -1432,6 +1453,25 @@ Write-Output "__DOCKER__: $dockerVer"
   }
 
   /**
+   * 会话类型：服务器状态面板据此决定「远端采集」还是「本机采集」。
+   */
+  getSessionType(sessionId: string): 'ssh' | 'local' | undefined {
+    return this.sessions.get(sessionId)?.type;
+  }
+
+  /**
+   * 在会话对应主机上跑一条只读命令（独立 exec 通道）。
+   * 不会向交互式终端写入任何内容，因此不会打断 rz/vim 等前台进程。
+   * 只给监控这类旁路采集用：本地会话没有远端主机，调用方需自行降级。
+   */
+  execReadonly(sessionId: string, command: string, timeoutMs = 8000): Promise<string> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error('会话不存在或已断开');
+    if (session.type !== 'ssh') throw new Error('本地会话没有远端主机');
+    return this.execRemote(sessionId, command, timeoutMs);
+  }
+
+  /**
    * 注册输出监听器（用于 Agent 捕获终端输出）
    * 注意：此方法不拦截现有 WebSocket 转发，仅添加额外监听
    */
@@ -1648,6 +1688,106 @@ Write-Output "__DOCKER__: $dockerVer"
     for (const [sessionId] of this.sessions) {
       if (ownerId && this.sessionMetadata.get(sessionId)?.ownerId !== ownerId) continue;
       this.closeSession(sessionId);
+    }
+  }
+
+  /**
+   * 紧急断开：关掉某个账号的全部终端，并抹掉它名下的 tab 记录。
+   *
+   * 与 closeAllSessions 的差别在于必须连元数据一起删：只关进程不删行，
+   * 对方刷新页面时 restoreOrCreateTabs 还会把 tab 建回来并重连，等于没断开。
+   * WebSocket 由调用方通过 socket-registry 关（本模块不知道宿主），令牌吊销也在路由层做。
+   */
+  async forceDisconnectUser(ownerId: string): Promise<number> {
+    if (!ownerId) return 0;
+
+    // 先把目标 id 收齐再动手：边遍历 Map 边删会跳过后续条目
+    const targetIds = new Set<string>();
+    for (const [sessionId, meta] of this.sessionMetadata) {
+      if (meta.ownerId === ownerId) targetIds.add(sessionId);
+    }
+    for (const sessionId of this.sessions.keys()) {
+      if (this.sessionMetadata.get(sessionId)?.ownerId === ownerId) targetIds.add(sessionId);
+    }
+
+    for (const sessionId of targetIds) {
+      this.closeSession(sessionId);
+    }
+    for (const sessionId of targetIds) {
+      this.sessionMetadata.delete(sessionId);
+      try {
+        await deleteSessionMeta(sessionId, ownerId);
+      } catch (error: any) {
+        // 删行失败不能中断断开：进程已经关了，残留一条刷新时会失败的记录可以接受
+        console.error(`[SSH] forceDisconnect: 删除会话元数据 ${sessionId} 失败:`, error?.message || error);
+      }
+    }
+    console.log(`[SSH] forceDisconnectUser: 账号 ${ownerId}，断开 ${targetIds.size} 个会话`);
+    return targetIds.size;
+  }
+
+  /** 注入传输审计写入器（宿主只需在 index.ts 里接一次） */
+  setTransferLogger(logger: TransferAuditLogger): void {
+    this.transferLogger = logger;
+  }
+
+  /**
+   * 落一条传输审计。
+   * 没有归属账号就不写：那条记录谁都不会看到，写它只是制造噪声。
+   */
+  private recordTransfer(
+    sessionId: string,
+    direction: 'upload' | 'download',
+    targetPath: string,
+    bytes: number,
+    startedAt: number,
+    errorText: string,
+  ): void {
+    const logger = this.transferLogger;
+    if (!logger) return;
+    const meta = this.sessionMetadata.get(sessionId);
+    if (!meta?.ownerId) return;
+    logger({
+      ownerId: meta.ownerId,
+      sessionId,
+      sessionName: meta.name || '',
+      connectionId: meta.connectionId || '',
+      direction,
+      path: targetPath,
+      bytes,
+      durationMs: Math.max(0, Date.now() - startedAt),
+      ok: !errorText,
+      error: errorText,
+    });
+  }
+
+  /**
+   * 上传（带审计）。所有调用点一律走这个包装，不要直接调 uploadFileViaSftp：
+   * 传输入口有四个（HTTP、WS 单消息、WS 分块、Electron IPC），
+   * 在收口处记一次比在每个入口各记一遍可靠。
+   */
+  async uploadFileTracked(sessionId: string, remotePath: string, fileBuffer: Buffer): Promise<number> {
+    const startedAt = Date.now();
+    try {
+      const bytes = await this.uploadFileViaSftp(sessionId, remotePath, fileBuffer);
+      this.recordTransfer(sessionId, 'upload', remotePath, bytes, startedAt, '');
+      return bytes;
+    } catch (error: any) {
+      this.recordTransfer(sessionId, 'upload', remotePath, 0, startedAt, error?.message || String(error));
+      throw error;
+    }
+  }
+
+  /** 同 uploadFileTracked，方向反过来 */
+  async downloadFileTracked(sessionId: string, remotePath: string): Promise<Buffer> {
+    const startedAt = Date.now();
+    try {
+      const buf = await this.downloadFile(sessionId, remotePath);
+      this.recordTransfer(sessionId, 'download', remotePath, buf.length, startedAt, '');
+      return buf;
+    } catch (error: any) {
+      this.recordTransfer(sessionId, 'download', remotePath, 0, startedAt, error?.message || String(error));
+      throw error;
     }
   }
 

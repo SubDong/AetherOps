@@ -21,8 +21,11 @@
           <button class="btn-ai-action" @click="handleOpenSettings" :title="t('ai.settings')">
             <i class="bi bi-gear"></i>
           </button>
-          <button class="btn-ai-action" @click="toggleHistoryPanel" :title="t('ai.history')" :class="{ active: showHistoryPanel }">
-            <i class="bi bi-clock-history"></i>
+          <button class="btn-ai-action" @click="newChat" :title="t('ai.newChat')">
+            <i class="bi bi-plus-square"></i>
+          </button>
+          <button class="btn-ai-action" @click="toggleChatPanel" :title="t('ai.chats')" :class="{ active: showChatPanel }">
+            <i class="bi bi-chat-square-text"></i>
           </button>
           <span v-if="sessionTokens > 0" class="ai-session-tokens" :title="t('ai.sessionTokens')">
             <i class="bi bi-cpu"></i>
@@ -46,6 +49,29 @@
       </div>
     </div>
 
+    <!-- 对话状态栏：当前对话 + 本次使用哪个模型 -->
+    <div v-if="activeTab === 'chat'" class="ai-chat-toolbar">
+      <div class="ai-chat-title" :title="currentChatTitle">
+        <i class="bi bi-chat-dots"></i>
+        <span class="text-truncate">{{ currentChatTitle }}</span>
+      </div>
+      <select
+        v-model="selectedModelId"
+        class="ai-model-select"
+        :title="selectedModelHint"
+        @change="handleModelChange"
+      >
+        <option :value="AUTO_MODEL_ID">{{ t('ai.autoTitle') }}</option>
+        <option v-for="p in usableProfiles" :key="p.id" :value="p.id">{{ modelOptionText(p) }}</option>
+      </select>
+      <button class="btn-ai-action" @click="toggleCostPanel" :title="t('ai.costTitle')" :class="{ active: showCostPanel }">
+        <i class="bi bi-graph-up-arrow"></i>
+      </button>
+      <button class="btn-ai-action" @click="handleOpenSettings" :title="t('ai.modelList')">
+        <i class="bi bi-sliders"></i>
+      </button>
+    </div>
+
     <!-- 消息列表 (Chat 模式) -->
     <div v-show="activeTab === 'chat'" class="ai-chat-messages" ref="messagesContainer" @click="handleMessagesClick">
       <div v-if="messages.length === 0" class="ai-chat-empty">
@@ -67,6 +93,13 @@
           <div v-if="msg.skillName" class="skill-badge">
             <i class="bi bi-lightning-charge-fill"></i>
             <span>{{ msg.skillName }}</span>
+          </div>
+
+          <!-- 本轮实际使用的模型（Auto 换模型时标出来，便于理解） -->
+          <div v-if="msg.modelLabel" class="ai-msg-model">
+            <i class="bi bi-cpu"></i>
+            <span>{{ msg.modelLabel }}</span>
+            <span v-if="msg.autoRouted" class="ai-msg-model-auto">{{ t('ai.autoBadge') }}</span>
           </div>
 
           <!-- Agent 步骤（在文本上方，先执行后结论） -->
@@ -157,31 +190,99 @@
       </div>
     </div>
 
-    <!-- 历史对话面板 -->
-    <div v-if="showHistoryPanel" class="history-panel">
+    <!-- 对话列表面板（与当前连接绑定） -->
+    <div v-if="showChatPanel" class="history-panel">
       <div class="history-panel-header">
-        <span>{{ t('ai.history') }}</span>
-        <button class="btn-ai-action" @click="showHistoryPanel = false">
-          <i class="bi bi-x"></i>
-        </button>
+        <span>{{ t('ai.chatsForConnection') }}</span>
+        <div class="d-flex align-items-center gap-1">
+          <button class="btn-ai-action" @click="newChat" :title="t('ai.newChat')">
+            <i class="bi bi-plus-lg"></i>
+          </button>
+          <button class="btn-ai-action" @click="showChatPanel = false">
+            <i class="bi bi-x"></i>
+          </button>
+        </div>
       </div>
       <div class="history-list">
         <div
-          v-for="h in historyList"
-          :key="h.sessionId"
+          v-for="c in chatList"
+          :key="c.id"
           class="history-item"
-          @click="loadPastHistory(h.sessionId)"
+          :class="{ active: c.id === currentChatId }"
+          @click="switchChat(c.id)"
         >
           <div class="history-item-top">
-            <span class="history-name">{{ h.sessionName || h.sessionId.substring(0, 8) }}</span>
-            <span class="history-time">{{ formatTime(h.savedAt) }}</span>
+            <span class="history-name text-truncate">{{ c.title || t('ai.unnamedChat') }}</span>
+            <span class="history-time">{{ formatTime(c.updatedAt) }}</span>
           </div>
-          <div class="history-preview">{{ h.preview || t('ai.noHistory') }}</div>
-          <div class="history-meta">{{ h.messageCount }} {{ t('ai.messages') }}</div>
+          <div class="history-preview">{{ c.preview || '—' }}</div>
+          <div class="history-meta d-flex justify-content-between align-items-center">
+            <span>
+              {{ c.messageCount }} {{ t('ai.messages') }}
+              <template v-if="chatModelLabel(c)"> · {{ chatModelLabel(c) }}</template>
+              <template v-if="c.totalTokens"> · {{ formatTokens(c.totalTokens) }}</template>
+            </span>
+            <button class="chat-delete-btn" @click.stop="removeChat(c)" :title="t('ai.deleteChat')">
+              <i class="bi bi-trash"></i>
+            </button>
+          </div>
         </div>
-        <div v-if="historyList.length === 0" class="history-empty">
-          {{ t('ai.noHistory') }}
+        <div v-if="chatList.length === 0" class="history-empty">
+          {{ t('ai.noChats') }}
         </div>
+      </div>
+    </div>
+
+    <!-- 成本面板：本对话 / 今日 / auto 节省 / 预算 -->
+    <div v-if="showCostPanel" class="history-panel cost-panel">
+      <div class="history-panel-header">
+        <span>{{ t('ai.costTitle') }}</span>
+        <div class="d-flex align-items-center gap-1">
+          <button class="btn-ai-action" @click="refreshInsights" :title="t('ai.refresh')">
+            <i class="bi bi-arrow-clockwise" :class="{ spin: loadingInsights }"></i>
+          </button>
+          <button class="btn-ai-action" @click="showCostPanel = false">
+            <i class="bi bi-x"></i>
+          </button>
+        </div>
+      </div>
+      <div class="cost-body">
+        <div class="cost-row">
+          <span>{{ t('ai.costChat') }}</span>
+          <strong>{{ formatTokens(insights?.chat?.totalTokens || 0) }} · {{ formatUsd(insights?.chat?.costUsd) }}</strong>
+        </div>
+        <div class="cost-row">
+          <span>{{ t('ai.costToday') }}</span>
+          <strong>{{ formatTokens(insights?.today?.totalTokens || 0) }} · {{ formatUsd(insights?.today?.costUsd) }}</strong>
+        </div>
+        <div v-if="insights?.savedUsd != null && insights.savedUsd > 0" class="cost-row saved">
+          <span>{{ t('ai.costSaved') }}</span>
+          <strong>{{ formatUsd(insights.savedUsd) }}</strong>
+        </div>
+        <div v-if="insights?.partial" class="cost-hint">{{ t('ai.costPartial') }}</div>
+
+        <div class="cost-subtitle">{{ t('ai.costBudget') }}</div>
+        <div class="cost-row">
+          <span>{{ t('ai.budgetChatLimit') }}</span>
+          <strong>{{ limitText(insights?.budget?.chatTokenLimit) }}</strong>
+        </div>
+        <div class="cost-row">
+          <span>{{ t('ai.budgetDailyLimit') }}</span>
+          <strong>{{ limitText(insights?.budget?.dailyTokenLimit) }}</strong>
+        </div>
+        <div class="cost-row">
+          <span>{{ t('ai.budgetCostLimit') }}</span>
+          <strong>{{ insights?.budget?.dailyCostLimit ? formatUsd(insights?.budget?.dailyCostLimit) : t('ai.unlimited') }}</strong>
+        </div>
+
+        <template v-if="insights?.byModel?.length">
+          <div class="cost-subtitle">{{ t('ai.costByModel') }}</div>
+          <div v-for="m in insights.byModel" :key="m.modelId" class="cost-model-row">
+            <span class="text-truncate">{{ m.modelLabel }}</span>
+            <span class="cost-model-num">{{ formatTokens(m.totalTokens) }} · {{ formatUsd(m.costUsd) }}</span>
+          </div>
+        </template>
+        <div v-else class="cost-hint">{{ t('ai.costNoData') }}</div>
       </div>
     </div>
 
@@ -208,6 +309,17 @@
 
     <!-- 输入区域 -->
     <div v-show="activeTab === 'chat'" class="ai-chat-input">
+      <!-- 上边缘的拖拽手柄：textarea 原生的 resize 角既看不出来、又被 max-height 卡住，
+           这里自己做一条，拖出高度后固定住，双击回到随内容自适应 -->
+      <div
+        class="ai-input-resizer"
+        :title="t('ai.inputResizeHint')"
+        @pointerdown="onInputResizeStart"
+        @pointermove="onInputResizeMove"
+        @pointerup="onInputResizeEnd"
+        @pointercancel="onInputResizeEnd"
+        @dblclick="resetInputHeight"
+      ></div>
       <button class="btn-skill-toggle" @click="toggleSkillsPanel" :title="t('ai.skills')" :class="{ active: showSkillsPanel }">
         <i class="bi bi-lightning-charge"></i>
       </button>
@@ -215,7 +327,7 @@
         ref="inputRef"
         v-model="inputText"
         :placeholder="t('ai.inputPlaceholder')"
-        @keydown.enter.exact.prevent="handleSend"
+        @keydown.enter.exact="onEnterKey"
         @keydown.shift.enter="handleNewLine"
         @input="handleInput"
         rows="1"
@@ -261,6 +373,9 @@ import AuditPanel from '@/components/audit-panel/index.vue';
 import LogMonitor from '@/components/log-monitor/index.vue';
 import { escapeHtml, sanitizeHtml } from '@/utils/sanitize-html';
 import { readClipboard } from '@/utils/vscode-clipboard';
+import { toast } from '@/utils/toast';
+import { modal } from '@/utils/modal';
+import { subscribe, unsubscribe, AI_PROFILES_CHANGED } from '@/base/eventBus';
 
 const { t, locale } = useI18n();
 
@@ -313,6 +428,10 @@ interface ChatMessage {
   tokens?: number;
   /** 本次回复是否以错误结束（显示重试按钮） */
   isError?: boolean;
+  /** 本轮实际使用的模型名（Auto 下每轮可能不同） */
+  modelLabel?: string;
+  /** 本轮是否由 Auto 自动选型 */
+  autoRouted?: boolean;
 }
 
 const activeTab = ref<'chat' | 'audit' | 'monitor'>('chat');
@@ -361,16 +480,52 @@ const skills = ref<SkillItem[]>([]);
 const selectedSkill = ref<SkillItem | null>(null);
 const showSkillsPanel = ref(false);
 
-// 历史对话相关
-interface HistoryItem {
-  sessionId: string;
-  sessionName?: string;
-  savedAt: number;
-  messageCount: number;
-  preview: string;
+// 模型配置与对话列表
+const AUTO_MODEL_ID = aiService.AUTO_MODEL_ID;
+const profiles = ref<aiService.AIProfile[]>([]);
+const usableProfiles = computed(() => profiles.value.filter(p => p.enabled && p.apiKey));
+const selectedModelId = ref<string>(AUTO_MODEL_ID);
+const showChatPanel = ref(false);
+/** 成本面板：与对话列表占同一个浮层位置，所以两者互斥 */
+const showCostPanel = ref(false);
+const insights = ref<aiService.CostInsights | null>(null);
+const loadingInsights = ref(false);
+const chatList = ref<aiService.AIChatMeta[]>([]);
+/** 当前对话（存储 key）；空表示还没落库的新对话，首次发送时才创建 */
+const currentChatId = ref('');
+/** 模型配置变更的全局事件订阅 id */
+let profilesEventId: string | symbol | null = null;
+
+const currentChatTitle = computed(() => {
+  const item = chatList.value.find((c) => c.id === currentChatId.value);
+  return item?.title || t('ai.unnamedChat');
+});
+
+const selectedModelHint = computed(() => {
+  if (selectedModelId.value === AUTO_MODEL_ID) return t('ai.autoHint');
+  const p = usableProfiles.value.find((x) => x.id === selectedModelId.value);
+  return p ? modelOptionText(p) : t('ai.selectModel');
+});
+
+/**
+ * 下拉项文案：自定义名称 + 实际模型 ID。
+ * 只写名称时看不出用的是哪个模型（同名配置换了模型界面毫无变化）；
+ * 而后端保存时 label 常与 model 相同，所以要判重，避免出现「gpt-4o · gpt-4o」。
+ */
+function modelOptionText(p: aiService.AIProfile): string {
+  const label = (p.label || '').trim();
+  const model = (p.model || '').trim();
+  if (!label) return model;
+  if (!model || label === model) return label;
+  return `${label} · ${model}`;
 }
-const showHistoryPanel = ref(false);
-const historyList = ref<HistoryItem[]>([]);
+
+/** 对话条目上显示的模型：auto 或某个配置的名字 */
+function chatModelLabel(chat: aiService.AIChatMeta): string {
+  if (!chat.modelId || chat.modelId === AUTO_MODEL_ID) return t('ai.autoBadge');
+  const p = profiles.value.find((x) => x.id === chat.modelId);
+  return p ? p.label || p.model : '';
+}
 
 // 当前正在构建的 assistant 消息
 let currentAssistantIdx = -1;
@@ -409,6 +564,12 @@ function handleAgentEvent(event: any) {
   if (!msg.agentSteps) msg.agentSteps = [];
 
   switch (event.type) {
+    case 'model_selected':
+      // 服务端每轮挑定模型后会先发这条，告知本轮用的是哪个（Auto 会换）
+      msg.modelLabel = event.modelLabel || event.modelId || '';
+      msg.autoRouted = !!event.route;
+      break;
+
     case 'thinking':
       // 移除旧的 thinking 步骤（如果有）
       msg.agentSteps = msg.agentSteps.filter(s => s.type !== 'thinking');
@@ -465,6 +626,8 @@ function handleAgentEvent(event: any) {
       stopElapsedTimer();
       currentAssistantIdx = -1;
       saveDisplayHistory();
+      // 本轮的 token/金额刚记完账，面板开着就地刷新，用户不用自己点
+      if (showCostPanel.value) void refreshInsights();
       break;
 
     case 'audit_entry':
@@ -479,7 +642,9 @@ function handleAgentEvent(event: any) {
       msg.agentSteps = msg.agentSteps.filter(s => s.type !== 'thinking');
       msg.durationMs = agentStartTime.value ? Date.now() - agentStartTime.value : undefined;
       msg.isError = true;
-      msg.content += `\n\n**错误**: ${event.error || '未知错误'}`;
+      // 预算拦截带 code：用界面语言说清楚是哪一项超了，其余错误照旧回显服务端原文
+      msg.content += `\n\n**${t('ai.errorLabel')}**: ${budgetErrorMessage(event.code) || event.error || t('ai.unknownError')}`;
+      if (showCostPanel.value) void refreshInsights();
       isAgentRunning.value = false;
       stopElapsedTimer();
       currentAssistantIdx = -1;
@@ -533,6 +698,101 @@ function handleInput() {
   }
 }
 
+/* ---------------- 输入框高度：默认随内容增高，也可以拖住上边缘固定高度 ---------------- */
+
+/** 与 CSS 的 min-height 保持一致 */
+const INPUT_MIN_HEIGHT = 40;
+/** 输入区上方至少留给消息列表的高度 */
+const INPUT_TOP_RESERVE = 140;
+/** 用户拖出来的高度；0 表示跟随内容自适应 */
+const manualInputHeight = ref(0);
+let resizeStartY = 0;
+let resizeStartHeight = 0;
+
+/** 最高到窗口 70% 与「面板高度 - 消息区预留」中的较小者，别把消息区挤没 */
+function maxInputHeight(): number {
+  const panel = (inputRef.value?.closest('.ai-chat-panel') as HTMLElement | null) ?? null;
+  const panelHeight = panel?.clientHeight || window.innerHeight;
+  const limit = Math.min(Math.round(window.innerHeight * 0.7), panelHeight - INPUT_TOP_RESERVE);
+  return Math.max(INPUT_MIN_HEIGHT * 2, limit);
+}
+
+function applyInputHeight(height: number) {
+  const el = inputRef.value;
+  if (!el) return;
+  // 向上取整：亚像素高度会让内容多出半行，滚动条每帧一隐形地闪
+  el.style.height = `${Math.ceil(height)}px`;
+}
+
+/**
+ * 按内容同步输入框高度：单行时贴底，多行时逐行长高。
+ * 先归零再读 scrollHeight——只有 height:auto 时读到的才是完整内容高度，
+ * 否则拿到的是被当前高度截断后的值。
+ */
+function autoGrowInput() {
+  // 用户拖过高度就完全按他拖的来：内容变化不再动高度，否则一输入就被压回内容高度
+  if (manualInputHeight.value > 0) {
+    applyInputHeight(Math.min(manualInputHeight.value, maxInputHeight()));
+    return;
+  }
+
+  const el = inputRef.value;
+  if (!el) return;
+  // v-show 隐藏时 scrollHeight 为 0，此时量高度会把多行内容压成一行
+  if (!el.offsetParent) return;
+
+  el.style.height = 'auto';
+  // 全局是 border-box，而 scrollHeight 不含边框，差这一点会每帧多出一条滚动条
+  const border = el.offsetHeight - el.clientHeight;
+  const contentHeight = el.scrollHeight + border;
+  const target = Math.min(Math.max(contentHeight, INPUT_MIN_HEIGHT), maxInputHeight());
+  applyInputHeight(target);
+}
+
+/** 按住上边缘往上拖 = 变高；指针捕获让拖到输入区外面也还能继续拖 */
+function onInputResizeStart(e: PointerEvent) {
+  const el = inputRef.value;
+  const handle = e.currentTarget as HTMLElement | null;
+  if (!el || !handle) return;
+  e.preventDefault();
+  handle.setPointerCapture?.(e.pointerId);
+  resizeStartY = e.clientY;
+  resizeStartHeight = el.offsetHeight;
+}
+
+function onInputResizeMove(e: PointerEvent) {
+  if (!(e.currentTarget as HTMLElement | null)?.hasPointerCapture?.(e.pointerId)) return;
+  const next = resizeStartHeight + (resizeStartY - e.clientY);
+  manualInputHeight.value = Math.min(Math.max(Math.round(next), INPUT_MIN_HEIGHT), maxInputHeight());
+  applyInputHeight(manualInputHeight.value);
+}
+
+function onInputResizeEnd(e: PointerEvent) {
+  const handle = e.currentTarget as HTMLElement | null;
+  handle?.releasePointerCapture?.(e.pointerId);
+  // 拖回最矮等同于放弃固定高度，重新跟随内容
+  if (manualInputHeight.value <= INPUT_MIN_HEIGHT) resetInputHeight();
+}
+
+/** 双击手柄：回到随内容自适应 */
+function resetInputHeight() {
+  manualInputHeight.value = 0;
+  nextTick(autoGrowInput);
+}
+
+/** Enter 发送；输入法选词时的 Enter 是确认候选词，不能当成发送 */
+function onEnterKey(e: KeyboardEvent) {
+  // keyCode 229 是部分输入法在组合期间的兼容标记，isComposing 未必为 true
+  if (e.isComposing || e.keyCode === 229) return;
+  e.preventDefault();
+  handleSend();
+}
+
+// 输入 / 清空 / 命令回填都会改变内容，高度跟着重新量
+watch(inputText, () => nextTick(autoGrowInput));
+// 从其他标签页切回来时元素才可见，隐藏时量不出真实高度
+watch(activeTab, (tab) => { if (tab === 'chat') nextTick(autoGrowInput); });
+
 // 发送消息
 function handleSend() {
   const text = inputText.value.trim();
@@ -570,7 +830,7 @@ function handleSend() {
 }
 
 /** 启动 Agent 执行（handleSend 与失败重试共用） */
-function runAgent(message: string, skill?: SkillItem | null) {
+async function runAgent(message: string, skill?: SkillItem | null) {
   const context = props.getTerminalContext?.() || '';
 
   isAgentRunning.value = true;
@@ -578,10 +838,23 @@ function runAgent(message: string, skill?: SkillItem | null) {
   startElapsedTimer();
   currentAssistantIdx = -1;
 
+  let chatId = '';
+  try {
+    chatId = await ensureChat();
+  } catch (e: any) {
+    isAgentRunning.value = false;
+    stopElapsedTimer();
+    toast.error(e?.message || t('ai.agentError'));
+    return;
+  }
+
   emit('ws-send', {
     type: 'ai-agent-run',
     data: {
+      // aiSessionId = 命令真正执行的终端；chatId = 这一轮属于哪个对话
       aiSessionId: props.sessionId,
+      chatId,
+      modelId: selectedModelId.value,
       message,
       context: context.substring(-3000),
       skillId: skill?.id,
@@ -615,7 +888,7 @@ function retryMessage(index: number) {
 function handleStop() {
   emit('ws-send', {
     type: 'ai-agent-stop',
-    data: { aiSessionId: props.sessionId },
+    data: { aiSessionId: props.sessionId, chatId: currentChatId.value || undefined },
   });
 }
 
@@ -627,12 +900,20 @@ function handleClear() {
   if (messages.value.length === 0) return;
   messages.value = [];
   currentAssistantIdx = -1;
-  // 通知服务端清空历史
-  aiService.clearHistory(props.sessionId).catch(() => {});
+  if (!currentChatId.value) return;
+  // 只清当前对话；面板里的摘要同步复位，避免还显示旧预览
+  aiService.clearHistory(currentChatId.value).catch(() => {});
+  const item = chatList.value.find((c) => c.id === currentChatId.value);
+  if (item) {
+    item.messageCount = 0;
+    item.preview = '';
+  }
 }
 
-// 保存对话显示历史到服务端
+// 保存对话显示历史到服务端（按对话存，不按终端会话）
 function saveDisplayHistory() {
+  const chatId = currentChatId.value;
+  if (!chatId) return;
   const toSave = messages.value.map(m => ({
     role: m.role,
     content: m.content,
@@ -650,13 +931,29 @@ function saveDisplayHistory() {
       collapsed: true,
     })),
   }));
-  aiService.saveDisplayHistory(props.sessionId, toSave, props.sessionName).catch(() => {});
+  aiService.saveDisplayHistory(chatId, toSave, props.sessionName)
+    .then(() => refreshChatMeta(chatId, toSave))
+    .catch(() => {});
 }
 
-// 加载对话历史
-async function loadDisplayHistory() {
+/** 保存成功后乐观更新列表条目，并静默拉一次列表以采纳服务端生成的标题 */
+function refreshChatMeta(chatId: string, saved: any[]) {
+  const item = chatList.value.find((c) => c.id === chatId);
+  if (item) {
+    item.messageCount = saved.length;
+    item.updatedAt = Date.now();
+    const lastUser = [...saved].reverse().find((m) => m.role === 'user' && !m.isSystemInfo);
+    if (lastUser) item.preview = String(lastUser.content).substring(0, 120);
+  }
+  aiService.listChats(props.connectionId).then((list) => {
+    if (Array.isArray(list)) chatList.value = list;
+  }).catch(() => {});
+}
+
+// 加载某个对话的消息
+async function loadDisplayHistory(chatId: string) {
   try {
-    const data = await aiService.getDisplayHistory(props.sessionId);
+    const data = await aiService.getDisplayHistory(chatId);
     if (Array.isArray(data) && data.length > 0) {
       messages.value = data.map((m: any) => ({
         role: m.role,
@@ -667,12 +964,14 @@ async function loadDisplayHistory() {
         isError: m.isError,
         durationMs: m.durationMs,
         tokens: m.tokens,
+        modelLabel: m.modelLabel,
+        autoRouted: m.autoRouted,
         agentSteps: m.agentSteps?.map((s: any) => ({ ...s, collapsed: true })),
         isRunning: false,
       }));
       nextTick(() => scrollToBottom());
     } else {
-      // 无历史消息时，主动获取系统环境信息并展示
+      // 该对话还没消息：顺手把系统环境展示出来，方便直接提问
       await fetchAndShowSystemInfo();
     }
   } catch (e) {
@@ -698,47 +997,192 @@ async function fetchAndShowSystemInfo() {
   }
 }
 
-// 历史对话面板
-function toggleHistoryPanel() {
-  showHistoryPanel.value = !showHistoryPanel.value;
-  if (showHistoryPanel.value) {
-    fetchHistoryList();
+// ===== 模型配置 =====
+async function loadProfiles() {
+  try {
+    const list = await aiService.listProfiles();
+    profiles.value = Array.isArray(list) ? list : [];
+  } catch (e) {
+    console.warn('Failed to load AI profiles:', e);
+    return;
+  }
+  // 选中的配置被删/被停用后回退到 Auto，避免发送时拿着一个无效 id
+  if (selectedModelId.value === AUTO_MODEL_ID) return;
+  if (!usableProfiles.value.some((p) => p.id === selectedModelId.value)) {
+    selectedModelId.value = AUTO_MODEL_ID;
+    rememberModel();
   }
 }
 
-async function fetchHistoryList() {
+// 用户上次在这个连接上选的模型：按连接记住，下次回来接着用
+function modelStorageKey() {
+  return `aetherops.ai.model.${props.connectionId || 'default'}`;
+}
+
+function readStoredModel(): string {
   try {
-    const data = await aiService.listHistories();
-    if (Array.isArray(data)) {
-      historyList.value = data;
-    }
-  } catch (e) {
-    console.warn('Failed to fetch history list:', e);
+    return localStorage.getItem(modelStorageKey()) || AUTO_MODEL_ID;
+  } catch {
+    return AUTO_MODEL_ID;
   }
 }
 
-async function loadPastHistory(targetSessionId: string) {
+function rememberModel() {
   try {
-    const data = await aiService.loadHistory(targetSessionId);
-    if (Array.isArray(data) && data.length > 0) {
-      messages.value = data.map((m: any) => ({
-        role: m.role,
-        content: m.content,
-        skillName: m.skillName,
-        skillId: m.skillId,
-        isSystemInfo: m.isSystemInfo,
-        isError: m.isError,
-        durationMs: m.durationMs,
-        tokens: m.tokens,
-        agentSteps: m.agentSteps?.map((s: any) => ({ ...s, collapsed: true })),
-        isRunning: false,
-      }));
-      showHistoryPanel.value = false;
-      nextTick(() => scrollToBottom());
-    }
-  } catch (e) {
-    console.warn('Failed to load past history:', e);
+    localStorage.setItem(modelStorageKey(), selectedModelId.value);
+  } catch {
+    /* 无法写本地存储时不影响功能 */
   }
+}
+
+// ===== 对话窗口（与连接绑定） =====
+function resetChatState() {
+  currentChatId.value = '';
+  chatList.value = [];
+  messages.value = [];
+  currentAssistantIdx = -1;
+  showChatPanel.value = false;
+  selectedModelId.value = readStoredModel();
+}
+
+async function initializeChats() {
+  await loadProfiles();
+  await loadChatList(true);
+}
+
+async function loadChatList(autoSelect = false) {
+  try {
+    const list = await aiService.listChats(props.connectionId);
+    chatList.value = Array.isArray(list) ? list : [];
+  } catch (e) {
+    console.warn('Failed to load chats:', e);
+    return;
+  }
+  if (!autoSelect) return;
+  // 回到这个连接时直接恢复最近一个对话，用户也可以再开面板挑别的
+  const latest = chatList.value[0];
+  if (latest) {
+    await openChat(latest);
+  } else {
+    currentChatId.value = '';
+    messages.value = [];
+    currentAssistantIdx = -1;
+    await fetchAndShowSystemInfo();
+  }
+}
+
+async function openChat(chat: aiService.AIChatMeta) {
+  currentChatId.value = chat.id;
+  selectedModelId.value = chat.modelId || AUTO_MODEL_ID;
+  rememberModel();
+  messages.value = [];
+  currentAssistantIdx = -1;
+  showChatPanel.value = false;
+  await loadDisplayHistory(chat.id);
+}
+
+async function switchChat(chatId: string) {
+  // 运行中切走会让流式输出落到别的窗口里，直接不切
+  if (isAgentRunning.value) return;
+  const target = chatList.value.find((c) => c.id === chatId);
+  if (!target) return;
+  if (target.id === currentChatId.value) {
+    showChatPanel.value = false;
+    return;
+  }
+  await openChat(target);
+}
+
+/** 新建对话：先不落库，首次发送时才建行，避免列表里堆一堆空对话 */
+function newChat() {
+  if (isAgentRunning.value) return;
+  currentChatId.value = '';
+  messages.value = [];
+  currentAssistantIdx = -1;
+  showChatPanel.value = false;
+  fetchAndShowSystemInfo();
+}
+
+async function removeChat(chat: aiService.AIChatMeta) {
+  const title = chat.title || t('ai.unnamedChat');
+  const ok = await modal.confirm(t('ai.deleteChatConfirm', { title }));
+  if (!ok) return;
+  try {
+    await aiService.deleteChat(chat.id);
+    toast.success(t('ai.chatDeleted'));
+    chatList.value = chatList.value.filter((c) => c.id !== chat.id);
+    if (currentChatId.value === chat.id) newChat();
+  } catch (e: any) {
+    toast.error(e?.message || t('ai.chatDeleted'));
+  }
+}
+
+/** 本轮的存储 key：已有对话就用它，否则当场建一个并记住 */
+async function ensureChat(): Promise<string> {
+  if (currentChatId.value) return currentChatId.value;
+  const created = await aiService.createChat({
+    connectionId: props.connectionId || '',
+    modelId: selectedModelId.value,
+  });
+  if (!created?.id) throw new Error('Failed to create chat');
+  currentChatId.value = created.id;
+  chatList.value = [created, ...chatList.value.filter((c) => c.id !== created.id)];
+  return created.id;
+}
+
+function toggleChatPanel() {
+  showCostPanel.value = false;
+  showChatPanel.value = !showChatPanel.value;
+  if (showChatPanel.value) loadChatList(false);
+}
+
+function toggleCostPanel() {
+  showChatPanel.value = false;
+  showCostPanel.value = !showCostPanel.value;
+  if (showCostPanel.value) void refreshInsights();
+}
+
+/** 拉一次成本洞察：还没落库的新对话不传 chatId，服务端就只算今日与预算 */
+async function refreshInsights() {
+  if (loadingInsights.value) return;
+  loadingInsights.value = true;
+  try {
+    insights.value = await aiService.getCostInsights(currentChatId.value || undefined);
+  } catch (e) {
+    console.warn('Failed to load cost insights:', e);
+  } finally {
+    loadingInsights.value = false;
+  }
+}
+
+/** 单轮对话常常不到 1 美分，小于 0.01 时才多留两位小数，否则一律 $0.00 看不出变化 */
+function formatUsd(value: number | null | undefined): string {
+  if (value === null || value === undefined) return '-';
+  if (value <= 0) return '$0';
+  return value < 0.01 ? `$${value.toFixed(4)}` : `$${value.toFixed(2)}`;
+}
+
+/** 预算 0 表示不限，显示成 0 会被误读成「已经用完」 */
+function limitText(value: number | null | undefined): string {
+  return value ? formatTokens(value) : t('ai.unlimited');
+}
+
+/** 预算拦截文案按 code 本地化；返回 null 表示不是预算问题 */
+function budgetErrorMessage(code?: string): string | null {
+  if (code === 'chat-token-limit') return t('ai.budgetChatLimitHit');
+  if (code === 'daily-token-limit') return t('ai.budgetDailyLimitHit');
+  if (code === 'daily-cost-limit') return t('ai.budgetDailyCostLimitHit');
+  return null;
+}
+
+/** 切换本次对话使用的模型，并写回该对话，下次打开保持 */
+function handleModelChange() {
+  rememberModel();
+  const chatId = currentChatId.value;
+  if (!chatId) return;
+  const item = chatList.value.find((c) => c.id === chatId);
+  if (item) item.modelId = selectedModelId.value;
+  aiService.updateChat(chatId, { modelId: selectedModelId.value }).catch(() => {});
 }
 
 function formatTime(ts: number): string {
@@ -1096,22 +1540,30 @@ function handleMonitorEvent(event: any) {
 watch(() => props.isOpen, (val) => {
   if (val) {
     nextTick(() => {
+      autoGrowInput();
       inputRef.value?.focus();
       scrollToBottom();
     });
+    // 重新打开面板时刷一下列表：可能在别的标签页里新建过对话
+    loadChatList(false);
   }
 });
 
-// sessionId 变化时重新加载历史（immediate: true 覆盖首次挂载）
-watch(() => props.sessionId, () => {
-  messages.value = [];
-  currentAssistantIdx = -1;
-  loadDisplayHistory();
+// 对话跟「连接」走而不是跟终端会话走：重连 / 换终端不应把对话切掉
+watch(() => props.connectionId, () => {
+  resetChatState();
+  initializeChats();
 }, { immediate: true });
 
 onMounted(() => {
   if (props.isOpen) inputRef.value?.focus();
+  // 多行输入：首次挂载就量一次高度
+  autoGrowInput();
+  // 窗口高度变了，上限跟着变
+  window.addEventListener('resize', autoGrowInput);
   loadSkills();
+  // 设置页增删模型后同步选择器
+  profilesEventId = subscribe(AI_PROFILES_CHANGED, () => { loadProfiles(); });
   // 捕获阶段注册：mousedown 为主（宿主可能吞掉 contextmenu），contextmenu 用于抑制原生菜单
   document.addEventListener('mousedown', onDocMouseDown as EventListener, true);
   document.addEventListener('mouseup', onDocMouseUp as EventListener, true);
@@ -1123,7 +1575,9 @@ onMounted(() => {
 
 onUnmounted(() => {
   stopElapsedTimer();
+  window.removeEventListener('resize', autoGrowInput);
   if (copiedTimer) { clearTimeout(copiedTimer); copiedTimer = null; }
+  if (profilesEventId) unsubscribe(profilesEventId);
   document.removeEventListener('mousedown', onDocMouseDown as EventListener, true);
   document.removeEventListener('mouseup', onDocMouseUp as EventListener, true);
   document.removeEventListener('contextmenu', onDocContextMenu as EventListener, true);
@@ -1556,12 +2010,42 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
 }
 
 .ai-chat-input {
+  position: relative;
   display: flex;
   align-items: flex-end;
   gap: 8px;
   padding: 12px 16px;
   border-top: 1px solid var(--border-color);
   background: rgb(var(--bg-input-rgb) / 30%);
+}
+
+/* 拖拽手柄：贴在输入区上边缘，平时只显示一条细线，hover / 拖动时高亮 */
+.ai-input-resizer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 6px;
+  cursor: ns-resize;
+  touch-action: none;
+}
+.ai-input-resizer::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 36px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--border-strong);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.ai-chat-input:hover .ai-input-resizer::after,
+.ai-input-resizer:hover::after {
+  opacity: 1;
+  background: var(--accent);
 }
 .ai-chat-input textarea {
   flex: 1;
@@ -1571,9 +2055,13 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
   padding: 10px 14px;
   color: var(--text-primary);
   font-size: 13px;
+  line-height: 1.5;
+  /* 高度全部由脚本控制（autoGrowInput 按内容 / 用户拖拽高度），
+     关掉原生 resize 与 max-height，否则手动拖出来的高度会被压回去 */
   resize: none;
   min-height: 40px;
-  max-height: 120px;
+  max-height: none;
+  overflow-y: auto;
   outline: none;
   font-family: inherit;
 }
@@ -1724,6 +2212,64 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
 }
 .skill-badge i { font-size: 10px; color: var(--warning); }
 
+/* 对话状态栏：当前对话 + 模型选择 */
+.ai-chat-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border-color);
+  font-size: 12px;
+}
+.ai-chat-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  flex: 1;
+  color: var(--text-secondary);
+}
+.ai-chat-title i { flex-shrink: 0; }
+.ai-model-select {
+  max-width: min(190px, 50%);
+  flex-shrink: 0;
+  background: var(--bg-recess);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  font-size: 11px;
+  padding: 2px 4px;
+  outline: none;
+  cursor: pointer;
+}
+/* 原生下拉弹层不在 select 盒子里渲染，而且会沿用 select 那层半透明底色
+   （--bg-recess 是 rgba），弹层下面透出的浅色一混，浅灰文字就糊成一片；
+   所以 option 得自备不透明底色，不能只靠 select 的 color 继承 */
+.ai-model-select option {
+  background-color: var(--bg-sidebar);
+  color: var(--text-primary);
+}
+.ai-model-select option:checked {
+  background-color: var(--bg-input);
+  color: var(--accent);
+}
+
+/* 消息上的模型标识 */
+.ai-msg-model {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-secondary);
+  margin-bottom: 6px;
+}
+.ai-msg-model-auto {
+  padding: 0 5px;
+  border-radius: 999px;
+  background: rgb(var(--accent-rgb) / 15%);
+  color: var(--accent);
+}
+
 /* 历史对话面板 */
 .history-panel {
   border-top: 1px solid var(--border-color);
@@ -1752,7 +2298,23 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
   border-bottom: 1px solid rgb(var(--overlay-rgb) / 3%);
 }
 .history-item:hover { background: rgb(var(--overlay-rgb) / 6%); }
+.history-item.active {
+  background: rgb(var(--accent-rgb) / 10%);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
 .history-item:last-child { border-bottom: none; }
+.chat-delete-btn {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: 11px;
+  opacity: 0;
+  transition: opacity 0.12s, color 0.12s;
+}
+.history-item:hover .chat-delete-btn { opacity: 1; }
+.chat-delete-btn:hover { color: var(--danger); }
 .history-item-top {
   display: flex;
   justify-content: space-between;
@@ -1790,6 +2352,60 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
 .btn-ai-action.active {
   color: var(--accent);
   background: rgb(var(--accent-rgb) / 10%);
+}
+
+/* 成本面板（与对话列表同在浮层位置，高度放宽些：要放预算和按模型明细） */
+.cost-panel {
+  max-height: 320px;
+}
+.cost-body {
+  padding: 8px 16px 10px;
+}
+.cost-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 3px 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.cost-row strong {
+  font-size: 12px;
+  color: var(--text-primary);
+  font-weight: 500;
+  white-space: nowrap;
+}
+/* 省下来的钱用正向色标出来，否则它和一行普通统计没区别 */
+.cost-row.saved strong {
+  color: var(--success, #3fb950);
+}
+.cost-subtitle {
+  margin: 10px 0 3px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.cost-hint {
+  margin-top: 6px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+.cost-model-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 0;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.cost-model-num {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
 }
 
 /* Tab 切换栏 */

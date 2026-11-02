@@ -1,5 +1,8 @@
 import { INIT_SQL } from './0001-init';
 import { ACCOUNTS_SQL } from './0002-accounts';
+import { MULTI_AI_SQL } from './0003-multi-ai';
+import { COST_CONTROL_SQL } from './0004-cost-control';
+import { BATCH_PERMISSION_SQL } from './0005-batch-permission';
 
 /**
  * 迁移清单。
@@ -24,6 +27,9 @@ export interface Migration {
 export const MIGRATIONS: Migration[] = [
   { version: '0001', name: 'init-schema', sql: INIT_SQL },
   { version: '0002', name: 'accounts-and-ownership', sql: ACCOUNTS_SQL },
+  { version: '0003', name: 'multi-ai-profiles-and-chats', sql: MULTI_AI_SQL },
+  { version: '0004', name: 'ai-cost-control', sql: COST_CONTROL_SQL },
+  { version: '0005', name: 'batch-permission', sql: BATCH_PERMISSION_SQL },
 ];
 
 /** 供 CLI 导出 .sql 文本 */

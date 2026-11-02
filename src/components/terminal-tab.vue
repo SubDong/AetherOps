@@ -9,7 +9,45 @@
       />
     </div>
 
-    <div class="terminal-container" ref="terminalContainer"></div>
+    <!-- 终端区：xterm 与它的浮层都挂在这里。开右侧面板时这块宽度自己收缩，
+         搜索条跟着缩，不会跑到 AI 面板 / 文件管理器上面去 -->
+    <div class="terminal-stage" ref="terminalStage">
+      <div class="terminal-container" ref="terminalContainer"></div>
+
+      <!-- 终端搜索条：可在终端区内自由拖动 -->
+      <div
+        v-if="showSearch"
+        ref="searchBarEl"
+        class="terminal-search-bar"
+        :class="{ 'is-dragging': searchDragging }"
+        :style="[searchDragStyle, { visibility: searchPlaced ? 'visible' : 'hidden' }]"
+        @pointerdown="onSearchDragStart"
+        @pointermove="onSearchDragMove"
+        @pointerup="onSearchDragEnd"
+        @pointercancel="onSearchDragEnd"
+      >
+        <i class="bi bi-grip-vertical search-grip" :title="t('search.drag')"></i>
+        <i class="bi bi-search"></i>
+        <input
+          ref="searchInputRef"
+          v-model="searchQuery"
+          type="text"
+          class="terminal-search-input"
+          :placeholder="t('search.placeholder')"
+          @input="handleSearchInput"
+          @keydown="handleSearchKeydown"
+        />
+        <button class="search-nav-btn" :title="t('search.prev')" @click="handleSearchNav('prev')">
+          <i class="bi bi-chevron-up"></i>
+        </button>
+        <button class="search-nav-btn" :title="t('search.next')" @click="handleSearchNav('next')">
+          <i class="bi bi-chevron-down"></i>
+        </button>
+        <button class="search-nav-btn" :title="t('common.close')" @click="closeSearch">
+          <i class="bi bi-x-lg"></i>
+        </button>
+      </div>
+    </div>
 
     <!-- 文件传输浮动面板 -->
     <FileTransfer ref="fileTransferRef" />
@@ -59,6 +97,18 @@
       <SnippetPanel @run="handleSnippetRun" @close="showSnippets = false" />
     </div>
 
+    <!-- 服务器状态按钮：面板在左侧边栏底部展开，没侧边栏的宿主不显示 -->
+    <button
+      v-if="status === 'connected' && !isVscodeHost"
+      class="ai-toggle-btn"
+      :class="{ active: serverStatusOpen }"
+      :style="showAIChat ? { right: (aiChatWidth + 172) + 'px' } : { right: '172px' }"
+      @click="$emit('toggle-server-status')"
+      :title="t('server.title')"
+    >
+      <i class="bi bi-speedometer2"></i>
+    </button>
+
     <!-- 终端搜索按钮 -->
     <button
       v-if="status === 'connected'"
@@ -71,35 +121,12 @@
       <i class="bi bi-search"></i>
     </button>
 
-    <!-- 终端搜索条 -->
-    <div v-if="showSearch" class="terminal-search-bar">
-      <i class="bi bi-search"></i>
-      <input
-        ref="searchInputRef"
-        v-model="searchQuery"
-        type="text"
-        class="terminal-search-input"
-        :placeholder="t('search.placeholder')"
-        @input="handleSearchInput"
-        @keydown="handleSearchKeydown"
-      />
-      <button class="search-nav-btn" :title="t('search.prev')" @click="handleSearchNav('prev')">
-        <i class="bi bi-chevron-up"></i>
-      </button>
-      <button class="search-nav-btn" :title="t('search.next')" @click="handleSearchNav('next')">
-        <i class="bi bi-chevron-down"></i>
-      </button>
-      <button class="search-nav-btn" :title="t('common.close')" @click="closeSearch">
-        <i class="bi bi-x-lg"></i>
-      </button>
-    </div>
-
     <!-- AI 对话面板 -->
     <div v-show="showAIChat" class="ai-chat-wrapper" :style="{ width: aiChatWidth + 'px' }" ref="aiChatWrapperRef">
       <div class="ai-resize-handle" @mousedown="startResize"></div>
       <AIChat
         ref="aiChatRef"
-        :sessionId="sessionId || tabId"
+        :sessionId="aiSessionId || tabId"
         :sessionName="props.connection.name"
         :connectionId="props.connection.id"
         :isOpen="showAIChat"
@@ -165,6 +192,9 @@ import {
   readClipboard,
 } from '@/utils/vscode-clipboard';
 import { getToken } from '@/utils/auth';
+import { isVSCode } from '@/base/detect';
+import { useDraggableFloating } from '@/utils/draggable';
+import * as terminalService from '@/service/terminal';
 
 const { t } = useI18n();
 
@@ -172,16 +202,24 @@ const props = defineProps<{
   tabId: string;
   connection: ConnectionEntity;
   active: boolean;
+  /** 侧边栏的服务器状态面板是否开着，用于按钮高亮 */
+  serverStatusOpen?: boolean;
 }>();
+
+// VSCode 面板里没有侧边栏，这个入口放出来也只能点了没反应
+const isVscodeHost = isVSCode;
 
 const emit = defineEmits<{
   (e: 'status-change', status: 'connecting' | 'connected' | 'disconnected' | 'error' | 'reconnecting', sessionId?: string): void;
   (e: 'zmodem-detected', detection: any): void;
   (e: 'open-ai-settings'): void;
+  (e: 'toggle-server-status'): void;
 }>();
 
 const terminalWrapper = ref<HTMLElement>();
 const terminalContainer = ref<HTMLElement>();
+/** 终端区外壳：搜索条等浮层的定位与拖动范围都以它为界 */
+const terminalStage = ref<HTMLElement>();
 const fileTransferRef = ref<InstanceType<typeof FileTransfer>>();
 const status = ref<'connecting' | 'connected' | 'disconnected' | 'error' | 'reconnecting'>('connecting');
 const errorMessage = ref('');
@@ -189,6 +227,9 @@ const errorMessage = ref('');
 // AI 聊天相关
 const showAIChat = ref(false);
 const aiChatRef = ref<InstanceType<typeof AIChat>>();
+// 真正可用于执行命令的终端会话 id。sessionId 是普通变量（不参与响应式），
+// 直接当 prop 传给 AI 面板会拿到连接前的旧值（tabId），命令就落不到正确终端上。
+const aiSessionId = ref('');
 
 // 文件管理器相关
 const showFileManager = ref(false);
@@ -204,6 +245,19 @@ const showSearch = ref(false);
 const searchQuery = ref('');
 const searchInputRef = ref<HTMLInputElement>();
 let searchAddon: SearchAddon | null = null;
+
+// 搜索条默认贴在终端区右上角，可以拖到终端内的任意位置（不跟右侧面板抢地盘）
+const {
+  elRef: searchBarEl,
+  placed: searchPlaced,
+  dragging: searchDragging,
+  dragStyle: searchDragStyle,
+  placeTopRight: placeSearchBar,
+  reset: resetSearchBar,
+  onPointerDown: onSearchDragStart,
+  onPointerMove: onSearchDragMove,
+  onPointerUp: onSearchDragEnd,
+} = useDraggableFloating({ container: () => terminalStage.value, margin: 8 });
 
 function startFmResize(e: MouseEvent) {
   e.preventDefault();
@@ -266,6 +320,8 @@ function inferCurrentCwdFromTerminal(): string {
 let terminal: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
 let ws: WebSocket | null = null;
+/** 组件已卸载：所有异步回调（onclose / 重连定时器）必须立刻停手 */
+let disposed = false;
 let ipcCleanup: (() => void) | null = null;
 let sessionId: string | null = null;
 // 客户端预生成 sessionId，确保 IPC 模式下从一开始就能精确过滤消息
@@ -650,6 +706,8 @@ function connectWebSocket() {
   }
 
   ws.onopen = () => {
+    // 卸载时 ws.close() 是异步的，onopen 仍可能赶到：这里再补一道
+    if (disposed) return;
     console.log(`[TerminalTab] WebSocket connected, sending create`);
     // 发送创建会话请求
     sendToServer({
@@ -682,6 +740,9 @@ function connectWebSocket() {
 
   ws.onclose = (event) => {
     console.log(`[TerminalTab] WebSocket closed, code: ${event.code}, reason: ${event.reason}`);
+    // 关闭 tab 时是主动 close：不能再重连，否则已关掉的会话会被重新 create 出来，
+    // 刷新页面时又被 restore 建回一个 tab（还会剩下一个没人用的 PTY）
+    if (disposed) return;
     if (status.value !== 'disconnected' && status.value !== 'reconnecting') {
       setStatus('disconnected');
     }
@@ -697,6 +758,7 @@ const MAX_RECONNECT_ATTEMPTS = 5;
 const RECONNECT_BASE_DELAY = 2000; // 基础延迟 2 秒
 
 function scheduleReconnect() {
+  if (disposed) return;
   if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
     console.log('[TerminalTab] Max reconnect attempts reached');
     if (terminal) {
@@ -712,6 +774,7 @@ function scheduleReconnect() {
 }
 
 function reconnect() {
+  if (disposed) return;
   // 清除之前的重连定时器
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
@@ -974,6 +1037,7 @@ function handleServerMessage(msg: WSMessage) {
     case 'status':
       if (msg.sessionId) {
         sessionId = msg.sessionId;
+        aiSessionId.value = msg.sessionId;
       }
       if (msg.data === 'connected') {
         reconnectAttempts = 0; // 重置重连计数
@@ -1138,7 +1202,15 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
-  if (reconnectTimer) clearTimeout(reconnectTimer);
+  // 先置位：下面 ws.close() 触发的 onclose 会异步赶到，它必须知道组件已经不在了
+  disposed = true;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  // 会话元数据按「本 tab 实际用的 id」删：还在连接中的 tab 还没回填 sessionId，
+  // 只删 sessionId 会漏掉它，刷新页面时它会被当成一个 tab 建回来
+  terminalService.deleteSession(sessionId || pendingSessionId).catch(() => {});
   resizeObserver?.disconnect();
   document.removeEventListener('click', onDocumentClick);
   offVscodeTheme?.();
@@ -1324,7 +1396,10 @@ const SEARCH_DECORATIONS = {
 function openSearch() {
   showSearch.value = true;
   showSnippets.value = false; // 避免与片段浮层重叠
+  resetSearchBar();
   nextTick(() => {
+    // 每次打开都回到右上角，不沿用上次拖到的位置
+    placeSearchBar(56, 12);
     searchInputRef.value?.focus();
     searchInputRef.value?.select();
   });
@@ -1398,6 +1473,16 @@ function onDocumentClick(e: MouseEvent) {
   overflow: hidden;
 }
 
+/* 终端区外壳：宽度跟着终端走，右侧面板打开时自动变窄 */
+.terminal-stage {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  overflow: hidden;
+}
+
 /* AI 按钮 */
 .ai-toggle-btn {
   position: absolute;
@@ -1446,27 +1531,42 @@ function onDocumentClick(e: MouseEvent) {
   flex-direction: column;
 }
 
-/* 终端搜索条 */
+/* 终端搜索条：left/top 由拖动逻辑写，不再钉死 right */
 .terminal-search-bar {
   position: absolute;
-  top: 56px;
-  right: 12px;
   z-index: 30;
   display: flex;
   align-items: center;
   gap: 4px;
   padding: 6px 8px;
+  max-width: calc(100% - 16px);
+  cursor: move;
   background: var(--bg-menu, var(--bg-dark));
   border: 1px solid var(--border-strong);
   border-radius: 8px;
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+}
+/* 拖动光标：整条都能拖，输入框与按钮除外 */
+.terminal-search-bar.is-dragging { cursor: grabbing; }
+.search-grip {
+  color: var(--text-secondary);
+  opacity: 0.6;
+  font-size: 12px;
+  cursor: grab;
+  user-select: none;
+}
+.search-grip:hover {
+  opacity: 1;
+  color: var(--accent);
 }
 .terminal-search-bar > i.bi-search {
   color: var(--text-secondary);
   font-size: 12px;
 }
 .terminal-search-input {
+  flex: 0 1 200px;
   width: 200px;
+  min-width: 80px;
   background: var(--bg-input, rgb(var(--bg-input-rgb)));
   border: 1px solid var(--border-color);
   border-radius: 6px;
@@ -1474,6 +1574,7 @@ function onDocumentClick(e: MouseEvent) {
   color: var(--text-primary);
   font-size: 12px;
   outline: none;
+  cursor: text;
 }
 .terminal-search-input:focus {
   border-color: var(--accent);

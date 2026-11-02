@@ -112,6 +112,15 @@
               {{ user.lastLoginAt ? formatTime(user.lastLoginAt) : t('auth.neverLogin') }}
             </td>
             <td class="row-actions">
+              <!-- 代管入口：审计 / 传输 / 连接 / 紧急断开都在弹层里，不往表格里摊平 -->
+              <button
+                v-if="user.id !== me?.id"
+                class="icon-btn"
+                :title="t('member.console')"
+                @click="openConsole(user)"
+              >
+                <i class="bi bi-person-gear"></i>
+              </button>
               <button class="icon-btn" :title="t('auth.resetPassword')" @click="resetPassword(user)">
                 <i class="bi bi-key"></i>
               </button>
@@ -131,6 +140,13 @@
         </tbody>
       </table>
     </div>
+
+    <MemberConsole
+      v-if="consoleUser"
+      :user-id="consoleUser.id"
+      :username="consoleUser.username"
+      @close="consoleUser = null"
+    />
   </div>
 </template>
 
@@ -139,6 +155,7 @@ import { onMounted, reactive, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { toast } from '@/utils/toast';
 import { modal } from '@/utils/modal';
+import MemberConsole from '@/components/member-console/index.vue';
 import {
   PERMISSION_KEYS,
   adminCreateUser,
@@ -161,6 +178,8 @@ const busy = ref(false);
 const showCreate = ref(false);
 const notice = ref<{ type: 'success' | 'error'; text: string } | null>(null);
 const me = ref(getCurrentUser());
+/** 当前打开代管弹层的账号；同一时刻只会开一个 */
+const consoleUser = ref<AuthUser | null>(null);
 
 const createForm = reactive({
   username: '',
@@ -172,6 +191,7 @@ const createForm = reactive({
 
 const PERM_LABELS: Record<PermissionKey, string> = {
   terminal: 'permTerminal',
+  batch: 'permBatch',
   ai: 'permAi',
   connections: 'permConnections',
   aiConfig: 'permAiConfig',
@@ -184,6 +204,10 @@ const PERM_LABELS: Record<PermissionKey, string> = {
 
 function permLabel(key: PermissionKey): string {
   return t(`auth.${PERM_LABELS[key]}`);
+}
+
+function openConsole(user: AuthUser) {
+  consoleUser.value = user;
 }
 
 function formatTime(value: string): string {

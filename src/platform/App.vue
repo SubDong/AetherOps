@@ -1,5 +1,11 @@
 <template>
-  <router-view />
+  <!-- 终端页保活：去账号管理等路由再回来时不能销毁 xterm 与 WebSocket，
+       否则已连着的会话会被全部重连。只缓存终端页，登录页/账号管理页照常销毁 -->
+  <router-view v-slot="{ Component }">
+    <keep-alive :include="['TerminalView']">
+      <component :is="Component" />
+    </keep-alive>
+  </router-view>
 </template>
 
 <script lang="ts" setup>

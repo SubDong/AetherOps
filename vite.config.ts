@@ -31,6 +31,7 @@ import {
 import { authenticate } from './server/service/auth.service';
 import { PUBLIC_PATHS, handleAccountRoutes } from './server/routes/auth.routes';
 import { extractBearerToken, isAllowedOrigin, normalizeUploadName, maxUploadBytes } from './server/utils/security';
+import { registerTerminalSocket, unregisterTerminalSocket } from './server/utils/socket-registry';
 
 const urlPrefix = process.env.PREFIX ? `/${process.env.PREFIX}` : '';
 const devUploadLimitBytes = maxUploadBytes();
@@ -327,6 +328,8 @@ const config = defineConfig({
                     wss.on('connection', async (ws: any, req: any) => {
                         const wsUser: AuthContext = req.user;
                         const ownerId = wsUser.userId;
+                        // 按账号登记：管理员在账号管理页点「紧急断开」时要按 ownerId 找到这个人的所有终端 socket
+                        registerTerminalSocket(ownerId, ws);
                         console.log(`[WS] Client connected to Vite dev WebSocket user=${wsUser.username}`);
                         let sessionId: string | null = null;
 
@@ -469,7 +472,9 @@ const config = defineConfig({
                                     break;
                                 }
                                 case 'ai-agent-run': {
-                                    const { aiSessionId, message, context, skillId, locale } = data || {};
+                                    // aiSessionId 是命令要跑在哪个终端；chatId 是这一轮属于哪个对话（存储 key）。
+                                    // 老前端只传 aiSessionId 时退化为「对话 = 终端会话」，不影响可用性。
+                                    const { aiSessionId, chatId, message, context, skillId, locale, modelId } = data || {};
                                     if (!wsUser.permissions || !wsUser.permissions.ai) {
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Forbidden: missing permission' } }));
                                         break;
@@ -478,22 +483,31 @@ const config = defineConfig({
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Missing params' } }));
                                         break;
                                     }
-                                    aiService.agentRun(ownerId, aiSessionId, message, context, (event: any) => {
-                                        safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, event }));
-                                    }, skillId, locale).catch((err: any) => {
-                                        safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, event: { type: 'error', error: err.message } }));
+                                    const conversationId = chatId || aiSessionId;
+                                    console.log(`[dev][WS] AI Agent run: chat=${conversationId}, terminal=${aiSessionId}, model=${modelId || 'auto'}`);
+                                    // 参数顺序与服务端一致：(ownerId, chatId, terminalSessionId, message, context, callback, opts)
+                                    aiService.agentRun(ownerId, conversationId, aiSessionId, message, context, (event) => {
+                                        safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, chatId: conversationId, event }));
+                                    }, { skillId, locale, modelId }).catch((err: any) => {
+                                        safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: aiSessionId, chatId: conversationId, event: { type: 'error', error: err.message } }));
                                     });
                                     break;
                                 }
                                 case 'ai-agent-stop': {
-                                    const { aiSessionId: stopSid } = data || {};
-                                    if (stopSid) aiService.stopAgent(ownerId, stopSid);
+                                    // 中止的粒度是「对话」，不是终端
+                                    const { aiSessionId: stopSid, chatId: stopChatId } = data || {};
+                                    const stopTarget = stopChatId || stopSid;
+                                    if (stopTarget) {
+                                        aiService.stopAgent(ownerId, stopTarget);
+                                        console.log(`[dev][WS] AI Agent stop requested: ${stopTarget}`);
+                                    }
                                     break;
                                 }
                             }
                         });
 
                         ws.on('close', () => {
+                            unregisterTerminalSocket(ownerId, ws);
                             if (sessionId) sshService.closeSession(sessionId);
                         });
                     });
@@ -604,7 +618,7 @@ async function serverRoute(req: Connect.IncomingMessage, res: http.ServerRespons
                 try {
                     const fileBuffer = Buffer.concat(chunks);
                     console.log(`[HTTP-Upload] Received ${fileBuffer.length} bytes, calling SFTP...`);
-                    const bytes = await sshService!.uploadFileViaSftp(sessionId, fileName, fileBuffer);
+                    const bytes = await sshService!.uploadFileTracked(sessionId, fileName, fileBuffer);
                     console.log(`[HTTP-Upload] SFTP done: ${fileName}, ${bytes} bytes`);
                     res.writeHead(200, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ success: true, bytes, fileName }));

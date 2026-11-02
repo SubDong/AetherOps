@@ -1,8 +1,15 @@
 <template>
     <div :class="embedded ? 'connection-editor-embed' : 'modal fade'" :id="modalId" ref="modalContainer" tabindex="-1" aria-labelledby="modalLabel">
-        <div :class="[embedded ? 'connection-editor-embed__dialog' : 'modal-dialog modal-dialog-centered', { 'modal-fullscreen': isFullScreen }]" :style="dialogStyle">
+        <div ref="dialogRef" :class="[embedded ? 'connection-editor-embed__dialog' : 'modal-dialog modal-dialog-centered', { 'modal-fullscreen': isFullScreen }]" :style="[dialogStyle, dragStyle]">
             <div class="modal-content" :class="contentClass">
-                <div class="modal-header" :class="headerClass">
+                <div
+                    class="modal-header"
+                    :class="[headerClass, { 'modal-drag-handle': dragEnabled, 'is-dragging': dragging }]"
+                    @pointerdown="handlePointerDown"
+                    @pointermove="onPointerMove"
+                    @pointerup="onPointerUp"
+                    @pointercancel="onPointerUp"
+                >
                     <h5 class="modal-title d-flex align-items-center" id="modalLabel">
                         <i v-if="typeIcon" :class="typeIcon" class="me-2"></i>
                         {{ dynamicTitle || props.title }}
@@ -39,6 +46,7 @@
 import { ref, onMounted, onUnmounted, watch, computed, nextTick } from 'vue';
 import * as bootstrap from 'bootstrap';
 import Loading from '@/components/loading/index.vue';
+import { useDraggableDialog } from '@/utils/draggable';
 import { useI18n } from 'vue-i18n';
 
 const { t } = useI18n();
@@ -83,6 +91,15 @@ const emits = defineEmits(['onConfirm', 'onClose', 'onCancel', 'onHidden']);
 const modalShow = ref(false);
 const isContentVisible = computed(() => props.embedded || modalShow.value);
 const modalContainer = ref<HTMLElement>(null as any);
+const dialogRef = ref<HTMLElement | null>(null);
+/** 内嵌态不是浮层（在页面里铺开），全屏态本来就没有可挪的余地，都不给拖 */
+const dragEnabled = computed(() => !props.embedded && !props.isFullScreen);
+const { dragging, dragStyle, onPointerDown, onPointerMove, onPointerUp, resetDrag } = useDraggableDialog(dialogRef);
+
+function handlePointerDown(e: PointerEvent) {
+    if (!dragEnabled.value) return;
+    onPointerDown(e);
+}
 let modal: bootstrap.Modal | null = null;
 
 function getModal() {
@@ -90,7 +107,7 @@ function getModal() {
     if (!modalContainer.value) return null;
     const m = new bootstrap.Modal(modalContainer.value, { backdrop: 'static', keyboard: false });
     modalContainer.value.addEventListener('hidden.bs.modal', () => { modalShow.value = false; emits('onHidden'); });
-    modalContainer.value.addEventListener('show.bs.modal', () => { modalShow.value = true; });
+    modalContainer.value.addEventListener('show.bs.modal', () => { resetDrag(); modalShow.value = true; });
     return m;
 }
 
@@ -143,6 +160,9 @@ defineExpose({
 
 <style scoped>
 .modal-body { min-height: 80px; display: flex; flex-direction: column; align-items: stretch; }
+/* 标题栏就是拖拽把手：光标提示能拖，拖动中换成抓紧的手 */
+.modal-drag-handle { cursor: grab; }
+.modal-drag-handle.is-dragging { cursor: grabbing; }
 </style>
 
 <style>

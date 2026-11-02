@@ -71,14 +71,24 @@
       </div>
     </div>
 
+    <!-- 服务器状态面板：由终端工具栏的仪表盘按钮开关，展示当前活动终端所在主机 -->
+    <div v-if="serverStatusVisible" class="server-status-host">
+      <ServerStatusPanel
+        :sessionId="serverSessionId || ''"
+        :connectionName="serverConnectionName"
+        @close="$emit('close-server-status')"
+        @toggle-float="$emit('float-server-status')"
+      />
+    </div>
+
     <!-- 底部信息 -->
-    <div class="p-2 text-center d-flex align-items-center justify-content-between" style="font-size: 11px; color: var(--text-secondary); border-top: 1px solid var(--border-color);">
+    <div class="p-2 text-center d-flex align-items-center justify-content-between" style="font-size: 12px; color: var(--text-secondary); gap: 8px; border-top: 1px solid var(--border-color);">
       <span>{{ connections.length }} {{ t('sidebar.connectionCount') }}</span>
       <div class="d-flex gap-1 align-items-center">
         <button v-if="canUseAi" class="btn-ai-settings" @click="$emit('open-ai-settings')" :title="t('ai.settings')">
           <i class="bi bi-robot"></i>
         </button>
-        <button v-if="canUseTerminal" class="btn-ai-settings" @click="$emit('open-batch')" :title="t('batch.title')">
+        <button v-if="canUseBatch" class="btn-ai-settings" @click="$emit('open-batch')" :title="t('batch.title')">
           <i class="bi bi-hdd-rack"></i>
         </button>
         <button class="btn-lang-switch" @click="toggleLocale" :title="currentLocale === 'zh-CN' ? 'Switch to English' : '切换到中文'">
@@ -97,11 +107,14 @@ import type { ConnectionEntity } from '@/typings/connection';
 import { setLocale, getLocale } from '@/utils/i18n';
 import { hasPermission } from '@/utils/auth';
 import AccountMenu from '@/components/account-menu/index.vue';
+import ServerStatusPanel from '@/components/server-status/index.vue';
 
 const { t } = useI18n();
 
 // 权限只在页面加载时算一次：管理员改权限会踢人下线，重新登录后才生效
 const canUseTerminal = hasPermission('terminal');
+// 批量操作单独一个权限位：一条命令打到 N 台主机，影响面比单个终端大，不能靠 terminal 顺带拿到
+const canUseBatch = hasPermission('batch');
 const canUseAi = hasPermission('ai');
 const canManageConnections = hasPermission('connections');
 
@@ -117,6 +130,12 @@ const props = defineProps<{
   connections: ConnectionEntity[];
   loading: boolean;
   collapsed: boolean;
+  /** 是否展开服务器状态面板 */
+  serverStatusVisible?: boolean;
+  /** 要监控的终端会话（当前活动的 tab），未连接时为空 */
+  serverSessionId?: string;
+  /** 会话昵称，采集不到 hostname 时用它兜底 */
+  serverConnectionName?: string;
 }>();
 
 defineEmits<{
@@ -128,6 +147,8 @@ defineEmits<{
   (e: 'toggle-sidebar'): void;
   (e: 'open-ai-settings'): void;
   (e: 'open-batch'): void;
+  (e: 'close-server-status'): void;
+  (e: 'float-server-status'): void;
 }>();
 
 const searchQuery = ref('');
@@ -148,6 +169,15 @@ function showContextMenu(_event: MouseEvent, _conn: ConnectionEntity) {
 </script>
 
 <style scoped>
+/* 面板占了连接列表的空间：固定高度，列表区自然变短，不跟着内容跳 */
+.server-status-host {
+  flex: 0 0 auto;
+  height: 340px;
+  max-height: 55%;
+  min-height: 220px;
+  border-top: 1px solid var(--border-color);
+}
+
 .btn-toolbar {
   background: none;
   border: none;
@@ -184,13 +214,18 @@ function showContextMenu(_event: MouseEvent, _conn: ConnectionEntity) {
 }
 
 .btn-lang-switch {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 22px;
   background: none;
   border: 1px solid var(--border-color);
   color: var(--text-secondary);
-  padding: 1px 6px;
+  padding: 0 7px;
   border-radius: 4px;
   cursor: pointer;
-  font-size: 11px;
+  font-size: 12px;
+  font-weight: 500;
   line-height: 1;
   transition: all 0.15s;
 }
@@ -201,17 +236,18 @@ function showContextMenu(_event: MouseEvent, _conn: ConnectionEntity) {
 }
 
 .btn-ai-settings {
+  display: flex;
+  align-items: center;
+  height: 22px;
   background: none;
   border: 1px solid var(--border-color);
   color: var(--text-secondary);
-  padding: 2px 6px;
+  padding: 0 7px;
   border-radius: 4px;
   cursor: pointer;
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1;
   transition: all 0.15s;
-  display: flex;
-  align-items: center;
 }
 
 .btn-ai-settings:hover {

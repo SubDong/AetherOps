@@ -223,7 +223,8 @@ function setupApiIPC() {
       if (!access.ok) return { success: false, error: access.error };
       console.log(`[IPC] File upload: session=${sessionId}, file=${fileName}, size=${fileData.byteLength || fileData.length}`);
       const buffer = Buffer.from(fileData);
-      const bytes = await services.sshService.uploadFileViaSftp(sessionId, fileName, buffer);
+      // tracked 版本会顺手把这次传输记进审计（管理员在账号管理页看得到）
+      const bytes = await services.sshService.uploadFileTracked(sessionId, fileName, buffer);
       return { success: true, bytes, fileName };
     } catch (err) {
       console.error('[IPC] File upload error:', err);
@@ -244,7 +245,7 @@ function setupApiIPC() {
       }
       const access = await assertSessionAccess(token, sessionId, ['files', 'terminal']);
       if (!access.ok) return { success: false, error: access.error };
-      const buffer = await services.sshService.downloadFile(sessionId, remotePath);
+      const buffer = await services.sshService.downloadFileTracked(sessionId, remotePath);
       const { dialog } = require('electron');
       const defaultName = fileName || path.basename(remotePath) || 'download';
       const { canceled, filePath } = await dialog.showSaveDialog({

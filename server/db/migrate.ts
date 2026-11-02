@@ -104,14 +104,26 @@ export function splitStatements(sql: string): string[] {
     }
 
     if (ch === "'" && !inDouble && !inBacktick) {
-      // '' 是转义后的单引号，不结束字符串；\' 同理
-      if (inSingle && (next === "'" || next === '\\')) {
+      // 单引号字符串里的 '' 与 \' 都是转义引号，不结束字符串。
+      // 两个字符都要原样留住：交给 MySQL 的文本少一个引号就变成语法错误
+      // （曾经因此把整份迁移当成一条语句，报出莫名其妙的 PREPARE 语法错）。
+      if (inSingle && next === "'") {
+        current += ch + next;
+        i++;
+        continue;
+      }
+      if (inSingle && current.endsWith('\\')) {
         current += ch;
         continue;
       }
       inSingle = !inSingle;
     } else if (ch === '"' && !inSingle && !inBacktick) {
-      if (inDouble && (next === '"' || next === '\\')) {
+      if (inDouble && next === '"') {
+        current += ch + next;
+        i++;
+        continue;
+      }
+      if (inDouble && current.endsWith('\\')) {
         current += ch;
         continue;
       }

@@ -13,7 +13,25 @@ import type {
   Message, ToolContext, ToolDefinition,
 } from '@cicctencent/agent-core';
 import { extractTextFromContent } from '@cicctencent/agent-core';
-import { loadAIConfigRow, saveAIConfigRow, DEFAULT_AI_CONFIG_ID } from '../db/repositories/ai-config.repo';
+import {
+  loadAIConfigRow, saveAIConfigRow, listAIConfigRows, deleteAIConfigRow, DEFAULT_AI_CONFIG_ID,
+} from '../db/repositories/ai-config.repo';
+import {
+  insertChatRow, listChatRows, loadChatRow, updateChatRow, deleteChatRow,
+} from '../db/repositories/ai-chat.repo';
+import type { AIChatRow } from '../db/repositories/ai-chat.repo';
+import { scoreTaskComplexity, rankProfilesForTier, describeAutoRoute } from './ai-auto-router';
+import type { AutoRouteDecision, AutoRouteInput, ModelHealthStat } from './ai-auto-router';
+import { analyzeProfiles, estimateCostUsd } from './ai-cost-analyzer';
+import type { CostAnalysisResult, CostTierInput } from './ai-cost-analyzer';
+import { prefetchCatalog, lookupPrice } from './ai-pricing';
+import {
+  insertUsageRow, sumUsage, groupUsageByModel, groupUsageByChat,
+  loadModelHealth, deleteUsageByChat, startOfToday,
+} from '../db/repositories/ai-usage.repo';
+import type { UsageTotals } from '../db/repositories/ai-usage.repo';
+import { loadBudgetRow, saveBudgetRow } from '../db/repositories/ai-budget.repo';
+import type { AIBudgetRow } from '../db/repositories/ai-budget.repo';
 import {
   saveHistory, loadHistoryMessages, listHistories, deleteHistory,
 } from '../db/repositories/ai-history.repo';
@@ -37,8 +55,74 @@ export interface AIConfig {
   temperature?: number;
 }
 
+/** 一套模型配置：id/label 是多配置管理需要的，AIConfig 只描述「怎么调这个模型」 */
+export interface AIProfile extends AIConfig {
+  id: string;
+  label: string;
+  /** 1=最便宜 … 5=最强，auto 路由按它分档 */
+  costTier: number;
+  /** auto=由定价目录/规则推断（允许重算），manual=用户手填（不再自动覆盖） */
+  costTierSource?: 'auto' | 'manual';
+  /** 美元 / 1M token；null=定价目录里没查到，不做金额估算 */
+  priceIn?: number | null;
+  priceOut?: number | null;
+  sortOrder: number;
+}
+
+/** 'auto' 是虚拟配置：不出现在 ai_config 表里，由路由实时决定用哪个 */
+export const AUTO_MODEL_ID = 'auto';
+
+/** 一个账号下最多几套模型配置：只是防手滑，不是产品限制 */
+const MAX_PROFILES = 20;
+/** auto 模式下最多向下试探几个模型（含第一个）：1 次首选 + 2 次降级 */
+const MAX_AUTO_ATTEMPTS = 3;
+
+/** 对话窗口元数据（与终端会话解耦，绑定 connectionId） */
+export interface AIChatMeta {
+  id: string;
+  connectionId: string;
+  title: string;
+  modelId: string;
+  messageCount: number;
+  preview: string;
+  createdAt: number;
+  updatedAt: number;
+  /** 该对话累计 token（列表页展示，未统计过为 0） */
+  totalTokens?: number;
+  /** 该对话累计金额（美元）；单价未知的调用不进去，所以是下限 */
+  costUsd?: number;
+}
+
+export interface AgentRunOptions {
+  skillId?: string;
+  locale?: string;
+  /** 'auto' 或 ai_config.id；不传按 auto 处理 */
+  modelId?: string;
+}
+
+function bySortOrder(a: AIProfile, b: AIProfile): number {
+  if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+  return a.id.localeCompare(b.id);
+}
+
+function clampTier(value: number | undefined): number {
+  if (!Number.isFinite(value as number)) return 3;
+  return Math.min(5, Math.max(1, Math.round(value as number)));
+}
+
+/** 数一下历史里已经有几次工具结果：深链路任务多半还要继续调工具，auto 该往高档走 */
+function countToolMessages(history: Message[]): number {
+  let count = 0;
+  for (const message of history || []) {
+    if ((message as any)?.role === 'tool') count++;
+  }
+  return count;
+}
+
 /** Agent 事件类型 */
-export type AgentEventType = 'thinking' | 'message' | 'tool_call' | 'tool_result' | 'audit_entry' | 'done' | 'error' | 'system_info';
+export type AgentEventType =
+  | 'thinking' | 'message' | 'tool_call' | 'tool_result' | 'audit_entry' | 'done' | 'error' | 'system_info'
+  | 'model_selected';
 
 /** Agent 事件（应用层简化格式） */
 export interface AgentEvent {
@@ -51,6 +135,13 @@ export interface AgentEvent {
   auditEntry?: any;
   /** LLM token 消耗统计（done 事件携带） */
   usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+  /** 本轮实际使用的模型（auto 模式下由路由选出） */
+  modelId?: string;
+  modelLabel?: string;
+  /** auto 路由的决策依据，让用户看得见「为什么用这个模型」 */
+  route?: { target: string; tier: number; score: number; reasons: string[] };
+  /** 错误码：前端按它本地化提示（如预算超限具体是哪一项） */
+  code?: string;
 }
 
 export type AgentEventCallback = (event: AgentEvent) => void;
@@ -178,20 +269,21 @@ Response format (important):
 // ============================================================
 
 export class AIService {
-  // ---- 配置（按账号） ----
+  // ---- 模型配置（按账号、按配置 ID 两级） ----
   // 不能再用一个 this.config：同进程里多个账号同时在用，谁最后保存谁覆盖所有人。
-  // 除 abortControllers 外，所有状态都以 ownerId 为 key。
-  private configs = new Map<string, AIConfig>();
+  // 一层 ownerId → 一层 profileId：一个账号可以有多套模型，auto 要在这几套之间挑。
+  private profiles = new Map<string, Map<string, AIProfile>>();
 
-  // ---- agent-core 组件（按账号） ----
-  // engine 绑定的是某个账号的 provider（模型 / Key / BaseURL），所以也必须一人一个
+  // ---- agent-core 组件（按 `ownerId:profileId`） ----
+  // engine 绑定的是某套配置的 provider（模型 / Key / BaseURL），
+  // 所以缓存粒度是配置而不是账号：切模型必须换 provider，不能复用。
   private providers = new Map<string, LLMProvider>();
   private engines = new Map<string, AgentEngine>();
   private toolRegistry: ToolRegistry;
   private contextManager: ContextManager;
   private securityGuard: SecurityGuard;
-  /** key 是 `ownerId:sessionId`：sessionId 由前端传，不能假定跨账号唯一，
-   *  否则拿到别人的 sessionId 就能中止对方的 Agent。 */
+  /** key 是 `ownerId:chatId`：chatId 由前端传，不能假定跨账号唯一，
+   *  否则拿到别人的 chatId 就能中止对方的 Agent。 */
   private abortControllers = new Map<string, AbortController>();
 
   // ---- 状态 ----
@@ -230,67 +322,95 @@ export class AIService {
    */
   async init(): Promise<void> {
     console.log('[AIService] 配置按账号懒加载（登录后首次使用时读取 ai_config）');
+    // 预热定价目录：不等它，但让「第一次保存配置」就能用上真实单价
+    prefetchCatalog();
   }
 
-  // ========== 按账号配置 ==========
+  // ========== 按账号配置（多套） ==========
 
   /**
-   * 取某个账号的配置：没缓存就读库，库里没记录就用默认值。
+   * 取某个账号的全部模型配置：没缓存就读库。
+   *
+   * 空库时返回空数组而不是「默认配置」：没有 Key 就不能对话，
+   * 前端直接引导去设置页新增，比塞一个 apiKey 为空的假配置更清楚。
    * 读库失败直接抛：拿默认配置继续跑会让用户以为「Key 丢了」，实际是库连不上。
    */
-  private async ensureConfig(ownerId: string): Promise<AIConfig> {
-    const cached = this.configs.get(ownerId);
-    if (cached) return cached;
+  private async ensureProfiles(ownerId: string): Promise<AIProfile[]> {
+    const cached = this.profiles.get(ownerId);
+    if (cached) return [...cached.values()].sort(bySortOrder);
 
-    let config = this.getDefaultConfig();
-    const row = await loadAIConfigRow(ownerId);
-    if (row) {
-      config = {
-        ...config,
+    const rows = await listAIConfigRows(ownerId);
+    const map = new Map<string, AIProfile>();
+    for (const row of rows) {
+      map.set(row.id, {
+        id: row.id,
+        label: row.label || row.model || row.id,
         enabled: row.enabled,
-        provider: row.provider || config.provider,
+        provider: row.provider || 'openai',
         apiKey: this.decryptSecretIfNeeded(row.apiKeyEnc),
-        baseUrl: row.baseUrl || config.baseUrl,
-        model: row.model || config.model,
-        maxTokens: row.maxTokens ?? config.maxTokens,
-        temperature: row.temperature ?? config.temperature,
-      };
+        baseUrl: row.baseUrl || '',
+        model: row.model || '',
+        maxTokens: row.maxTokens ?? undefined,
+        temperature: row.temperature ?? undefined,
+        costTier: row.costTier,
+        costTierSource: row.costTierSource,
+        priceIn: row.priceIn,
+        priceOut: row.priceOut,
+        sortOrder: row.sortOrder,
+      });
     }
-    this.configs.set(ownerId, config);
-    return config;
+    this.profiles.set(ownerId, map);
+    return [...map.values()].sort(bySortOrder);
+  }
+
+  private async findProfile(ownerId: string, profileId?: string): Promise<AIProfile | undefined> {
+    const list = await this.ensureProfiles(ownerId);
+    if (!list.length) return undefined;
+    if (!profileId) return list.find((p) => p.enabled && p.apiKey) || list[0];
+    return list.find((p) => p.id === profileId);
   }
 
   // ========== LLM Provider & Engine 懒初始化 ==========
 
-  private async ensureLLMProvider(ownerId: string): Promise<LLMProvider | undefined> {
-    const config = await this.ensureConfig(ownerId);
-    if (!config.apiKey) return undefined;
+  private async ensureLLMProvider(ownerId: string, profile: AIProfile): Promise<LLMProvider | undefined> {
+    if (!profile.apiKey) return undefined;
 
-    let provider = this.providers.get(ownerId);
+    const cacheKey = `${ownerId}:${profile.id}`;
+    let provider = this.providers.get(cacheKey);
     if (!provider) {
       provider = createLLMProvider({
-        provider: config.provider || 'openai',
-        model: config.model,
-        apiKey: config.apiKey,
-        baseUrl: config.baseUrl,
-        temperature: config.temperature,
-        maxTokens: config.maxTokens,
+        provider: profile.provider || 'openai',
+        model: profile.model,
+        apiKey: profile.apiKey,
+        baseUrl: profile.baseUrl,
+        temperature: profile.temperature,
+        maxTokens: profile.maxTokens,
       });
-      this.providers.set(ownerId, provider);
+      this.providers.set(cacheKey, provider);
     }
     return provider;
   }
 
-  private resetProviderAndEngine(ownerId: string): void {
-    this.providers.delete(ownerId);
-    this.engines.delete(ownerId);
+  /** 不传 profileId 清该账号全部：改配置后旧 provider 里的 Key/模型已经不对了 */
+  private resetProviderAndEngine(ownerId: string, profileId?: string): void {
+    const prefix = `${ownerId}:`;
+    if (profileId) {
+      this.providers.delete(`${ownerId}:${profileId}`);
+      this.engines.delete(`${ownerId}:${profileId}`);
+      return;
+    }
+    for (const key of [...this.providers.keys()]) if (key.startsWith(prefix)) this.providers.delete(key);
+    for (const key of [...this.engines.keys()]) if (key.startsWith(prefix)) this.engines.delete(key);
   }
 
-  private async getEngine(ownerId: string): Promise<AgentEngine | undefined> {
-    const provider = await this.ensureLLMProvider(ownerId);
+  private async getEngine(ownerId: string, profile: AIProfile, terminalSessionId: string): Promise<AgentEngine | undefined> {
+    const provider = await this.ensureLLMProvider(ownerId, profile);
     if (!provider) return undefined;
 
-    let engine = this.engines.get(ownerId);
+    // 缓存 key 必须带终端会话：hooks 里的审计要记「命令在哪个终端里跑的」，
+    // 这是构造时闭包进去的，同一套配置在不同终端之间不能共用同一个 engine。
+    const cacheKey = `${ownerId}:${profile.id}:${terminalSessionId}`;
+    let engine = this.engines.get(cacheKey);
     if (!engine) {
       engine = new AgentEngine({
         llmProvider: provider,
@@ -300,17 +420,26 @@ export class AIService {
         basePrompt: AGENT_SYSTEM_PROMPT,
         maxIterations: this.MAX_AGENT_ITERATIONS,
         maxMessages: this.MAX_MESSAGES,
-        hooks: this.buildHooks(ownerId),
+        hooks: this.buildHooks(ownerId, terminalSessionId),
       });
-      this.engines.set(ownerId, engine);
+      this.engines.set(cacheKey, engine);
     }
     return engine;
   }
 
-  private buildHooks(ownerId: string): import('@cicctencent/agent-core').Hook[] {
+  /**
+   * 审计钩子。
+   * 
+   * 注意 ctx.sessionId 现在是 chatId（engine 的上下文 key），
+   * 而审计要记的是「命令在哪个终端里跑的」，所以终端会话 ID 用闭包带进来，
+   * 不能再用 ctx.sessionId——否则审计日志里的 sessionId 会变成对话 ID，
+   * 拿它去查终端归属永远查不到。
+   */
+  private buildHooks(ownerId: string, terminalSessionId?: string): import('@cicctencent/agent-core').Hook[] {
     if (!this.auditService) return [];
     const auditService = this.auditService;
     const sshService = this.sshService;
+    const sessionId = terminalSessionId || '';
     return [{
       name: 'audit-tool-call',
       event: 'after_tool' as const,
@@ -321,9 +450,9 @@ export class AIService {
             : JSON.stringify(ctx.args);
           // ownerId 从构造时闭包捕获：hooks 挂在某人的 engine 上，不会串号
           await auditService.log(ownerId, {
-            sessionId: ctx.sessionId,
-            sessionName: sshService?.getSession(ctx.sessionId)?.name,
-            connectionId: sshService?.getSession(ctx.sessionId)?.connectionId,
+            sessionId,
+            sessionName: sshService?.getSession(sessionId)?.name,
+            connectionId: sshService?.getSession(sessionId)?.connectionId,
             userMessage: '',
             tool: ctx.tool || '',
             command,
@@ -336,15 +465,7 @@ export class AIService {
     }];
   }
 
-  // ========== 配置管理 ==========
-
-  private getDefaultConfig(): AIConfig {
-    return {
-      enabled: true, provider: 'openai', apiKey: '',
-      baseUrl: 'https://api.openai.com/v1',
-      model: 'gpt-4o-mini', maxTokens: 4000, temperature: 0.3,
-    };
-  }
+  // ========== 模型配置管理 ==========
 
   /** 密文字段按需解密：数据库里存的永远是 enc:v1: 密文 */
   private decryptSecretIfNeeded(value: string): string {
@@ -353,26 +474,30 @@ export class AIService {
   }
 
   /**
-   * 写配置到 MySQL。
+   * 写一套配置到 MySQL。
    * 写失败必须抛出去：吞掉会让前端看到「已保存」而库里还是旧值，
    * 这是最难查的一类不一致。
    */
-  private async saveConfig(ownerId: string): Promise<void> {
-    const config = await this.ensureConfig(ownerId);
-    const encryptedKey = config.apiKey && !config.apiKey.startsWith(ENCRYPTED_PREFIX)
-      ? this.encryptSecret(config.apiKey)
-      : config.apiKey;
+  private async persistProfile(ownerId: string, profile: AIProfile): Promise<void> {
+    const encryptedKey = profile.apiKey && !profile.apiKey.startsWith(ENCRYPTED_PREFIX)
+      ? this.encryptSecret(profile.apiKey)
+      : profile.apiKey;
     await saveAIConfigRow(ownerId, {
-      id: DEFAULT_AI_CONFIG_ID,
-      label: '默认',
-      enabled: config.enabled,
-      provider: config.provider,
-      baseUrl: config.baseUrl,
-      model: config.model,
+      id: profile.id,
+      label: profile.label || profile.model || profile.id,
+      enabled: profile.enabled,
+      provider: profile.provider,
+      baseUrl: profile.baseUrl,
+      model: profile.model,
       apiKeyEnc: encryptedKey || '',
-      maxTokens: config.maxTokens ?? null,
-      temperature: config.temperature ?? null,
-    });
+      maxTokens: profile.maxTokens ?? null,
+      temperature: profile.temperature ?? null,
+      costTier: profile.costTier,
+      costTierSource: profile.costTierSource || 'manual',
+      priceIn: profile.priceIn ?? null,
+      priceOut: profile.priceOut ?? null,
+      sortOrder: profile.sortOrder,
+    }, profile.id);
   }
 
   private getEncryptionKey(): Buffer {
@@ -414,38 +539,187 @@ export class AIService {
     }
   }
 
-  // ========== 公共配置 API ==========
+  // ========== 公共配置 API（多套模型） ==========
 
   /**
-   * 读取账号自己的 AI 配置。
+   * 列出账号的全部模型配置。
    *
    * apiKey 不做掩码：配置已按账号隔离，读到的必然是调用者本人的 key，
    * 再打一遍码只会让用户没法核对、也没法把 key 复制出来用。
    * 需要遮眼时由前端输入框自己的眼睛开关负责，不影响这里原样下发。
    */
-  async getConfig(ownerId: string): Promise<AIConfig> {
-    return { ...await this.ensureConfig(ownerId) };
+  async listProfiles(ownerId: string): Promise<AIProfile[]> {
+    return (await this.ensureProfiles(ownerId)).map((p) => ({ ...p }));
   }
 
-  async getFullConfig(ownerId: string): Promise<AIConfig> {
-    return this.getConfig(ownerId);
+  /** 新增或更新一套配置；没有 id 视为新增，由服务端生成 */
+  async saveProfile(ownerId: string, input: Partial<AIProfile>): Promise<AIProfile> {
+    const list = await this.ensureProfiles(ownerId);
+    const existing = input.id ? list.find((p) => p.id === input.id) : undefined;
+    if (!existing && list.length >= MAX_PROFILES) {
+      throw new Error(`最多只能配置 ${MAX_PROFILES} 个模型`);
+    }
+    const id = existing?.id || input.id || `p_${crypto.randomBytes(6).toString('hex')}`;
+
+    // 档位归属：请求里带了 costTier 就视为用户手填（前端在「没动过下拉框」时不带这个字段）。
+    // 否则沿用原来的来源，新增的默认 auto —— 让新配置一上手就有依据，
+    // 而不是默默落成默认的 3 档。
+    const costTierSource: 'auto' | 'manual' = input.costTier !== undefined
+      ? 'manual'
+      : (existing?.costTierSource === 'manual' ? 'manual' : 'auto');
+
+    const profile: AIProfile = {
+      id,
+      label: (input.label ?? existing?.label ?? '').trim(),
+      enabled: input.enabled ?? existing?.enabled ?? true,
+      provider: input.provider ?? existing?.provider ?? 'openai',
+      apiKey: input.apiKey ?? existing?.apiKey ?? '',
+      baseUrl: input.baseUrl ?? existing?.baseUrl ?? '',
+      model: input.model ?? existing?.model ?? '',
+      maxTokens: input.maxTokens ?? existing?.maxTokens,
+      temperature: input.temperature ?? existing?.temperature,
+      costTier: clampTier(input.costTier ?? existing?.costTier),
+      costTierSource,
+      priceIn: existing?.priceIn ?? null,
+      priceOut: existing?.priceOut ?? null,
+      sortOrder: input.sortOrder ?? existing?.sortOrder ?? list.length,
+    };
+    if (!profile.model) throw new Error('模型名称不能为空');
+
+    // 手填了档位也要刷新单价：换了模型却沿用旧模型的价格，金额会算错
+    const modelChanged = !!existing && existing.model !== profile.model;
+    if (costTierSource === 'auto' || modelChanged) {
+      const decision = await this.resolveAutoTier(profile, list);
+      if (decision) {
+        profile.priceIn = decision.priceIn;
+        profile.priceOut = decision.priceOut;
+        if (costTierSource === 'auto') profile.costTier = decision.tier;
+      }
+    }
+
+    await this.persistProfile(ownerId, profile);
+
+    // 缓存与 engine 一起更新：不重置的话旧 Key / 旧模型会继续被复用
+    const map = this.profiles.get(ownerId) || new Map<string, AIProfile>();
+    map.set(id, profile);
+    this.profiles.set(ownerId, map);
+    this.resetProviderAndEngine(ownerId, id);
+    return { ...profile };
   }
 
-  async updateConfig(ownerId: string, updates: Partial<AIConfig>): Promise<AIConfig> {
-    // 入参就是完整配置：读取时不再下发掩码值，前端也就不可能把 **** 回传覆盖掉真实 key
-    this.configs.set(ownerId, { ...await this.ensureConfig(ownerId), ...updates });
-    await this.saveConfig(ownerId);
+  /**
+   * 自动定档。必须把「这条 + 账号下其它配置」一起交给分析器：
+   * 档位是相对排位，只看自己一条算不出高低。
+   * 不等待定价目录：保存是用户正在等的操作，目录没缓存就用模型名规则。
+   */
+  private async resolveAutoTier(
+    profile: AIProfile,
+    list: AIProfile[],
+  ): Promise<{ tier: number; priceIn: number | null; priceOut: number | null } | null> {
+    const drafts: CostTierInput[] = [...list.filter((p) => p.id !== profile.id), profile].map((p) => ({
+      id: p.id,
+      label: p.label,
+      provider: p.provider,
+      model: p.model,
+      enabled: p.enabled,
+      costTier: p.costTier,
+      costTierSource: (p.costTierSource || 'auto') as 'auto' | 'manual',
+      priceIn: p.priceIn ?? null,
+      priceOut: p.priceOut ?? null,
+    }));
+    try {
+      const analysis = await analyzeProfiles(drafts, { waitForCatalog: false });
+      return analysis.decisions.find((d) => d.id === profile.id) || null;
+    } catch (error: any) {
+      console.warn(`[AIService] 档位分析失败（${error.message}），保留用户填的值`);
+      return null;
+    }
+  }
+
+  /**
+   * 只体检、不写库：设置页打开时调用。
+   * 与 reanalyzeCosts 的区别是不等定价目录、不落库 —— 打开弹窗不应该
+   * 因为网络慢而卡住。
+   */
+  async checkupCosts(ownerId: string): Promise<CostAnalysisResult> {
+    const list = await this.ensureProfiles(ownerId);
+    const drafts: CostTierInput[] = list.map((p) => ({
+      id: p.id,
+      label: p.label,
+      provider: p.provider,
+      model: p.model,
+      enabled: p.enabled,
+      costTier: p.costTier,
+      costTierSource: (p.costTierSource || 'auto') as 'auto' | 'manual',
+      priceIn: p.priceIn ?? null,
+      priceOut: p.priceOut ?? null,
+    }));
+    return analyzeProfiles(drafts, { waitForCatalog: false });
+  }
+
+  /**
+   * 重算全账号档位与单价：把 auto 来源的全部刷新，manual 的只刷新价格。
+   * 用户主动点「重新分析」时才等待定价目录，这时他就是想要一个准的结果。
+   */
+  async reanalyzeCosts(ownerId: string): Promise<CostAnalysisResult & { profiles: AIProfile[] }> {
+    const list = await this.ensureProfiles(ownerId);
+    const drafts: CostTierInput[] = list.map((p) => ({
+      id: p.id,
+      label: p.label,
+      provider: p.provider,
+      model: p.model,
+      enabled: p.enabled,
+      costTier: p.costTier,
+      costTierSource: (p.costTierSource || 'auto') as 'auto' | 'manual',
+      priceIn: p.priceIn ?? null,
+      priceOut: p.priceOut ?? null,
+    }));
+    const analysis = await analyzeProfiles(drafts, { waitForCatalog: true });
+
+    const updated: AIProfile[] = [];
+    for (const profile of list) {
+      const decision = analysis.decisions.find((d) => d.id === profile.id);
+      if (!decision) continue;
+      const isManual = profile.costTierSource === 'manual';
+      const next: AIProfile = {
+        ...profile,
+        costTier: isManual ? profile.costTier : decision.tier,
+        priceIn: decision.priceIn,
+        priceOut: decision.priceOut,
+      };
+      // 手填档位又没价格变化时不必写库，少一次无意义的 UPDATE
+      if (next.costTier === profile.costTier && next.priceIn === profile.priceIn && next.priceOut === profile.priceOut) {
+        updated.push(next);
+        continue;
+      }
+      await this.persistProfile(ownerId, next);
+      updated.push(next);
+    }
+    const map = new Map<string, AIProfile>();
+    for (const p of updated) map.set(p.id, p);
+    this.profiles.set(ownerId, map);
     this.resetProviderAndEngine(ownerId);
-    return this.getConfig(ownerId);
+    return { ...analysis, profiles: updated.map((p) => ({ ...p })) };
   }
 
-  async testConfig(ownerId: string, config?: Partial<AIConfig>): Promise<{ success: boolean; message: string }> {
-    const testCfg = { ...await this.ensureConfig(ownerId), ...config };
-    if (!testCfg.apiKey) return { success: false, message: 'API Key not configured' };
+  async deleteProfile(ownerId: string, id: string): Promise<void> {
+    if (id === AUTO_MODEL_ID) throw new Error('auto 是内置的虚拟模型，不能删除');
+    await deleteAIConfigRow(ownerId, id);
+    this.profiles.get(ownerId)?.delete(id);
+    this.resetProviderAndEngine(ownerId, id);
+  }
+
+  /** 测试一套配置：可以传还没保存的表单值，不传 id 就是纯试连 */
+  async testProfile(ownerId: string, input?: Partial<AIProfile>): Promise<{ success: boolean; message: string }> {
+    const base = input?.id ? (await this.ensureProfiles(ownerId)).find((p) => p.id === input.id) : undefined;
+    const cfg = { ...(base || {}), ...input } as Partial<AIProfile>;
+    if (!cfg.apiKey) return { success: false, message: 'API Key not configured' };
     try {
       const provider = createLLMProvider({
-        provider: testCfg.provider || 'openai', model: testCfg.model,
-        apiKey: testCfg.apiKey, baseUrl: testCfg.baseUrl,
+        provider: cfg.provider || 'openai',
+        model: cfg.model || '',
+        apiKey: cfg.apiKey,
+        baseUrl: cfg.baseUrl || undefined,
       });
       const ok = await provider.ping();
       return ok
@@ -454,6 +728,28 @@ export class AIService {
     } catch (error: any) {
       return { success: false, message: error.message || 'Connection failed' };
     }
+  }
+
+  // ---- 旧接口兼容：桌面端/VSCode 扩展的旧版本仍可能调 /api/ai/getConfig ----
+
+  async getConfig(ownerId: string): Promise<AIConfig> {
+    const profile = await this.findProfile(ownerId);
+    if (!profile) throw new Error('No AI model configured');
+    return { ...profile };
+  }
+
+  async getFullConfig(ownerId: string): Promise<AIConfig> {
+    return this.getConfig(ownerId);
+  }
+
+  async updateConfig(ownerId: string, updates: Partial<AIConfig>): Promise<AIConfig> {
+    const current = await this.findProfile(ownerId);
+    await this.saveProfile(ownerId, { ...(current || {}), ...updates, id: current?.id || DEFAULT_AI_CONFIG_ID });
+    return this.getConfig(ownerId);
+  }
+
+  async testConfig(ownerId: string, config?: Partial<AIConfig>): Promise<{ success: boolean; message: string }> {
+    return this.testProfile(ownerId, config as Partial<AIProfile>);
   }
 
   // ========== 工具注册 ==========
@@ -654,17 +950,50 @@ export class AIService {
 
   // ========== Agent 核心循环 ==========
 
+  /**
+   * 跑一轮 Agent。
+   *
+   * chatId 与 terminalSessionId 是两件事，不能合并：
+   * - chatId 是对话存储与 engine 上下文的 key（一个对话可以跨终端存在）；
+   * - terminalSessionId 是命令真正要在哪个终端里执行。
+   * 旧实现把两者当同一个用，所以对话无法脱离终端会话存在。
+   */
   async agentRun(
     ownerId: string,
-    sessionId: string,
+    chatId: string,
+    terminalSessionId: string,
     userMessage: string,
     context: string | undefined,
     eventCallback: AgentEventCallback,
-    skillId?: string,
-    locale?: string,
+    opts?: AgentRunOptions,
   ): Promise<void> {
-    const engine = await this.getEngine(ownerId);
-    if (!engine) {
+    const usable = (await this.ensureProfiles(ownerId)).filter((p) => p.enabled && p.apiKey);
+    if (!usable.length) {
+      eventCallback({ type: 'error', error: 'API Key not configured. Please set it in AI settings.' });
+      return;
+    }
+
+    // 预算在「发起这一轮之前」检查：已经开始的对话不会中途被掐断。
+    // 半途中断留下的是说到一半的方案，比多花一点 token 更难收拾。
+    const budget = await this.checkBudget(ownerId, chatId);
+    if (!budget.ok) {
+      eventCallback({ type: 'error', error: budget.message, code: budget.code });
+      return;
+    }
+
+    // 历史只读一次：auto 打分用的「已有工具调用数/历史长度」
+    // 与随后注入 engine 的上下文必须是同一份快照。
+    const savedHistory = (await this.loadChatMessages(ownerId, chatId)) || [];
+    // 指定了具体模型时没有选择余地，不必去查实测统计
+    const usingAuto = !opts?.modelId || opts.modelId === AUTO_MODEL_ID;
+    const health = usingAuto ? await this.loadHealthForRouting(ownerId) : undefined;
+    const { chain, decision } = this.buildModelChain(usable, opts?.modelId, {
+      message: userMessage,
+      context,
+      priorToolCalls: countToolMessages(savedHistory),
+      historyLength: savedHistory.length,
+    }, health);
+    if (!chain.length) {
       eventCallback({ type: 'error', error: 'API Key not configured. Please set it in AI settings.' });
       return;
     }
@@ -672,86 +1001,336 @@ export class AIService {
     // 构建 system prompt 覆盖片段
     let systemPromptOverride = '';
 
-    if (locale) {
+    if (opts?.locale) {
+      const locale = opts.locale;
       const langName = locale.startsWith('zh') ? 'Chinese' : locale.startsWith('ja') ? 'Japanese' : locale.startsWith('ko') ? 'Korean' : 'English';
       systemPromptOverride += `\n\n[User's UI language preference: ${langName} (${locale}). If the user's message language is ambiguous, prefer responding in ${langName}.]`;
     }
 
-    const sysContext = await this.getSessionContext(sessionId);
+    const sysContext = await this.getSessionContext(terminalSessionId);
     if (sysContext && sysContext !== 'Failed to collect system info') {
       systemPromptOverride += `\n\n${sysContext}`;
     }
 
-    if (skillId && this.skillService) {
-      const skill = await this.skillService.getSkill(ownerId, skillId);
+    if (opts?.skillId && this.skillService) {
+      const skill = await this.skillService.getSkill(ownerId, opts.skillId);
       if (skill) {
         systemPromptOverride += `\n\n## Current Task Instructions (Skill: ${skill.name})\n\n${skill.content}`;
       }
     }
 
-    // 加载并注入会话历史
-    const savedHistory = await this.loadChatMessages(ownerId, sessionId);
-    if (savedHistory && savedHistory.length > 0) {
-      engine.setHistory(sessionId, savedHistory);
-    }
-
-    // AbortController 管理
     const ctrl = new AbortController();
-    this.abortControllers.set(this.abortKey(ownerId, sessionId), ctrl);
+    this.abortControllers.set(this.abortKey(ownerId, chatId), ctrl);
 
+    let lastError = '';
     try {
-      // 注入 shell 执行器：新版 agent-core 的内置 execute_command/read_terminal 走
-      // ctx.shell.exec/read，不注入则落到 noop shell（捕不到任何输出）。
-      const shellExecutor = this.buildShellExecutor(sessionId);
-      const eventStream = engine.run({
-        sessionId,
-        message: userMessage,
-        context: context
-          ? { sessionId, terminalOutput: context, custom: { shell: shellExecutor } }
-          : { sessionId, custom: { shell: shellExecutor } },
-        abortSignal: ctrl.signal,
-        systemPromptOverride: systemPromptOverride || undefined,
-        skillId,
-      });
+      for (let attempt = 0; attempt < chain.length; attempt++) {
+        const profile = chain[attempt];
+        const engine = await this.getEngine(ownerId, profile, terminalSessionId);
+        if (!engine) {
+          lastError = `provider unavailable: ${profile.id}`;
+          continue;
+        }
 
-      for await (const coreEvent of eventStream) {
-        const mapped = this.mapCoreEvent(coreEvent);
-        if (mapped) eventCallback(mapped);
+        const modelLabel = profile.label || profile.model || profile.id;
+        const route = decision
+          ? { target: profile.id, tier: decision.tier, score: decision.score, reasons: decision.reasons }
+          : undefined;
+
+        // 先告诉前端这轮用哪个模型：用户能立刻看到「谁在回答」，
+        // 降级时也能看到模型换了，而不是莫名其妙地换了口径。
+        eventCallback({ type: 'model_selected', modelId: profile.id, modelLabel, route });
+        if (attempt > 0) {
+          console.warn(`[AIService] 降级重试 -> ${modelLabel}(${profile.id})，上一轮失败：${lastError}`);
+        }
+
+        engine.setHistory(chatId, savedHistory);
+        let produced = false;
+        try {
+          // 注入 shell 执行器：新版 agent-core 的内置 execute_command/read_terminal 走
+          // ctx.shell.exec/read，不注入则落到 noop shell（捕不到任何输出）。
+          const shellExecutor = this.buildShellExecutor(terminalSessionId);
+          const eventStream = engine.run({
+            sessionId: chatId,
+            message: userMessage,
+            context: context
+              ? { sessionId: chatId, terminalOutput: context, custom: { shell: shellExecutor } }
+              : { sessionId: chatId, custom: { shell: shellExecutor } },
+            abortSignal: ctrl.signal,
+            systemPromptOverride: systemPromptOverride || undefined,
+            skillId: opts?.skillId,
+          });
+
+          for await (const coreEvent of eventStream) {
+            const mapped = this.mapCoreEvent(coreEvent);
+            if (!mapped) continue;
+            if (mapped.type === 'message' || mapped.type === 'tool_call') produced = true;
+            if (mapped.type === 'error') {
+              // 中间档的失败不单独下发：后面可能降级成功，
+              // 否则前端会先弹一个报错又接着正常输出。
+              lastError = mapped.error || 'Agent runtime error';
+              continue;
+            }
+            if (mapped.type === 'done') {
+              mapped.modelId = profile.id;
+              mapped.modelLabel = modelLabel;
+              mapped.route = route;
+              void this.recordUsage(ownerId, profile, chatId, terminalSessionId, mapped.usage, true, !!decision);
+            }
+            eventCallback(mapped);
+          }
+        } catch (error: any) {
+          lastError = error.message || 'Agent runtime error';
+          // 失败也留一条（tokens 为 0）：没有失败记录就无法按实测成功率做路由自适应
+          void this.recordUsage(ownerId, profile, chatId, terminalSessionId, undefined, false, !!decision);
+        }
+
+        // 每轮结束都存上下文：降级重试时下一档能接着用刚才的历史
+        try {
+          const snapshot = engine.getHistorySnapshot(chatId);
+          if (snapshot && snapshot.length > 0) await this.saveChatMessages(ownerId, chatId, snapshot);
+        } catch { /* ignore */ }
+
+        // 已经产生输出就不换模型重试：重跑会让用户看到两套答案
+        if (produced) return;
+        if (ctrl.signal.aborted) return;
       }
-    } catch (error: any) {
-      eventCallback({ type: 'error', error: error.message || 'Agent runtime error' });
+
+      eventCallback({ type: 'error', error: lastError || 'All models are unavailable, please check AI settings.' });
     } finally {
-      this.abortControllers.delete(this.abortKey(ownerId, sessionId));
-      // 持久化 LLM 上下文消息
-      try {
-        const snapshot = engine.getHistorySnapshot(sessionId);
-        if (snapshot && snapshot.length > 0) await this.saveChatMessages(ownerId, sessionId, snapshot);
-      } catch { /* ignore */ }
+      this.abortControllers.delete(this.abortKey(ownerId, chatId));
     }
   }
 
-  private abortKey(ownerId: string, sessionId: string): string {
-    return `${ownerId}:${sessionId}`;
+  /**
+   * 选模型链：显式指定就只用它；auto（或指定了不可用模型）就按复杂度排序，
+   * 后面的位置是降级候选。
+   */
+  private buildModelChain(
+    usable: AIProfile[],
+    requested: string | undefined,
+    input: AutoRouteInput,
+    health?: Map<string, ModelHealthStat>,
+  ): { chain: AIProfile[]; decision?: AutoRouteDecision } {
+    if (requested && requested !== AUTO_MODEL_ID) {
+      const picked = usable.find((p) => p.id === requested);
+      // 指定了已禁用/已删除的模型：退回 auto，总比直接报错强
+      if (picked) return { chain: [picked] };
+      console.warn(`[AIService] 指定的模型不可用（${requested}），回退到 auto`);
+    }
+
+    const decision = scoreTaskComplexity(input);
+    const chain = rankProfilesForTier(usable, decision.tier, health).slice(0, MAX_AUTO_ATTEMPTS);
+    console.log(`[AIService] auto 选型 ${describeAutoRoute(decision, chain[0])}`);
+    return { chain, decision };
   }
 
-  stopAgent(ownerId: string, sessionId: string): boolean {
-    const ctrl = this.abortControllers.get(this.abortKey(ownerId, sessionId));
-    if (ctrl) {
-      ctrl.abort();
-      this.engines.get(ownerId)?.abort(sessionId);
-      return true;
+  /**
+   * 路由自适应的输入：近 7 天的成功率。
+   * 查不到就当没有 —— 没统计历史不该让对话报错。
+   */
+  private async loadHealthForRouting(ownerId: string): Promise<Map<string, ModelHealthStat> | undefined> {
+    try {
+      const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      const rows = await loadModelHealth(ownerId, since);
+      return new Map(rows.map((row) => [row.modelId, { calls: row.calls, okCalls: row.okCalls }]));
+    } catch (error: any) {
+      console.warn(`[AIService] 模型健康度读取失败（${error.message}），本轮按档位排序`);
+      return undefined;
     }
-    return false;
+  }
+
+  private abortKey(ownerId: string, chatId: string): string {
+    return `${ownerId}:${chatId}`;
+  }
+
+  // ========== 成本与预算 ==========
+
+  /**
+   * 发起一轮前的预算检查。
+   * 返回 code 而不是拼好的多语言文案：前端要能按自己的语言提示。
+   */
+  private async checkBudget(
+    ownerId: string,
+    chatId: string,
+  ): Promise<{ ok: boolean; message?: string; code?: string }> {
+    let budget: AIBudgetRow;
+    try {
+      budget = await loadBudgetRow(ownerId);
+    } catch (error: any) {
+      // 读不到预算就不拦：预算表出问题不该让整个 AI 功能停摆
+      console.warn(`[AIService] 预算读取失败（${error.message}），本轮不限额`);
+      return { ok: true };
+    }
+    if (!budget.chatTokenLimit && !budget.dailyTokenLimit && !budget.dailyCostLimit) return { ok: true };
+
+    if (budget.chatTokenLimit) {
+      const used = await sumUsage(ownerId, { chatId });
+      if (used.totalTokens >= budget.chatTokenLimit) {
+        return {
+          ok: false,
+          code: 'chat-token-limit',
+          message: `Chat token limit reached (${used.totalTokens}/${budget.chatTokenLimit}). Start a new chat or raise the budget.`,
+        };
+      }
+    }
+    if (budget.dailyTokenLimit || budget.dailyCostLimit) {
+      const today = await sumUsage(ownerId, { since: startOfToday() });
+      if (budget.dailyTokenLimit && today.totalTokens >= budget.dailyTokenLimit) {
+        return {
+          ok: false,
+          code: 'daily-token-limit',
+          message: `Daily token limit reached (${today.totalTokens}/${budget.dailyTokenLimit}).`,
+        };
+      }
+      if (budget.dailyCostLimit && today.costUsd >= budget.dailyCostLimit) {
+        return {
+          ok: false,
+          code: 'daily-cost-limit',
+          message: `Daily cost limit reached ($${today.costUsd.toFixed(4)}/$${budget.dailyCostLimit}).`,
+        };
+      }
+    }
+    return { ok: true };
+  }
+
+  /**
+   * 取一份带单价的配置视图。
+   * 保存时若定价目录还没加载完，落库的 price 是 null；直接拿它算金额会把
+   * 这一轮记成 0 美元，面板上的花费与「省了多少」都会失真。所以现查一次
+   * 目录兑底——目录已在进程内存里，不产生网络请求。
+   */
+  private pricedProfile(profile: AIProfile): AIProfile {
+    if (profile.priceIn != null && profile.priceOut != null) return profile;
+    const live = lookupPrice(profile.provider, profile.model);
+    if (!live) return profile;
+    return { ...profile, priceIn: live.inputPerM, priceOut: live.outputPerM };
+  }
+
+  /**
+   * 记一笔用量。任何异常都吞掉：记账失败不该让对话本身失败。
+   * 成功的调用若没拿到 usage 就不记 —— 0 token 的记录会拉低均值。
+   */
+  private async recordUsage(
+    ownerId: string,
+    profile: AIProfile,
+    chatId: string,
+    terminalSessionId: string,
+    usage: AgentEvent['usage'],
+    ok: boolean,
+    autoRouted: boolean,
+  ): Promise<void> {
+    try {
+      const promptTokens = usage?.promptTokens || 0;
+      const completionTokens = usage?.completionTokens || 0;
+      const totalTokens = usage?.totalTokens || promptTokens + completionTokens;
+      if (ok && !totalTokens) return;
+      const connectionId = this.sshService?.getSession(terminalSessionId)?.connectionId || '';
+      await insertUsageRow(ownerId, {
+        chatId,
+        connectionId,
+        modelId: profile.id,
+        modelLabel: profile.label || profile.model || profile.id,
+        autoRouted,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        costUsd: estimateCostUsd({ promptTokens, completionTokens }, this.pricedProfile(profile)),
+        ok,
+      });
+    } catch (error: any) {
+      console.warn(`[AIService] 用量写入失败：${error.message}`);
+    }
+  }
+
+  async getBudget(ownerId: string): Promise<AIBudgetRow> {
+    return loadBudgetRow(ownerId);
+  }
+
+  async updateBudget(ownerId: string, patch: Partial<AIBudgetRow>): Promise<AIBudgetRow> {
+    const saved = await saveBudgetRow(ownerId, patch);
+    return saved;
+  }
+
+  /** 成本洞察：今天是花得多了还是少了、钱都花在哪个模型上、auto 到底省了多少 */
+  async getCostInsights(ownerId: string, opts?: { chatId?: string }): Promise<{
+    today: UsageTotals;
+    chat: UsageTotals | null;
+    byModel: Array<{ modelId: string; modelLabel: string; calls: number; totalTokens: number; costUsd: number }>;
+    budget: AIBudgetRow;
+    baselineModel: { id: string; label: string; priceIn: number; priceOut: number } | null;
+    savedUsd: number | null;
+    partial: boolean;
+  }> {
+    const todayStart = startOfToday();
+    const [today, chat, byModel, budget, profiles] = await Promise.all([
+      sumUsage(ownerId, { since: todayStart }),
+      opts?.chatId ? sumUsage(ownerId, { chatId: opts.chatId }) : Promise.resolve(null),
+      groupUsageByModel(ownerId, todayStart),
+      loadBudgetRow(ownerId),
+      this.ensureProfiles(ownerId),
+    ]);
+
+    // 参照基准：手头上最贵的那个模型。auto 省的金额 =
+    // 「同样这些 token 全用最贵的模型要花多少」- 「实际花了多少」。
+    const priced = profiles
+      .map((p) => this.pricedProfile(p))
+      .filter((p) => p.priceIn != null && p.priceOut != null)
+      .sort((a, b) => (b.priceIn! + b.priceOut!) - (a.priceIn! + a.priceOut!));
+    const baseline = priced[0] || null;
+    let savedUsd: number | null = null;
+    if (baseline && today.calls > 0) {
+      const hypothetical = (today.promptTokens * baseline.priceIn! + today.completionTokens * baseline.priceOut!) / 1e6;
+      // 保留 6 位：浮点尾巴会跟着算出来的金额一路传到界面上
+      savedUsd = Math.round(Math.max(0, hypothetical - today.costUsd) * 1e6) / 1e6;
+    }
+
+    return {
+      today,
+      chat,
+      byModel,
+      budget,
+      baselineModel: baseline
+        ? { id: baseline.id, label: baseline.label || baseline.model, priceIn: baseline.priceIn!, priceOut: baseline.priceOut! }
+        : null,
+      savedUsd,
+      // 有调用查不到单价时金额被低估，界面要说明「部分金额未知」
+      partial: today.unknownCostCalls > 0,
+    };
+  }
+
+  stopAgent(ownerId: string, chatId: string): boolean {
+    const ctrl = this.abortControllers.get(this.abortKey(ownerId, chatId));
+    if (!ctrl) return false;
+    ctrl.abort();
+    // engine 的缓存 key 带模型和终端会话，这里按「以 chatId 结尾」找回来
+    const prefix = `${ownerId}:`;
+    for (const [key, engine] of this.engines) {
+      if (key.startsWith(prefix) && key.endsWith(`:${chatId}`)) engine.abort(chatId);
+    }
+    return true;
   }
 
   // ========== 非 Agent 对话 ==========
 
-  async chat(ownerId: string, sessionId: string, userMessage: string, context?: string): Promise<string> {
-    const provider = await this.ensureLLMProvider(ownerId);
-    if (!provider) throw new Error('API Key not configured. Please set it in AI settings.');
-    const config = await this.ensureConfig(ownerId);
+  /** 不带工具的一次性问答：默认用当前最便宜的可用模型 */
+  private async resolveProfile(ownerId: string, modelId?: string): Promise<AIProfile | undefined> {
+    const usable = (await this.ensureProfiles(ownerId)).filter((p) => p.enabled && p.apiKey);
+    if (!usable.length) return undefined;
+    if (modelId && modelId !== AUTO_MODEL_ID) {
+      const picked = usable.find((p) => p.id === modelId);
+      if (picked) return picked;
+    }
+    return rankProfilesForTier(usable, 1)[0] || usable[0];
+  }
 
-    const history = (await this.loadChatMessages(ownerId, sessionId)) || [];
+  async chat(ownerId: string, chatId: string, userMessage: string, context?: string, modelId?: string): Promise<string> {
+    const profile = await this.resolveProfile(ownerId, modelId);
+    if (!profile) throw new Error('API Key not configured. Please set it in AI settings.');
+    const provider = await this.ensureLLMProvider(ownerId, profile);
+    if (!provider) throw new Error('API Key not configured. Please set it in AI settings.');
+
+    const history = (await this.loadChatMessages(ownerId, chatId)) || [];
     const messages: Message[] = [{ role: 'system', content: AGENT_SYSTEM_PROMPT }];
     if (context) messages.push({ role: 'system', content: `Recent terminal output:\n\`\`\`\n${context}\n\`\`\`` });
     messages.push(...history);
@@ -761,14 +1340,14 @@ export class AIService {
     try {
       const response = await provider.chat({
         messages,
-        maxTokens: config.maxTokens,
-        temperature: config.temperature,
+        maxTokens: profile.maxTokens,
+        temperature: profile.temperature,
       });
       const content = response.choices?.[0]?.message?.content;
       if (content) {
         const textContent = extractTextFromContent(content);
         history.push({ role: 'assistant', content: textContent });
-        await this.saveChatMessages(ownerId, sessionId, history);
+        await this.saveChatMessages(ownerId, chatId, history);
         return textContent;
       }
       throw new Error('AI response is empty');
@@ -780,15 +1359,17 @@ export class AIService {
 
   async *chatStream(
     ownerId: string,
-    sessionId: string,
+    chatId: string,
     userMessage: string,
     context?: string,
+    modelId?: string,
   ): AsyncGenerator<string, void, unknown> {
-    const provider = await this.ensureLLMProvider(ownerId);
+    const profile = await this.resolveProfile(ownerId, modelId);
+    if (!profile) throw new Error('API Key not configured. Please set it in AI settings.');
+    const provider = await this.ensureLLMProvider(ownerId, profile);
     if (!provider) throw new Error('API Key not configured. Please set it in AI settings.');
-    const config = await this.ensureConfig(ownerId);
 
-    const history = (await this.loadChatMessages(ownerId, sessionId)) || [];
+    const history = (await this.loadChatMessages(ownerId, chatId)) || [];
     const messages: Message[] = [{ role: 'system', content: AGENT_SYSTEM_PROMPT }];
     if (context) messages.push({ role: 'system', content: `Recent terminal output:\n\`\`\`\n${context}\n\`\`\`` });
     messages.push(...history);
@@ -799,8 +1380,8 @@ export class AIService {
     try {
       const stream = provider.chatStream({
         messages,
-        maxTokens: config.maxTokens,
-        temperature: config.temperature,
+        maxTokens: profile.maxTokens,
+        temperature: profile.temperature,
       });
       for await (const chunk of stream) {
         const content = chunk.delta?.content;
@@ -812,7 +1393,7 @@ export class AIService {
       }
       if (fullResponse) {
         history.push({ role: 'assistant', content: fullResponse });
-        await this.saveChatMessages(ownerId, sessionId, history);
+        await this.saveChatMessages(ownerId, chatId, history);
       }
     } catch (error: any) {
       history.pop();
@@ -828,7 +1409,11 @@ export class AIService {
       deleteHistory(ownerId, sessionId),
       deleteChatMessagesRow(ownerId, sessionId),
     ]);
-    this.engines.get(ownerId)?.setHistory(sessionId, []);
+    // engine 按「owner:model:terminal」分桶存放，同一对话可能命中多个桶，全扫一遍比记 key 可靠
+    const prefix = `${ownerId}:`;
+    for (const [key, engine] of this.engines) {
+      if (key.startsWith(prefix) && key.endsWith(`:${sessionId}`)) engine.setHistory(sessionId, []);
+    }
   }
 
   async getHistory(ownerId: string, sessionId: string): Promise<Message[] | null> {
@@ -855,20 +1440,97 @@ export class AIService {
     }
   }
 
+  // ========== 对话窗口（与连接绑定） ==========
+
+  private toChatMeta(row: AIChatRow): AIChatMeta {
+    return {
+      id: row.id,
+      connectionId: row.connectionId,
+      title: row.title,
+      modelId: row.modelId,
+      messageCount: row.messageCount,
+      preview: row.preview,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    };
+  }
+
+  async listChats(ownerId: string, connectionId?: string): Promise<AIChatMeta[]> {
+    const rows = await listChatRows(ownerId, connectionId);
+    const metas = rows.map((row) => this.toChatMeta(row));
+    // 一次聚合查回全部对话的用量，避免列表页对每条对话各发一次查询
+    try {
+      const usage = await groupUsageByChat(ownerId, metas.map((m) => m.id));
+      for (const meta of metas) {
+        const found = usage.get(meta.id);
+        meta.totalTokens = found?.totalTokens || 0;
+        meta.costUsd = found?.costUsd || 0;
+      }
+    } catch (error: any) {
+      // 用量查不到不影响列表本身
+      console.warn(`[AIService] 对话用量汇总失败：${error.message}`);
+    }
+    return metas;
+  }
+
+  async getChat(ownerId: string, chatId: string): Promise<AIChatMeta | null> {
+    const row = await loadChatRow(ownerId, chatId);
+    return row ? this.toChatMeta(row) : null;
+  }
+
+  async createChat(ownerId: string, input?: { connectionId?: string; title?: string; modelId?: string }): Promise<AIChatMeta> {
+    const id = `chat_${Date.now().toString(36)}_${crypto.randomBytes(4).toString('hex')}`;
+    await insertChatRow(ownerId, {
+      id,
+      connectionId: input?.connectionId || '',
+      title: (input?.title || '').trim(),
+      modelId: input?.modelId || AUTO_MODEL_ID,
+    });
+    const row = await loadChatRow(ownerId, id);
+    if (!row) throw new Error('创建对话失败');
+    return this.toChatMeta(row);
+  }
+
+  async updateChat(ownerId: string, chatId: string, patch: { title?: string; modelId?: string }): Promise<AIChatMeta> {
+    await updateChatRow(ownerId, chatId, patch);
+    const row = await loadChatRow(ownerId, chatId);
+    if (!row) throw new Error('对话不存在');
+    return this.toChatMeta(row);
+  }
+
+  /** 删对话要连带消息体：否则 ai_history / ai_messages 会留下永远读不到的孤儿行 */
+  async deleteChat(ownerId: string, chatId: string): Promise<void> {
+    await deleteChatRow(ownerId, chatId);
+    await this.clearHistory(ownerId, chatId);
+    // 用量也一并清掉：否则今日/单对话预算里会永久挂着一笔查不到来源的账
+    await deleteUsageByChat(ownerId, chatId).catch(() => undefined);
+  }
+
   // ========== 对话历史持久化（前端显示） ==========
 
-  async saveDisplayHistory(ownerId: string, sessionId: string, displayMessages: DisplayMessage[], sessionName?: string): Promise<void> {
+  async saveDisplayHistory(ownerId: string, chatId: string, displayMessages: DisplayMessage[], sessionName?: string): Promise<void> {
     try {
       const firstUser = displayMessages.find(m => m.role === 'user');
       await saveHistory({
         ownerId,
-        sessionId,
+        sessionId: chatId,
         sessionName,
         messageCount: displayMessages.length,
         preview: (firstUser?.content || '').substring(0, 80),
         messages: displayMessages,
         savedAt: Date.now(),
       });
+
+      // 列表页只读 ai_chats，摘要/条数必须同步过去；
+      // 标题还空着就取首条用户消息（跟聊天软件的习惯一致，用户可随时改名）
+      const row = await loadChatRow(ownerId, chatId);
+      if (row) {
+        await updateChatRow(ownerId, chatId, {
+          messageCount: displayMessages.length,
+          preview: (firstUser?.content || '').substring(0, 80),
+          title: row.title || (firstUser?.content || '').substring(0, 40),
+        });
+      }
     } catch (error) { console.error('[AIService] Failed to save display history:', error); }
   }
 

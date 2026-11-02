@@ -121,16 +121,17 @@ onBeforeUnmount(() => document.removeEventListener('click', closeOnOutside));
 .account-trigger {
   display: flex;
   align-items: center;
-  gap: 5px;
-  max-width: 130px;
+  gap: 6px;
+  height: 22px;
+  max-width: 140px;
   background: none;
   border: 1px solid var(--border-color);
   color: var(--text-secondary);
-  padding: 2px 6px;
+  padding: 0 8px;
   border-radius: 4px;
-  font-size: 11px;
+  font-size: 12px;
   cursor: pointer;
-  line-height: 1.2;
+  line-height: 1;
 }
 
 .account-trigger:hover {
@@ -139,7 +140,7 @@ onBeforeUnmount(() => document.removeEventListener('click', closeOnOutside));
 }
 
 .account-name {
-  max-width: 88px;
+  max-width: 96px;
 }
 
 .account-panel {

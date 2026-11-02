@@ -39,6 +39,8 @@ export interface AuditQueryRow {
   sessionId?: string;
   keyword?: string;
   status?: string;
+  /** 工具名精确过滤：管理员看「只含文件传输」的流水时用 */
+  tool?: string;
   limit?: number;
   offset?: number;
 }
@@ -102,6 +104,10 @@ function buildWhere(q: AuditQueryRow): { sql: string; params: any[] } {
   if (q.status) {
     clauses.push('status = ?');
     params.push(q.status);
+  }
+  if (q.tool) {
+    clauses.push('tool = ?');
+    params.push(q.tool);
   }
   if (q.keyword) {
     const like = `%${q.keyword}%`;

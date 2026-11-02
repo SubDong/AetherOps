@@ -16,11 +16,11 @@ export type UserStatus = 'pending' | 'active' | 'disabled';
 
 /** 与 server/model/user.entity.ts 的 UserPermissions 一一对应 */
 export type PermissionKey =
-  | 'terminal' | 'ai' | 'connections' | 'aiConfig' | 'files'
+  | 'terminal' | 'batch' | 'ai' | 'connections' | 'aiConfig' | 'files'
   | 'monitor' | 'audit' | 'skills' | 'snippets';
 
 export const PERMISSION_KEYS: PermissionKey[] = [
-  'terminal', 'ai', 'connections', 'aiConfig', 'files',
+  'terminal', 'batch', 'ai', 'connections', 'aiConfig', 'files',
   'monitor', 'audit', 'skills', 'snippets',
 ];
 

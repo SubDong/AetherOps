@@ -15,6 +15,8 @@ export type UserStatus = 'pending' | 'active' | 'disabled';
 export interface UserPermissions {
   /** 终端：SSH / 本地 Shell */
   terminal: boolean;
+  /** 批量操作：一次向多台主机并行下发同一条命令 */
+  batch: boolean;
   /** AI 对话与 Agent */
   ai: boolean;
   /** 自行增删改连接 */
@@ -42,6 +44,7 @@ export type PermissionKey = keyof UserPermissions;
  */
 export const PERMISSION_COLUMNS: Record<PermissionKey, string> = {
   terminal: 'can_use_terminal',
+  batch: 'can_use_batch',
   ai: 'can_use_ai',
   connections: 'can_manage_connections',
   aiConfig: 'can_configure_ai',
@@ -58,6 +61,7 @@ export const PERMISSION_KEYS = Object.keys(PERMISSION_COLUMNS) as PermissionKey[
 export function emptyPermissions(): UserPermissions {
   return {
     terminal: false,
+    batch: false,
     ai: false,
     connections: false,
     aiConfig: false,
@@ -72,6 +76,7 @@ export function emptyPermissions(): UserPermissions {
 export function fullPermissions(): UserPermissions {
   return {
     terminal: true,
+    batch: true,
     ai: true,
     connections: true,
     aiConfig: true,

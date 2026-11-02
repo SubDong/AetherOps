@@ -35,6 +35,8 @@ export interface AuditQuery {
   sessionId?: string;
   keyword?: string;
   status?: string;
+  /** 只看某一类工具（如 file-transfer）；管理员开成员传输记录时用 */
+  tool?: string;
   limit?: number;
   offset?: number;
 }
@@ -59,7 +61,10 @@ export interface AuditStats {
  * keyword / status / sessionId 现在可以做真正的跨日过滤与分页。
  *
  * 账号隔离：除 init() 的保留期清理（全局策略）外，所有方法第一个参数都是 ownerId，
- * 不提供「不带 owner 的全局查询」——管理员也没有看别人数据的口子。
+ * 服务层自己不提供「不带 owner 的全局查询」。
+ * 唯一的例外在路由层：管理员代管端点（/api/admin/*）先把 role 校成 admin，
+ * 再把目标账号的 id 当 ownerId 传进来——换句话说「看谁的数」这个决定只能在入口做一次，
+ * 不能下沉到服务层让它去猜调用方是谁。
  */
 export class AuditService {
   private retentionDays: number = 30;
@@ -113,6 +118,7 @@ export class AuditService {
       sessionId: query.sessionId,
       keyword: query.keyword,
       status: query.status,
+      tool: query.tool,
       limit: query.limit || 100,
       offset: query.offset || 0,
     });

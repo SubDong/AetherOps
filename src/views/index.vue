@@ -5,6 +5,11 @@
       :connections="store.connections"
       :loading="store.loading"
       :collapsed="store.sidebarCollapsed"
+      :server-status-visible="serverStatusDocked"
+      :server-session-id="serverStatusSessionId"
+      :server-connection-name="serverStatusSessionName"
+      @close-server-status="closeServerStatus"
+      @float-server-status="floatServerStatus"
       @connect="handleConnect"
       @add-connection="openEditor()"
       @edit-connection="openEditor"
@@ -75,7 +80,9 @@
               :tabId="tab.id"
               :connection="getConnection(tab.connectionId)"
               :active="tab.id === store.activeTabId"
+              :serverStatusOpen="showServerStatus"
               @status-change="(s, sid) => handleStatusChange(tab.id, s, sid)"
+              @toggle-server-status="toggleServerStatus"
               @open-ai-settings="openAISettings"
             />
           </div>
@@ -106,8 +113,15 @@
 
     <!-- 批量操作面板 -->
     <div v-if="showBatchPanel" class="batch-modal-overlay" @click.self="showBatchPanel = false">
-      <div class="batch-modal">
-        <div class="batch-modal-header">
+      <div class="batch-modal" ref="batchModalRef" :style="batchDragStyle">
+        <div
+          class="batch-modal-header"
+          :class="{ 'is-dragging': batchDragging }"
+          @pointerdown="onBatchDragStart"
+          @pointermove="onBatchDragMove"
+          @pointerup="onBatchDragEnd"
+          @pointercancel="onBatchDragEnd"
+        >
           <h4><i class="bi bi-hdd-rack"></i> {{ t('batch.title') }}</h4>
           <button class="btn-close-modal" @click="showBatchPanel = false">
             <i class="bi bi-x-lg"></i>
@@ -118,6 +132,29 @@
         </div>
       </div>
     </div>
+
+    <!-- 服务器状态悬浮窗：从左侧边栏脱出来后独立成板块，可以在整个页面里拖 -->
+    <Teleport to="body">
+      <div
+        v-if="viewActive && showServerStatus && serverStatusFloating"
+        ref="serverStatusFloatRef"
+        class="server-status-float"
+        :class="{ 'is-dragging': serverStatusFloatDragging }"
+        :style="[serverStatusFloatStyle, { visibility: serverStatusFloatPlaced ? 'visible' : 'hidden' }]"
+        @pointerdown="onServerStatusFloatDown"
+        @pointermove="onServerStatusFloatMove"
+        @pointerup="onServerStatusFloatUp"
+        @pointercancel="onServerStatusFloatUp"
+      >
+        <ServerStatusPanel
+          floating
+          :sessionId="serverStatusSessionId"
+          :connectionName="serverStatusSessionName"
+          @close="closeServerStatus"
+          @toggle-float="dockServerStatus"
+        />
+      </div>
+    </Teleport>
 
     <!-- Tab 右键菜单 -->
     <div
@@ -147,7 +184,7 @@
 </template>
 
 <script lang="ts" setup>
-import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue';
+import { ref, computed, onMounted, onActivated, onDeactivated, onBeforeUnmount, nextTick, watch } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { subscribe, unsubscribe } from '@/base/eventBus';
 import { useTerminalStore } from '@/stores/terminal';
@@ -157,8 +194,14 @@ import TerminalTabComp from '@/components/terminal-tab.vue';
 import ConnectionEditor from '@/components/connection-editor/index.vue';
 import AISettings from '@/components/ai-settings/index.vue';
 import BatchPanel from '@/components/batch-panel/index.vue';
+import ServerStatusPanel from '@/components/server-status/index.vue';
+import { useDraggableDialog, useDraggableFloating } from '@/utils/draggable';
 import type { ConnectionEntity, TerminalTab as TerminalTabType } from '@/typings/connection';
 import { hasPermission, isPending } from '@/utils/auth';
+
+// 终端页在路由之间要保活（见 App.vue 的 keep-alive include）：
+// 去账号管理再回来不能把已经连着的终端全部重建一遍
+defineOptions({ name: 'TerminalView' });
 
 const { t } = useI18n();
 
@@ -172,6 +215,114 @@ const connectionEditorRef = ref<InstanceType<typeof ConnectionEditor>>();
 const aiSettingsRef = ref<InstanceType<typeof AISettings>>();
 const batchPanelRef = ref<InstanceType<typeof BatchPanel>>();
 const showBatchPanel = ref(false);
+const batchModalRef = ref<HTMLElement | null>(null);
+const {
+  dragging: batchDragging,
+  dragStyle: batchDragStyle,
+  onPointerDown: onBatchDragStart,
+  onPointerMove: onBatchDragMove,
+  onPointerUp: onBatchDragEnd,
+  resetDrag: resetBatchDrag,
+} = useDraggableDialog(batchModalRef);
+// 每次重新打开都回到居中，不记住上次拖到的位置
+watch(showBatchPanel, (open) => { if (open) resetBatchDrag(); });
+
+// ========== 服务器状态面板 ==========
+
+/** 面板是否展开（由终端工具栏的仪表盘按钮开关） */
+const showServerStatus = ref(false);
+/** 本页是否在前台（keep-alive 让页面没被销毁，只能自己记住这点） */
+const viewActive = ref(true);
+/** 悬浮态：从侧边栏脱出来，变成可以在整页里拖动的小窗口 */
+const serverStatusFloating = ref(false);
+const {
+  elRef: serverStatusFloatRef,
+  placed: serverStatusFloatPlaced,
+  dragging: serverStatusFloatDragging,
+  dragStyle: serverStatusFloatStyle,
+  place: placeServerStatusFloat,
+  reset: resetServerStatusFloat,
+  onPointerDown: onServerStatusFloatPointerDown,
+  onPointerMove: onServerStatusFloatMove,
+  onPointerUp: onServerStatusFloatUp,
+} = useDraggableFloating({ margin: 8 });
+
+/** 停靠态：只有「开着且没悬浮」时才占用侧边栏那一块地方 */
+const serverStatusDocked = computed(() => showServerStatus.value && !serverStatusFloating.value);
+/** 面板永远监控「当前活动 tab」的那台机器，切 tab 自动跟着换 */
+const activeTab = computed(() => store.tabs.find((tab) => tab.id === store.activeTabId));
+const activeSessionId = computed(() => activeTab.value?.sessionId || '');
+const activeTabName = computed(() => activeTab.value?.connectionName || '');
+
+/**
+ * 最近一个真的连上过的会话。「正在连接」的 tab 还没有 sessionId，
+ * 此时面板不能跟着清空，否则切过去再切回来面板就成了空的。
+ */
+const lastServerSessionId = ref('');
+const lastServerSessionName = ref('');
+watch([activeSessionId, activeTabName], ([sessionId, name]) => {
+  if (!sessionId) return;
+  lastServerSessionId.value = sessionId;
+  lastServerSessionName.value = name;
+}, { immediate: true });
+
+/** 面板用「当前会话，否则用记下的那个」 */
+const serverStatusSessionId = computed(() => activeSessionId.value || lastServerSessionId.value);
+const serverStatusSessionName = computed(
+  () => (activeSessionId.value ? activeTabName.value : lastServerSessionName.value) || '',
+);
+
+function toggleServerStatus() {
+  if (showServerStatus.value) {
+    closeServerStatus();
+    return;
+  }
+  // 侧边栏收起时点按钮，先把侧边栏展开，否则面板开了也看不见
+  if (store.sidebarCollapsed) store.toggleSidebar();
+  showServerStatus.value = true;
+}
+
+function closeServerStatus() {
+  showServerStatus.value = false;
+  serverStatusFloating.value = false;
+  resetServerStatusFloat();
+}
+
+/** 停靠 → 悬浮：默认落在右上角，避开终端工具栏那一列按钮 */
+function floatServerStatus() {
+  serverStatusFloating.value = true;
+  nextTick(() => {
+    const width = serverStatusFloatRef.value?.offsetWidth || 340;
+    placeServerStatusFloat(window.innerWidth - width - 24, 88);
+  });
+}
+
+/** 悬浮 → 停靠：回侧边栏；侧边栏收着就先展开 */
+function dockServerStatus() {
+  serverStatusFloating.value = false;
+  resetServerStatusFloat();
+  if (store.sidebarCollapsed) store.toggleSidebar();
+}
+
+/** 只有标题栏能吃拖动，面板正文要留给滚动与选文本 */
+function onServerStatusFloatDown(e: PointerEvent) {
+  if (!(e.target as HTMLElement | null)?.closest?.('.ss-header')) return;
+  onServerStatusFloatPointerDown(e);
+}
+
+// 终端全部关掉后没有可监控的会话，面板不该继续挂着；
+// 只是切到一个还在连接的 tab（sessionId 为空）不算，那种情况要保持面板可见
+watch(() => store.tabs.length, (count) => {
+  if (count === 0) {
+    closeServerStatus();
+    return;
+  }
+  // 记下的会话所属 tab 已经被关掉：别再拿着一个不存在的会话去轮询
+  if (lastServerSessionId.value && !store.tabs.some((tab) => tab.sessionId === lastServerSessionId.value)) {
+    lastServerSessionId.value = '';
+    lastServerSessionName.value = '';
+  }
+});
 
 // Tab 重命名状态
 const editingTabId = ref<string | null>(null);
@@ -390,6 +541,23 @@ onMounted(async () => {
   menuNewConnSubId = subscribe('MENU_NEW_CONNECTION', () => {
     openEditor();
   });
+});
+
+/**
+ * 从账号管理等路由保活回来：xterm 实例还在，但卸载期间容器尺寸为 0，
+ * 重新挂回 DOM 后必须重新量一次，否则字符会挤在左上角。
+ */
+onActivated(() => {
+  viewActive.value = true;
+  nextTick(() => {
+    termRefs.forEach((ref) => ref?.fit?.());
+    if (store.activeTabId) termRefs.get(store.activeTabId)?.focus?.();
+  });
+});
+
+/** Teleport 到 body 的悬浮窗不会被 keep-alive 一起移走，离开页面得先收起来 */
+onDeactivated(() => {
+  viewActive.value = false;
 });
 
 onBeforeUnmount(() => {
@@ -629,6 +797,38 @@ async function restoreOrCreateTabs() {
   color: var(--success);
 }
 
+/* 服务器状态悬浮窗：从侧边栏脱出来的独立板块，整页可拖 */
+.server-status-float {
+  position: fixed;
+  z-index: 1040;
+  width: 340px;
+  height: 470px;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background-color: var(--bg-sidebar, var(--bg-dark));
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.45);
+}
+
+.server-status-float.is-dragging {
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.55);
+  opacity: 0.96;
+}
+
+/* 只有标题栏是拖拽把手，面板内容里的滚动和点击照旧 */
+.server-status-float :deep(.ss-header) {
+  cursor: grab;
+  user-select: none;
+}
+
+.server-status-float.is-dragging :deep(.ss-header) {
+  cursor: grabbing;
+}
+
 /* 批量操作模态框 */
 .batch-modal-overlay {
   position: fixed;
@@ -643,6 +843,8 @@ async function restoreOrCreateTabs() {
   justify-content: center;
 }
 .batch-modal {
+  /* 拖拽靠 left/top 偏移实现，必须定位了才生效 */
+  position: relative;
   width: 700px;
   max-width: 90vw;
   height: 600px;
@@ -656,6 +858,7 @@ async function restoreOrCreateTabs() {
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
 }
 .batch-modal-header {
+  cursor: grab;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -671,6 +874,8 @@ async function restoreOrCreateTabs() {
   align-items: center;
   gap: 8px;
 }
+/* 拖动中换成抓紧的手，和通用弹窗保持一致 */
+.batch-modal-header.is-dragging { cursor: grabbing; }
 .batch-modal-header h4 i { color: var(--accent); }
 .btn-close-modal {
   background: none;

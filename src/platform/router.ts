@@ -17,7 +17,7 @@ export const router = createRouter({
             path: '/users',
             name: 'users',
             component: () => import('@/views/users.vue'),
-            // 管理员专用：账号本身可以管，但看不到别人的数据（隔离不因角色破例）
+            // 管理员专用：账号、权限与代管（/api/admin/* 看成员数据）都在这页，代管是账号隔离的唯一例外
             meta: { titleKey: 'auth.users', requiresAdmin: true }
         },
         {

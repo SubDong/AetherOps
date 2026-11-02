@@ -4,6 +4,8 @@ export const AUTHTIMEOUT = 'AUTHTIMEOUT';
 export const TERMINAL_CONNECTED = 'TERMINAL_CONNECTED';
 export const TERMINAL_DISCONNECTED = 'TERMINAL_DISCONNECTED';
 export const TERMINAL_DATA = 'TERMINAL_DATA';
+/** AI 模型配置被增删改后广播，AI 助手的模型选择器据此刷新 */
+export const AI_PROFILES_CHANGED = 'AI_PROFILES_CHANGED';
 
 const GlobalEventBus = new EventEmitter();
 const GlobalEventBusCache = new Map<string | symbol, any>();

@@ -11,7 +11,7 @@ import {
 
 /** 查询列固定写出，避免 SELECT * 以后加列把口令哈希带到不需要它的地方 */
 const COLUMNS = `id, username, display_name, password_hash, role, status,
-  can_use_terminal, can_use_ai, can_manage_connections, can_configure_ai, can_use_files,
+  can_use_terminal, can_use_batch, can_use_ai, can_manage_connections, can_configure_ai, can_use_files,
   can_view_monitor, can_view_audit, can_manage_skills, can_manage_snippets,
   created_at, updated_at, last_login_at, last_login_ip`;
 
@@ -25,6 +25,7 @@ function rowToUser(r: any): UserRecord {
     status: r.status as UserStatus,
     permissions: {
       terminal: !!r.can_use_terminal,
+      batch: !!r.can_use_batch,
       ai: !!r.can_use_ai,
       connections: !!r.can_manage_connections,
       aiConfig: !!r.can_configure_ai,
