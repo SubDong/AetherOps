@@ -15,6 +15,10 @@ on:
 permissions:
   contents: write
 
+# 依赖钉版：所有 pnpm install 都是 --frozen-lockfile，锁文件不一致就失败而不是重解析。
+# 升级 @cicctencent/agent-core / vite 用 pnpm run upgrade-pin，package.json 与
+# pnpm-lock.yaml 必须同进一个 commit。
+
 jobs:
   # ============================================================
   # Windows Build
@@ -44,7 +48,7 @@ jobs:
           restore-keys: ${{ runner.os }}-pnpm-
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Build Electron app
         env:
@@ -103,7 +107,7 @@ jobs:
           restore-keys: ${{ runner.os }}-pnpm-
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Install Rosetta (for x64 cross-compile)
         run: softwareupdate --install-rosetta --agree-to-license
@@ -182,7 +186,7 @@ jobs:
           sudo apt-get install -y rpm fakeroot
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Build Electron app
         env:

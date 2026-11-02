@@ -15,15 +15,23 @@ RUN apt-get update && apt-get install -y --fix-missing python3 make g++ && rm -r
 ENV ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
 ENV ELECTRON_BUILDER_BINARIES_MIRROR=https://npmmirror.com/mirrors/electron-builder-binaries/
 
-# 4. 安装 pnpm 并指定 v9 版本
-RUN npm install -g pnpm@9 --registry=https://registry.npmmirror.com
+# 4. 安装 pnpm（10，与 .github/workflows 和 .cnb.yml 对齐）
+#    镜像里必须用同一个大版本：pnpm 9 不认 pnpm-workspace.yaml 里的 allowBuilds /
+#    patchedDependencies（只能回落到 package.json 的 pnpm 字段），而 --frozen-lockfile
+#    一旦判锁文件与声明不一致就直接失败，版本不对齐会让同一个仓库在 CI 绿、在 Docker 红
+#    实测：pnpm 12 写的锁（patchedDependencies 是单行 hash）会被 pnpm 10 + frozen 判为
+#    ERR_PNPM_LOCKFILE_CONFIG_MISMATCH，所以仓库里的锁统一由 pnpm 10 生成
+RUN npm install -g pnpm@10 --registry=https://registry.npmmirror.com
 
 # 5. 复制依赖文件
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY patches ./patches
 
-# 6. 安装依赖 (去掉严格锁校验，并放行原生模块的编译脚本)
-RUN pnpm install --no-frozen-lockfile
+# 6. 安装依赖 (frozen-lockfile：pnpm-lock.yaml 是唯一事实，声明与锁不一致就构建失败，
+#    不允许安装器悄悄重解析依赖 —— @cicctencent/agent-core 是黑盒引擎，版本变了行为就可能变，
+#    镜像必须能对得上号。升级版本走 pnpm run upgrade-pin，改完把 package.json 和 lock 一起提交)
+#    放行原生模块的编译脚本仍需 approve-builds
+RUN pnpm install --frozen-lockfile
 RUN pnpm approve-builds || true
 
 # 7. 复制源码并构建
@@ -42,8 +50,8 @@ ENV NODE_ENV=production
 ENV TZ=Asia/Shanghai
 ENV HOST=0.0.0.0
 
-# 生产环境只需要 pnpm
-RUN npm install -g pnpm@9 --registry=https://registry.npmmirror.com
+# 生产环境只需要 pnpm（版本跟构建阶段一致，否则同一个 lock 可能被另个大版本判为不合）
+RUN npm install -g pnpm@10 --registry=https://registry.npmmirror.com
 
 # 从构建阶段复制产物 (去掉了不存在的 view 目录)
 COPY --from=build-stage /app/dist ./dist

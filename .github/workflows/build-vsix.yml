@@ -21,6 +21,10 @@ on:
 permissions:
   contents: write   # required by softprops/action-gh-release to create releases
 
+# 依赖钉版：所有 pnpm install 都是 --frozen-lockfile，锁文件不一致就失败而不是重解析。
+# VSIX 会把服务端连 node_modules 一起打包（prepare-vscode-runtime.mjs），引擎版本必须可追；
+# 升级 @cicctencent/agent-core / vite 走 pnpm run upgrade-pin，package.json 与 lock 同提交。
+
 jobs:
   build-vsix:
     runs-on: ubuntu-latest
@@ -48,7 +52,7 @@ jobs:
       - name: Install dependencies (root)
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       # Tagged releases must match packages/vscode version so the published artifact is unambiguous.
       - name: Verify tag matches extension version
@@ -116,7 +120,7 @@ jobs:
           restore-keys: ${{ runner.os }}-pnpm-
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Build Electron app
         env:
@@ -166,7 +170,7 @@ jobs:
           restore-keys: ${{ runner.os }}-pnpm-
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Install Rosetta (for x64 cross-compile)
         run: softwareupdate --install-rosetta --agree-to-license
@@ -233,7 +237,7 @@ jobs:
           sudo apt-get install -y rpm fakeroot
 
       - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Build Electron app
         env:
@@ -282,7 +286,7 @@ jobs:
       - name: Install dependencies (root)
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Build app & prepare backend runtime
         run: |
@@ -323,7 +327,7 @@ jobs:
       - name: Install dependencies (root)
         env:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       - name: Build app & prepare backend runtime
         run: |

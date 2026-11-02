@@ -31,7 +31,9 @@
     "migrate": "node scripts/migrate.mjs",
     "build": "npm run build-only",
     "preview": "vite preview",
-    "build-only": "vite build && npm run build-server",
+    "build-only": "node scripts/check-engine-pin.mjs && vite build && npm run build-server",
+    "check-pin": "node scripts/check-engine-pin.mjs",
+    "upgrade-pin": "node scripts/upgrade-pin.mjs",
     "build-server": "tsc -p tsconfig.server.json",
     "prepublishOnly": "npm run build",
     "type-check": "vue-tsc --noEmit --composite false",
@@ -48,7 +50,7 @@
     "vscode:package": "npm run build:vscode && node scripts/prepare-vscode-runtime.mjs && cd packages/vscode && vsce package"
   },
   "dependencies": {
-    "@cicctencent/agent-core": "^1.0.80",
+    "@cicctencent/agent-core": "1.0.80",
     "@xterm/addon-search": "^0.16.0",
     "axios": "^1.20.0",
     "dotenv": "^17.4.2",
@@ -102,7 +104,7 @@
     "tailwindcss": "^3.4.19",
     "to-ico": "^1.1.5",
     "typescript": "^5.9.3",
-    "vite": "latest",
+    "vite": "8.3.5",
     "vite-plugin-files-copy": "^3.8.0",
     "vue": "^3.5.44",
     "vue-i18n": "^11.4.16",
