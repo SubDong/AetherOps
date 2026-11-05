@@ -1,85 +1,127 @@
-# 跳板机与 SSH Agent 转发配置指南
+# Jump Hosts and SSH Agent Forwarding
 
-## 概述
+**English** · [简体中文](./jump-host.zh.md)
 
-AetherOps 支持通过跳板机（Jump Host / Bastion Host）访问内网服务器。核心机制：
-
-1. **启动脚本（Startup Script）**：SSH 登录跳板机后自动执行跳转命令
-2. **SSH Agent 转发**：将本机密钥代理转发到跳板机，支持二次 SSH 的密钥认证
+AetherOps reaches internal hosts by logging in to a bastion and letting a **startup script** perform
+the second hop. There is no dedicated "jump host" field: a connection is treated as a bastion purely
+because it has a startup script configured.
 
 ```
-本机 ──SSH──▶ 跳板机 ──SSH──▶ 目标服务器
-  │              │                │
-  │  SSH Agent   │  Agent 转发    │  使用本机密钥
-  │  (持有密钥)   │  (代理通道)    │  完成认证
+browser / desktop ──SSH──▶ bastion ──SSH──▶ target host
+                              │
+                    startup script writes the
+                    second-hop command into the shell
 ```
 
-## 配置步骤
+- [How it works](#how-it-works)
+- [Configuration](#configuration)
+- [Agent forwarding](#agent-forwarding)
+- [Setting up your ssh-agent](#setting-up-your-ssh-agent)
+- [System information on the target host](#system-information-on-the-target-host)
+- [Multi-hop chains](#multi-hop-chains)
+- [Troubleshooting](#troubleshooting)
+- [Security recommendations](#security-recommendations)
 
-### 1. 创建跳板机连接
+## How it works
 
-在连接编辑器中配置跳板机的 SSH 信息：
+1. AetherOps connects to the bastion with ssh2 and opens an interactive shell channel.
+2. **800 ms** after the channel is ready, the trimmed startup script is written to the shell as if you
+   had typed it, followed by a newline.
+3. The bastion executes it — normally an `ssh` command — and the terminal now shows the target host's
+   shell.
+4. Everything downstream (terminal input, the AI agent, command auditing) operates on whatever shell is
+   currently in front of it, which after a successful hop is the target's.
 
-| 字段 | 值 |
-|------|-----|
-| 名称 | 如 `跳板机 → 生产服务器` |
-| 主机 | 跳板机的公网 IP 或域名 |
-| 端口 | 22（或自定义端口） |
-| 用户名 | 跳板机的登录用户名 |
-| 认证方式 | 密钥 / 密码 / 自动 |
+Consequences of implementing the hop as "type a command into a shell":
 
-### 2. 配置启动脚本
+- The hop is **not atomic and not verified**. If `ssh` fails (key rejected, host unknown, timeout),
+  the shell stays on the bastion and the terminal just shows the error text. Nothing detects "the hop
+  did not happen".
+- Because the first hop is a real interactive session, the second hop inherits whatever the bastion
+  allows — you still need valid credentials for the target *as seen from the bastion*.
+- Timing is a heuristic. A slow link or a long MOTD can outrun the 800 ms delay.
 
-展开 **「启动脚本」** 卡片，在文本框中填入跳转到目标服务器的命令：
+## Configuration
+
+In the connection editor:
+
+| Field | Value |
+|-------|-------|
+| Name | Something that says both ends, e.g. `bastion → prod-db-01` |
+| Host / Port / Username | The **bastion** — never the target |
+| Authentication | Key, password or automatic, for the bastion |
+| Startup script | The command that reaches the target |
+| SSH Agent forwarding | Tick it if the second hop should use your key |
+
+Startup script examples:
 
 ```bash
 ssh ubuntu@192.168.1.100
 ```
 
-如果需要指定端口或用户：
-
 ```bash
 ssh -p 2222 admin@target-server.internal
 ```
 
-如果跳板机有首次登录提示（MOTD），脚本会在 800ms 延迟后执行，确保提示显示完毕。
+```bash
+sleep 1; ssh -J jump2.internal target.internal
+```
 
-### 3. 启用 SSH Agent 转发
+Keep it **one line**: it is written as a single string into the shell. If the bastion prints a long
+MOTD, prepend `sleep 1` (the built-in delay is 800 ms and is not configurable per connection).
 
-勾选 **「SSH Agent 转发」** 复选框。
+## Agent forwarding
 
-这会将本机的 SSH Agent 转发到跳板机，使得在跳板机上执行 `ssh 目标服务器` 时，可以使用本机的密钥进行认证 — **无需将私钥存放在跳板机上**。
+Enabling the checkbox does two things on the server side:
 
-## SSH Agent 设置
+1. At connect time, `config.agent` is set to a detected agent socket — `$SSH_AUTH_SOCK` on
+   Linux/macOS, or the fixed OpenSSH pipe `\\.\pipe\openssh-ssh-agent` on Windows.
+2. The shell channel is opened with `agentForward: true`, so the target (and the bastion) can reach
+   that agent through the forwarded socket.
 
-SSH Agent 转发依赖本机的 ssh-agent 服务。请根据你的操作系统进行配置：
+This means **no private key is stored on the bastion** — signing happens against the agent socket.
+
+**Which machine's agent?** The one running the **AetherOps backend**, since that process is the SSH
+client. This distinction matters:
+
+| Host | Whose agent is forwarded |
+|------|--------------------------|
+| Electron desktop, VS Code extension | Yours — the backend runs on your machine, so your local agent is used |
+| Shared web deployment | The **server's** agent, not the browser user's. Your laptop's keys are not reachable |
+
+For a shared web instance, agent forwarding is therefore an operator-level feature: either the server
+host has an agent with keys that the bastion trusts, or the second hop must authenticate some other way
+(target key stored in the connection, password, or bastion-side keys). There is no way to delegate a
+browser user's local agent into a remote backend.
+
+If no agent is found, the connection log says so and forwarding is silently skipped:
+
+```
+Agent forwarding 已请求但未检测到 SSH agent
+No SSH agent detected. Agent forwarding will not work.
+```
+
+Enabling `debug.sshDebug` (or `AETHEROPS_SSH_DEBUG=1`) puts the ssh2 protocol trace into the terminal,
+which is the fastest way to see whether an `auth agent` request was ever made.
+
+## Setting up your ssh-agent
 
 ### Linux / macOS
 
-大多数系统默认运行 ssh-agent。确认 Agent 是否工作：
-
 ```bash
-# 检查 Agent 是否运行
-echo $SSH_AUTH_SOCK
-# 如果有输出，说明 Agent 正在运行
-
-# 添加密钥到 Agent
+echo $SSH_AUTH_SOCK          # non-empty → an agent is running
 ssh-add ~/.ssh/id_rsa
-# 如果密钥有密码，会提示输入
-
-# 查看已加载的密钥
-ssh-add -l
+ssh-add -l                   # list loaded keys
 ```
 
-如果 Agent 未运行：
+If none is running:
 
 ```bash
-# 启动 Agent 并设置环境变量
 eval $(ssh-agent -s)
 ssh-add ~/.ssh/id_rsa
 ```
 
-**macOS 用户**：将密钥添加到 Keychain 以避免每次重启后重新添加：
+macOS, to survive reboots via the Keychain:
 
 ```bash
 ssh-add --apple-use-keychain ~/.ssh/id_rsa
@@ -87,105 +129,109 @@ ssh-add --apple-use-keychain ~/.ssh/id_rsa
 
 ### Windows
 
-Windows 的 OpenSSH Agent 服务默认是**禁用**状态，需要手动启用。
-
-**以管理员身份打开 PowerShell**：
+The OpenSSH agent service is **disabled** by default. In an elevated PowerShell:
 
 ```powershell
-# 1. 启动 SSH Agent 服务
 Start-Service ssh-agent
-
-# 2. 设为自动启动（重启后仍然可用）
 Set-Service ssh-agent -StartupType Automatic
-
-# 3. 添加密钥
 ssh-add $HOME\.ssh\id_rsa
-
-# 4. 验证
 ssh-add -l
 ```
 
-如果 `Start-Service` 报错，可能需要先安装 OpenSSH：
+If the capability is missing:
 
 ```powershell
-# Windows 10/11 自带 OpenSSH，如果缺失可通过设置安装：
 Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
 ```
 
-## 工作原理
+Note that the pipe path ssh2 uses is the one the Windows OpenSSH agent creates. A third-party agent
+(PuTTY's pageant, for example) does not expose that pipe, so forwarding will not find it.
 
-### 启动脚本执行流程
+## System information on the target host
 
-```
-1. AetherOps 通过 ssh2 连接到跳板机
-2. 建立 Shell 通道
-3. 等待 800ms（让 MOTD 显示完毕）
-4. 将启动脚本写入 Shell 输入流
-5. 跳板机执行脚本，SSH 跳转到目标服务器
-6. 终端现在显示目标服务器的 Shell
-```
+For ordinary SSH sessions, AetherOps derives environment info from the login **MOTD** (captured for 3 s
+in the background), falling back to an active probe over a separate `exec` channel when nothing usable
+arrives.
 
-### Agent 转发认证流程
+For a session with a startup script, the cached/captured data would describe the *bastion*, so the
+behavior differs deliberately:
 
-```
-1. 本机 ssh-agent 持有私钥
-2. SSH 连接跳板机时，agent 通道被转发
-3. 启动脚本执行 ssh 目标服务器
-4. 目标服务器要求密钥认证
-5. 跳板机通过转发通道请求本机 Agent 签名
-6. 本机 Agent 用私钥签名，认证通过
-```
+- The connection is identified as a bastion session by having a non-empty startup script.
+- Cached context is **ignored** and re-collected every time.
+- Collection waits until the session is at least **8 s old**, so the second hop has had time to
+  complete (script at 800 ms + a 2–5 s hop).
+- The bastion hop cannot use the `exec` channel — that would run on the bastion — so the probe is
+  **typed into the interactive terminal** and its echo is read back, with prompt lines stripped from
+  the captured text.
+- The OS family is probed first, then the matching collection script is sent. Before family detection
+  existed, a bash-only probe on a Windows target produced nothing but unreadable error echo.
+- Timeouts: family probe 8 s, collection script 15 s (output must go idle for 1.5 s to be considered
+  complete).
 
-### 系统信息采集
+What this means in practice:
 
-对于配置了启动脚本的跳板机会话：
+- Asking the AI "what's on this server" on a fresh bastion session may take several seconds before it
+  answers — it is waiting for the settle window.
+- The **server status panel** describes where its probe runs, which for a bastion session is the
+  bastion. The panel and the AI context do not necessarily agree about which machine you are on; the
+  AI's collected context is the one that follows the hop.
+- Injecting a probe into an interactive shell is visible in the terminal. If you are running a
+  full-screen program (an editor, `top`), that injection will garble it — collect context before or
+  after, not during.
+- If the hop has not finished when collection runs, the reported environment is the bastion's. Increase
+  the reliability by making the startup script slower to fail rather than faster (e.g. `ssh -o
+  ConnectTimeout=10`), or open the chat a few seconds after connecting.
 
-- **不会**自动捕获 MOTD（因为二次 SSH 过程中的输出不可靠）
-- 当 AI 需要系统信息时，**主动**向目标服务器发送采集命令
-- 确保获取的是**目标服务器**的信息（而非跳板机）
-- 采集结果会被缓存，避免重复执行
+## Multi-hop chains
 
-## 常见问题
-
-### Q: 启动脚本执行后提示 "Permission denied"
-
-说明 SSH Agent 转发没有生效。检查：
-
-1. 是否勾选了「SSH Agent 转发」
-2. 本机 ssh-agent 是否在运行（`ssh-add -l`）
-3. 密钥是否已添加到 Agent
-4. Windows 用户：OpenSSH Agent 服务是否已启动
-
-### Q: 启动脚本没有执行
-
-可能原因：
-- 跳板机的 MOTD 输出过多，覆盖了脚本输入
-- 网络延迟导致 800ms 不够
-- 可以在脚本前加一行 `sleep 1` 延迟
-
-### Q: 可以使用密码认证进行二次 SSH 跳转吗？
-
-可以，但不推荐。在启动脚本中使用 `sshpass`：
-
-```bash
-sshpass -p 'password' ssh user@target-server
-```
-
-**风险**：密码会出现在进程列表中。推荐使用密钥 + Agent 转发。
-
-### Q: 多级跳板机（跳板机 → 跳板机 → 目标）是否支持？
-
-支持。在启动脚本中链式跳转：
+Chaining is just a startup script that hops more than once.
 
 ```bash
 ssh -J jump2.internal target.internal
 ```
 
-或使用 `-J`（Jump）参数指定多级跳转，SSH 会自动处理链路。确保 Agent 转发已启用，密钥在所有节点都能通过转发认证。
+```bash
+ssh jump2.internal -t 'ssh target.internal'
+```
 
-## 安全建议
+`-J` (ProxyJump) is preferred where the bastion supports it: fewer interactive shells, cleaner agent
+handling. `-t … 'ssh …'` forces a pseudo-terminal on the intermediate hop, which is required when the
+next hop needs a TTY.
 
-1. **始终使用 Agent 转发**，不要将私钥复制到跳板机
-2. **限制跳板机权限**：跳板机只开放 SSH 端口，不运行其他服务
-3. **定期轮换密钥**：即使使用 Agent 转发，也应定期更新 SSH 密钥
-4. **审计日志**：AetherOps 会记录所有 AI 执行的命令，可在审计面板中查看
+Agent forwarding through a chain needs every hop to pass it along: the local agent is forwarded to
+bastion 1, and bastion 2 must be reached *from* bastion 1 with forwarding still active. Intermediate
+hosts must have `AllowAgentForwarding yes` (and not restricted by `Match` blocks) for the key to remain
+usable at the far end.
+
+## Troubleshooting
+
+| Symptom | Likely cause | Check |
+|---------|--------------|-------|
+| Second hop says `Permission denied (publickey)` | Agent forwarding not active | Was an agent socket found in the connection log? Is the key loaded (`ssh-add -l`)? On a shared web backend, is the *server's* agent the one with the key? |
+| Script never runs, shell just sits on the bastion | MOTD too long / slow link outran the 800 ms write | Prefix `sleep 1;` |
+| Hop works in your terminal, fails in AetherOps | Your interactive shell has `SSH_AUTH_SOCK` from a login session; the backend process does not | Start the backend from a shell where `echo $SSH_AUTH_SOCK` is non-empty, or use the Windows OpenSSH service |
+| Environment info describes the bastion | The probe ran before the hop finished, or the hop failed | Look at the terminal: is the prompt from the target? Re-ask after a few seconds |
+| Full-screen program breaks after connecting | The probe was typed into the interactive shell | Don't start `top`/editors within the first ~15 s of a bastion session |
+| `ssh: Could not resolve hostname` on the second hop | The target name only resolves inside the target network — which is where you are, so this usually means the hop *did not* happen | Confirm the prompt changed; use an IP to rule out DNS |
+| Password auth for the second hop | `sshpass` in the startup script | Works, but the password appears in the process list and in the terminal echo. Prefer keys |
+
+Using `sshpass` (as in the older revision of this guide) is possible but discouraged:
+
+```bash
+sshpass -p 'password' ssh user@target-server
+```
+
+The credential is visible in the bastion's process list, in the terminal, and in command audit records.
+It is a workaround for a missing key rollout, not an authentication strategy.
+
+## Security recommendations
+
+1. Forward an agent instead of copying private keys onto the bastion.
+2. Keep bastion permissions narrow: SSH only, no extra services, and restrict which targets it may
+   reach.
+3. Rotate keys regularly — forwarding means the loaded agent key is usable on everything it can reach.
+4. Remember that the AI agent operates on the **target** shell. A prompt-injection-style mistake in the
+   audit trail is a command that actually ran; review `audit` records for bastion sessions like any
+   other host ([accounts-and-permissions.md](./accounts-and-permissions.md#admin-oversight)).
+5. Batch commands (`can_use_batch`) against a list of bastion connections fan out through the hop — the
+   blast radius is the targets, not the bastions. Grant that bit accordingly.

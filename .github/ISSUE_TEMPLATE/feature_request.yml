@@ -1,0 +1,94 @@
+name: Feature request
+description: Propose something new, or an improvement to what exists
+title: "[feat]: "
+labels: ["enhancement"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Tell us about the problem you have first. AetherOps is an operations tool with an AI agent
+        holding a real shell, so "how would this be used on a Monday morning" carries more weight than
+        a feature list — and a description of the workflow you are stuck in usually leads to a better
+        design than the one we would have guessed.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem, in your words
+      description: What are you trying to do, and what stops you? Include the workaround you live with.
+      placeholder: "As an operator running a shared deployment, I cannot …"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part of the project
+      options:
+        - Terminal / sessions
+        - Jump host / agent forwarding
+        - File transfer (SFTP, ZMODEM)
+        - Server status / OS detection
+        - AI chat / agent / skills
+        - Model routing, cost and budgets
+        - Accounts, roles, permissions, admin oversight
+        - Audit / log monitor / batch / snippets
+        - Configuration, storage, migrations
+        - Deployment (Docker, reverse proxy, systemd)
+        - Hosts (Electron, VS Code)
+        - Documentation
+        - Build / CI / release automation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: proposed
+    attributes:
+      label: What you would like to happen
+      description: >-
+        The shape of the solution as you see it: the UI entry point, the config key, the API, the
+        permission bit it should live behind. Rough is fine.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Other designs, existing tools that already cover this, or "live without it because …".
+    validations:
+      required: false
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and privilege implications
+      description: >-
+        Does this let a command reach a host, widen what the agent may do, expose data across accounts,
+        or touch a credential? If so, say which permission bit should gate it and what an auditor should
+        see. Features that cannot be gated are usually declined or redesigned — this is not a complaint,
+        it is the nature of the tool.
+    validations:
+      required: false
+  - type: dropdown
+    id: pr
+    attributes:
+      label: Are you willing to implement it?
+      description: >-
+        If yes, please read [CONTRIBUTING.md](https://github.com/SubDong/AetherOps/blob/master/CONTRIBUTING.md)
+        first — especially dependency pinning, migration re-entrancy and the authorization funnel. An
+        issue you turn into a draft PR moves faster than one you wait on.
+      options:
+        - Yes, I plan to open a PR
+        - I can help test or review
+        - Not able to work on it myself
+    validations:
+      required: true
+  - type: checkboxes
+    id: known
+    attributes:
+      label: Not already a documented gap?
+      description: >-
+        Several things in the README's *Known limitations* list are deliberate, documented state (no
+        skill-authoring API, no HA mode, no release artifacts yet). Those are still open to discussion,
+        but say what you need from them so the constraint can be evaluated against a real use case.
+      options:
+        - label: I checked the README "Known limitations" section and the docs index, and this is genuinely new
+          required: true

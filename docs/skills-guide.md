@@ -1,271 +1,272 @@
-# 自定义技能（Skills）开发指南
+# Skills: Reusable Playbooks for the Agent
 
-## 什么是 Skill？
+**English** · [简体中文](./skills-guide.zh.md)
 
-Skill 是 AI Agent 的「操作手册」。它是一个 Markdown 文件，告诉 Agent 遇到某类任务时应该怎么做 — 包括执行步骤、注意事项、最佳实践等。
-
-Skill 被注入到 Agent 的系统提示词中，让 AI 不需要每次从零开始思考，而是遵循预定义的 SOP。
-
-## 快速开始
-
-### 1. 创建技能文件
-
-在用户技能目录下创建 Markdown 文件：
-
-```bash
-# Linux / macOS
-mkdir -p ~/.aetherops/skills
-touch ~/.aetherops/skills/my-deploy.md
-
-# Windows
-mkdir %USERPROFILE%\.aetherops\skills
-echo. > %USERPROFILE%\.aetherops\skills\my-deploy.md
-```
-
-### 2. 编写技能内容
+A skill is a Markdown playbook that gets injected into the agent's system prompt for one run. It tells
+the model *how* to do a class of task on your infrastructure — steps, platform differences, safety
+checks, output format — instead of letting it improvise every time.
 
 ```markdown
 ---
-name: Deploy My App
-description: Deploy the production application with zero-downtime
-tags: [deploy, ops, production]
----
-
-Deploy the application following these steps:
-
-1. Pull the latest code from the main branch
-2. Run database migrations
-3. Build frontend assets
-4. Restart the application with PM2 (graceful reload)
-5. Verify the deployment by checking the health endpoint
-
-## Important Notes
-
-- Always check the current deployment status before starting
-- If any step fails, rollback to the previous version
-- Run `pm2 logs` after deployment to check for startup errors
-```
-
-### 3. 使用技能
-
-在 AI 聊天中用斜杠命令触发：
-
-```
-/deploy-my-app
-```
-
-或者直接用自然语言（Agent 会根据 tags 自动匹配）：
-
-```
-帮我部署一下应用
-```
-
-## 文件格式
-
-### Front Matter（元数据）
-
-每个 Skill 文件以 YAML front matter 开头：
-
-```yaml
----
-name: 技能名称           # 必填，显示名称
-description: 简短描述     # 必填，Agent 据此判断何时使用此技能
-tags: [tag1, tag2]       # 必填，用于搜索和自动匹配
----
-```
-
-| 字段 | 说明 | 要求 |
-|------|------|------|
-| `name` | 技能的显示名称 | 必填，简洁明了 |
-| `description` | 一句话描述技能用途 | 必填，Agent 据此决定是否匹配 |
-| `tags` | 标签列表 | 必填，用于关键词匹配 |
-
-### Markdown 正文
-
-Front matter 之后的 Markdown 内容是技能的核心指令，会被注入到 Agent 的系统提示词中。
-
-## 编写最佳实践
-
-### 1. 明确执行策略
-
-告诉 Agent **怎么做**，而不只是**做什么**：
-
-```markdown
-## Execution Strategy
-
-Use a bash script to collect all metrics in one pass.
-For Windows targets, generate a PowerShell script instead.
-```
-
-### 2. 区分平台差异
-
-如果技能涉及系统命令，说明不同平台的差异：
-
-```markdown
-## Platform Notes
-
-- **Linux**: Use `systemctl` for service management
-- **macOS**: Use `launchctl` instead, no `systemctl` available
-- **Windows**: Use PowerShell cmdlets like `Get-Service`, `Stop-Service`
-```
-
-### 3. 指定何时用脚本 vs 单条命令
-
-```markdown
-## When to Generate Scripts
-
-Generate a script (instead of running commands one by one) when:
-- The task has more than 3 sequential steps
-- Requires loops, conditionals, or error handling
-- Needs to process large amounts of data
-
-For simple single-step operations, a direct command is fine.
-```
-
-### 4. 包含安全检查
-
-```markdown
-## Safety
-
-- Always preview destructive operations before executing
-- For database operations, create a backup first
-- Never run `DROP DATABASE` without explicit user confirmation
-```
-
-### 5. 定义输出格式
-
-```markdown
-## Output Format
-
-Present results as a structured report:
-1. Summary line (one sentence)
-2. Key metrics in a table
-3. Issues highlighted with ⚠️
-4. Recommendations at the end
-```
-
-## 技能来源与优先级
-
-```
-系统内置 Skills:  <project>/data/skills/*.md   ← 随项目发布
-用户自定义 Skills: ~/.aetherops/skills/*.md          ← 用户私有
-```
-
-**优先级规则**：用户自定义 Skills 优先级高于系统内置。如果两者同名（文件名相同），用户版本会覆盖系统版本。
-
-## 内置技能参考
-
-### server-health-check
-
-全面的服务器健康检查：CPU、内存、磁盘、网络、进程、服务状态。跨平台自适应。
-
-```yaml
-name: Server Health Check
-description: Comprehensive server health check - CPU, memory, disk, network, processes, services
-tags: [ops, monitoring, health]
-```
-
-### log-analyze
-
-日志分析：错误模式检测、频率统计、异常关联分析。支持 Python/awk 脚本。
-
-```yaml
-name: Log Analysis
-description: Analyze log files for errors, patterns, and anomalies
-tags: [ops, logs, analysis]
-```
-
-### docker-manage
-
-Docker 管理：容器生命周期、镜像清理、网络排查、卷管理。
-
-```yaml
 name: Docker Management
-description: Docker container lifecycle management, cleanup, monitoring
+description: Docker container lifecycle management, cleanup, monitoring, and troubleshooting
 tags: [ops, docker, containers]
+---
+
+Manage Docker containers, images, volumes, and networks efficiently. Use scripts for batch operations.
+...
 ```
 
-## 技能触发方式
+- [Where skills come from](#where-skills-come-from)
+- [Current limits of the write path](#current-limits-of-the-write-path)
+- [File format](#file-format)
+- [How a skill is selected](#how-a-skill-is-selected)
+- [What the agent actually receives](#what-the-agent-actually-receives)
+- [Built-in skills](#built-in-skills)
+- [Writing good skills](#writing-good-skills)
+- [Full example](#full-example)
+- [Debugging](#debugging)
+- [Contributing skills](#contributing-skills)
 
-| 方式 | 示例 | 说明 |
-|------|------|------|
-| **斜杠命令** | `/docker-manage` | 用户显式指定，精确触发 |
-| **关键词匹配** | "帮我看看 docker 状态" | 基于 tags 自动匹配 |
-| **LLM 智能分析** | 复杂任务描述 | Agent 阅读所有 Skill 描述后选择最佳匹配 |
+## Where skills come from
 
-## 调试技巧
+| Source | Location | Scope | Loaded |
+|--------|----------|-------|--------|
+| **Built-in** | `<app root>/data/skills/*.md` | Everyone, read-only | Read once at startup (per process), from `process.cwd()/data/skills` |
+| **User** | MySQL table `skills`, keyed by `owner_id` | One account | Queried on every list/get — never cached in the process |
 
-1. **检查技能是否被加载**：查看服务端启动日志中的 `[SkillService] Loaded N skills`
-2. **验证触发**：在聊天中输入 `/your-skill-name`，观察 Agent 是否按照技能指令行动
-3. **迭代优化**：修改技能文件后，重启服务即可生效（无需重新构建）
-4. **查看系统提示词**：开启 DevTools 的 Network 面板，观察发送给 AI 的完整提示词
+Built-ins are files that ship with the code and move with git, so they are reviewable. User skills are
+database rows, because a shared web instance cannot give every account write access to one directory.
 
-## 示例：完整的 Nginx 管理技能
+Merging rule: for one account's view, a user skill **replaces** a built-in with the same id (the id is
+the file name without `.md`; for a DB row it is the row's key). Two accounts never see each other's
+user skills — the service deliberately does not cache a merged map, since one process serves everyone.
+
+Note that `data/skills` is *not* under the data directory (`~/.aetherops`): the Docker image copies it
+to `/app/data/skills` precisely because the lookup is relative to the working directory. A container
+missing that step shows an empty skill list.
+
+## Current limits of the write path
+
+Being explicit here, because the upstream documentation promised more than the code does:
+
+- `SkillService.saveUserSkill()` and `deleteUserSkill()` exist and work, and the `skills` table is
+  ready, but **no HTTP endpoint and no UI calls them**. The registered routes are
+  `/api/ai/getSkills` and `/api/ai/getSkill` only.
+- Therefore, in practice today: authoring a skill means editing a file in `data/skills`, which requires
+  filesystem access to wherever the backend runs, plus a restart. On a shared deployment that is an
+  operator action, not a user feature.
+- There is no reload endpoint either. Adding or editing a built-in file takes effect on the next
+  restart (`skillService.reload()` is not wired to any route).
+
+If you want per-account skill creation, that is a legitimate contribution: add owner-scoped routes, keep
+them behind the `skills` permission bit, and reuse the existing repository functions rather than
+inventing a second storage path.
+
+## File format
+
+A skill file is YAML-ish front matter plus Markdown. The parser is a small hand-rolled regex
+(`skill.service.ts#parseSkillFile`), not a YAML library, so the supported shape is narrow:
 
 ```markdown
 ---
 name: Nginx Management
-description: Manage Nginx web server - config, reload, SSL, troubleshooting
+description: Manage Nginx - config validation, reload, SSL, troubleshooting
 tags: [ops, nginx, web, ssl]
 ---
 
-Manage Nginx web server configuration and troubleshooting.
+正文：给 Agent 的具体指令 / instructions for the agent go here
+```
+
+| Field | Required | Effect |
+|-------|----------|--------|
+| `name` | no (falls back to the file id) | Shown in the skills panel and in the injected header |
+| `description` | no | Shown in the panel; also used as the prompt text when you send a bare `/skill-id` |
+| `tags` | no | Metadata only, surfaced in the list. **Nothing matches on tags automatically** |
+| body | yes, practically | The instructions the agent follows |
+
+Parser constraints that bite in practice:
+
+- Front matter must start at **byte 0** of the file with `---`; anything else (a blank first line, a BOM
+  before the delimiter) means "no front matter", and the whole file — delimiters included — becomes the
+  body.
+- Each field must be **one line** matching `^key:\s*value`. Multi-line YAML blocks, nested maps, lists in
+  block form (`- item`), and comments are not understood; the value is taken verbatim to end of line.
+- Quotes and brackets are stripped wherever they appear in the value, so `tags: ["ops", "nginx"]` and
+  `tags: ops, nginx` both work, and `description: "He said "hi""` is not going to be clever.
+- Only `name`, `description`, `tags` are read. Extra keys (`version`, `author`, `platform`) are ignored —
+  fine to keep for humans, invisible to the loader.
+- A file that cannot be read is logged (`[SkillService] Failed to parse skill: …`) and skipped; it does
+  not stop startup, so a typo can silently remove one skill from the list.
+- Encoding: UTF-8. Line endings CRLF or LF both parse (the regex accepts `\r?\n`).
+- The id is the file name: `nginx-management.md` → `/nginx-management`. Spaces and non-ASCII in file names
+  make slash commands awkward — use kebab-case.
+
+There is no size limit enforced in code. Everything is injected verbatim on every turn of a run, so a
+50 KB playbook is 50 KB off your context window; the built-ins stay under a few KB on purpose.
+
+## How a skill is selected
+
+Two paths, both explicit — the agent never picks a skill by itself:
+
+1. **Skills panel** — open it in the chat area and click a skill; it stays selected (with a clear button)
+   until you send, then resets.
+2. **Slash command** — type `/` + the skill id. Matching is exact and case-insensitive against the id,
+   and only when the message starts with `/`:
+
+   | You type | What the agent receives |
+   |----------|-------------------------|
+   | `/docker-manage` | Instructions from that skill, with the skill's `description` as the task text |
+   | `/docker-manage prune stopped containers` | Same instructions, task text = your words after the command |
+   | `/docke` | No exact match → sent to the agent as an ordinary message |
+   | `please /docker-manage now` | Not at position 0 → ordinary message |
+
+There is **no** keyword/tag auto-matching and **no** "let the LLM choose the skill" step. Natural language
+like "帮我看看 docker 状态" works only if the model happens to be in a context where that skill is
+selected — the older revision of this guide claimed automatic tag matching, and the code has no such
+path.
+
+Access to the list is permission-gated: `/api/ai/getSkills` accepts either the `skills` bit or the `ai`
+bit, since picking a skill is part of chatting.
+
+## What the agent actually receives
+
+When a run starts with a skill, the server appends to the system prompt:
+
+```
+## Current Task Instructions (Skill: <name>)
+
+<entire skill body>
+```
+
+Details worth knowing:
+
+- It is per **run**, not a persistent mode. The next message without a skill has no such section.
+- It is an *addition* to the base system prompt (which already carries terminal context and tool
+  definitions), not a replacement.
+- The skill id and name are stored on the user message in chat history, so the transcript shows which
+  playbook produced which answer, and "retry" on that message re-uses the same skill.
+- Skills cannot grant capability. A skill that says "restart all services" only runs if the account's
+  permission bits and the agent's own dangerous-command handling allow it. The blacklisted commands in
+  the agent engine are not bypassed by playbook text.
+- Prompt-injection surface: skill content is trusted input written into the system prompt. On a shared
+  instance, whoever can write a skill can steer the agent's behavior for that account — which is why
+  user skills are owner-scoped and why a future write endpoint belongs behind the `skills` bit.
+
+## Built-in skills
+
+The three playbooks shipped in `data/skills`:
+
+| Id | name | Purpose |
+|----|------|---------|
+| `server-health-check` | Server Health Check | One-pass metric collection (CPU, memory, disk, network, processes, services) via a generated script that adapts to Linux / macOS / Windows |
+| `log-analyze` | Log Analysis | Error-pattern detection, frequency counts, anomaly correlation across Nginx / application / system logs; uses scripts for throughput |
+| `docker-manage` | Docker Management | Container lifecycle, image/volume cleanup, network troubleshooting, batch operations |
+
+Read them as examples as much as features: each one demonstrates the pattern the agent handles best —
+collect in one script rather than twenty round-trips, state platform differences explicitly, and end with
+a defined output shape.
+
+## Writing good skills
+
+1. **Say how, not just what.** "Generate one bash script that collects all metrics in one pass" beats
+   "check the server". Round trips against a remote shell are slow and noisy.
+2. **Handle platform differences by name.**
+   ```markdown
+   - **Linux**: `systemctl` for services
+   - **macOS**: `launchctl`; no `systemctl`
+   - **Windows**: PowerShell cmdlets (`Get-Service`, `Stop-Service`); assume cmd may wrap the call
+   ```
+3. **Define when to script instead of running one command** — more than ~3 sequential steps, loops,
+   conditionals, or large output.
+4. **State safety rules the agent must not trade away.**
+   ```markdown
+   - ALWAYS run `nginx -t` before reload
+   - Back up the config before a major change
+   - Never `DROP DATABASE` without explicit confirmation in this turn
+   ```
+5. **Fix the output format** so results are comparable across runs: summary line, metrics table, flagged
+   issues, recommendations.
+6. **Assume nothing about the host being reachable as you are.** Prefer read-only discovery first
+   (`command -v docker`, `nginx -v`) before any mutation, so a missing tool fails with a clear message
+   instead of a chain of errors.
+7. **Keep it short.** Every line competes with the terminal output you also want the model to read.
+
+## Full example
+
+```markdown
+---
+name: Nginx Management
+description: Manage Nginx web server - config validation, reload, SSL, troubleshooting
+tags: [ops, nginx, web, ssl]
+---
+
+Manage Nginx configuration and troubleshoot serving problems.
 
 ## Pre-check
 
-Before any operation, verify Nginx is installed:
-```bash
-nginx -v 2>&1 || echo "Nginx not installed"
-```
+Confirm Nginx is present before doing anything else:
 
-## Common Operations
+    nginx -v 2>&1 || echo "Nginx not installed"
 
-### Config Validation (ALWAYS do this before reload)
-```bash
-nginx -t
-```
+## Common operations
 
-### Reload Config (graceful, no downtime)
-```bash
-systemctl reload nginx   # Linux
-launchctl kickstart -k system/org.macports.nginx  # macOS (MacPorts)
-```
+Config validation — ALWAYS before a reload:
 
-### View Current Config
-```bash
-cat /etc/nginx/nginx.conf
-ls /etc/nginx/sites-enabled/   # Debian/Ubuntu
-ls /etc/nginx/conf.d/          # CentOS/RHEL
-```
+    nginx -t
 
-### SSL Certificate Check
-```bash
-echo | openssl s_client -connect localhost:443 -servername $(hostname) 2>/dev/null | openssl x509 -noout -dates
-```
+Graceful reload (no downtime):
+
+    systemctl reload nginx    # Linux
+    launchctl kickstart -k system/org.macports.nginx   # macOS, MacPorts
+
+Inspect the active configuration:
+
+    cat /etc/nginx/nginx.conf
+    ls /etc/nginx/sites-enabled/   # Debian/Ubuntu layout
+    ls /etc/nginx/conf.d/          # RHEL/CentOS layout
+
+Certificate dates:
+
+    echo | openssl s_client -connect localhost:443 -servername $(hostname) 2>/dev/null | openssl x509 -noout -dates
 
 ## Troubleshooting
 
-### 502 Bad Gateway
-1. Check upstream service: `systemctl status <upstream>`
-2. Check Nginx error log: `tail -50 /var/log/nginx/error.log`
-3. Verify upstream port is listening: `ss -tlnp | grep <port>`
+502 Bad Gateway: check the upstream service status, then `tail -50 /var/log/nginx/error.log`,
+then confirm the upstream port is listening (`ss -tlnp`).
 
-### High Memory/CPU
-1. Check worker processes: `ps aux | grep nginx`
-2. Review worker_connections in config
-3. Check for open file descriptor limits: `cat /proc/sys/fs/file-max`
+High memory or CPU: `ps aux | grep nginx`, review `worker_connections`, check the open-file limit.
 
 ## Safety
 
-- ALWAYS run `nginx -t` before reload
-- Backup config before major changes: `cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak`
-- For SSL changes, test with `curl -vk https://localhost` first
+- Never reload without `nginx -t` passing first.
+- Copy the config to a `.bak` before structural changes.
+- Test TLS changes with `curl -vk https://localhost` before declaring success.
+
+## Output format
+
+1. One-line summary of what was done
+2. Table of checks and results
+3. Remaining risks, flagged
 ```
 
-## 技术细节
+## Debugging
 
-- **文件编码**：UTF-8
-- **行尾**：LF（Unix）或 CRLF（Windows）均可
-- **文件大小**：建议不超过 10KB（过大的内容会占用过多上下文窗口）
-- **热加载**：修改技能文件后需重启 AetherOps 服务
-- **存储位置**：技能文件路径由 `AETHEROPS_DATA_DIR` 环境变量控制（默认 `~/.aetherops/skills/`）
+| Question | How to answer |
+|----------|---------------|
+| Did my file load? | Startup log: `[SkillService] Loaded N system skills (user skills are per-account, queried on demand)`. N lower than expected → look for the `Failed to parse skill` line above it |
+| Is the front matter parsed? | Panel shows the id instead of `name` → front matter not recognized (see [File format](#file-format) constraints) |
+| Which skills does this account see? | `POST /api/ai/getSkills` with the account's bearer token — it returns exactly the merged view (built-ins + this owner's rows) |
+| Was the skill injected into the prompt? | The turn's user message carries a skill badge in the transcript; the WS `ai-agent-run` frame carries `skillId` (DevTools → Messages) |
+| Why did nothing happen on `/myskill`? | Id mismatch (slash matching is exact on the file name), or the `/` is not the first character |
+| My edit did not appear | Built-ins are read at startup; restart the backend |
+
+## Contributing skills
+
+- Add a new built-in by dropping `data/skills/<kebab-case-id>.md` in a PR. It becomes available to every
+  account on that deployment, so write it to be correct for strangers: no internal hostnames, no
+  environment-specific assumptions, no credentials — see [CONTRIBUTING.md](../CONTRIBUTING.md).
+- Prefer improving the existing three over adding a near-duplicate; the list is shown in full in the
+  panel and long lists are painful to scan.
+- Skills are documentation that the model executes. Review them with the same care as a shell script:
+  a wrong "always do X first" instruction becomes a wrong command on real hosts.

@@ -1,0 +1,134 @@
+name: Bug report
+description: Something does not work as documented
+title: "[bug]: "
+labels: ["bug"]
+assignees: []
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thanks for taking the time to file this. Two requests up front: **do not report security
+        issues here** (use [private vulnerability reporting](https://github.com/SubDong/AetherOps/security/advisories/new),
+        see SECURITY.md), and **redact anything you attach** — logs and screenshots routinely contain
+        hostnames, usernames, commands and keys. This repository is public.
+  - type: checkboxes
+    id: precheck
+    attributes:
+      label: Before you post
+      options:
+        - label: I searched open and closed issues and did not find this
+          required: true
+        - label: I read [Known limitations](https://github.com/SubDong/AetherOps/blob/master/CHANGELOG.md#known-gaps-at-this-point) and this is not a documented gap
+          required: true
+        - label: I read the relevant section of [docs/troubleshooting.md](https://github.com/SubDong/AetherOps/blob/master/docs/troubleshooting.md)
+          required: true
+        - label: I removed secrets, internal hostnames and personal data from everything attached
+          required: true
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: >-
+        One or two sentences describing the failure, and what you expected instead. "The terminal is
+        broken" is hard to act on; "opening a second tab on a Windows target leaves the pane blank
+        until I press Enter" usually is not.
+      placeholder: A clear, concise description.
+    validations:
+      required: true
+  - type: dropdown
+    id: host
+    attributes:
+      label: Which host are you running it in
+      description: Each host wires the same backend differently, so this is not cosmetic.
+      options:
+        - Web (`node server.js`)
+        - Electron desktop (Windows)
+        - Electron desktop (macOS)
+        - Electron desktop (Linux)
+        - VS Code extension
+        - Vite dev server (`pnpm dev`)
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Startup / configuration / migrations
+        - Login, accounts, permissions
+        - Terminal (SSH or local session, rendering)
+        - Jump host / agent forwarding
+        - File transfer (SFTP file manager, ZMODEM)
+        - Server status / OS detection
+        - AI chat / agent / model routing
+        - Cost accounting / budgets
+        - Audit panel
+        - Log monitor
+        - Batch operations
+        - Skills
+        - Snippets
+        - Build / packaging / CI / Docker
+        - Other (please say below)
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      description: >-
+        `node -p "require('./package.json').version"`, or the release you installed, or
+        `git rev-parse --short HEAD`. There are **no release tags yet**, so a commit is the most
+        precise thing you can give.
+      placeholder: "1.0.26 / a1c3651"
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS of the machine running AetherOps, and the versions of its dependencies.
+      value: |
+        - AetherOps host OS: 
+        - Node.js: 
+        - pnpm: 
+        - MySQL: 
+        - Redis: 
+        - Reverse proxy (if any): 
+        - Target server OS (if the issue involves a remote host): 
+        - MySQL TLS enabled: yes / no
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: >-
+        A fresh install should be enough to hit it. Please include the **permission bits** of the
+        account you used and whether the account is `pending` or `active` — a surprising number of
+        "why is this forbidden" reports are just an unapproved account.
+      value: |
+        1. 
+        2. 
+        3. 
+        Account role / status / permission bits used: 
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: >-
+        Paste the tail of `~/.aetherops/server.log` or the console, and the browser DevTools console /
+        Network tab for front-end problems. Exact `[FATAL]`, `[pin]`, `[WS]`, `[Auth]`, `[SSH]` or
+        migration lines are worth more than a summary — they are written to be diagnostic.
+        **Strip hostnames, usernames, tokens and command content first.**
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: workaround
+    attributes:
+      label: Workaround or additional context
+      description: Anything that makes it stop happening, or a clue about when it does not happen.
+    validations:
+      required: false
