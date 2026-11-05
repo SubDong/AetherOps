@@ -455,6 +455,11 @@ export class MonitorService {
     this.analysisTimer = setInterval(() => {
       // 目前仅做清理，AI 分析由前端按需触发
     }, this.analysisInterval);
+    // 避免定时器阻止 Node.js 进程正常退出
+    //（构建期也会加载本模块：不 unref 的话 vite 打完包后事件循环永不空闲，进程不退出）
+    if (this.analysisTimer && typeof this.analysisTimer === 'object' && 'unref' in this.analysisTimer) {
+      this.analysisTimer.unref();
+    }
   }
 
   /**
