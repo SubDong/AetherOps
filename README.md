@@ -239,7 +239,7 @@ Full walkthrough with team setup: [docs/getting-started.md](./docs/getting-start
 | Method | Command / source | Good for |
 |--------|------------------|----------|
 | Source build | `pnpm install && pnpm build && node server.js` | Everyone; currently the only way to get the app |
-| Docker | `docker build -t aetherops .` + compose with MySQL/Redis | Servers, shared team deployment |
+| Docker | `pnpm docker:build` (or `docker build -t aetherops .`) + compose with MySQL/Redis | Servers, shared team deployment |
 | Electron desktop | `pnpm electron:build:win \| :mac \| :linux` | Single operators who want a native window |
 | VSCode extension | `pnpm vscode:package` → `.vsix`, then *Install from VSIX* | Keeping terminals inside the editor |
 | GitHub Releases | Created by CI when a version tag is pushed (**none published yet**) | Installers without a local toolchain |
@@ -252,13 +252,15 @@ pnpm build:vscode          # front-end + backend + extension host
 pnpm vscode:package        # package a .vsix
 
 # Docker
-docker build -t aetherops .
+pnpm docker:build          # one command: preflight checks + aetherops:<version> + :latest
+pnpm docker:build -- --platform linux/amd64 --push   # cross-build / publish
+docker build -t aetherops .   # the raw equivalent the wrapper execs
 docker run -d -p 9802:9802 -v ~/.aetherops:/root/.aetherops aetherops
 ```
 
-See [docs/deployment.md](./docs/deployment.md) for a Docker Compose file that brings up MySQL and
-Redis alongside the app, reverse-proxy settings (WebSocket upgrade is mandatory), and the release
-flow.
+See [docs/deployment.md](./docs/deployment.md) for what `docker:build` checks before it runs, a Docker
+Compose file that brings up MySQL and Redis alongside the app, reverse-proxy settings (WebSocket
+upgrade is mandatory), and the release flow.
 
 ### CLI
 
@@ -302,7 +304,7 @@ was actually read. Full reference, including TLS choices and the storage layout:
 .
 ├── bin/                # CLI entry (aetherops start/stop/restart)
 ├── data/skills/        # Built-in agent skills (Markdown)
-├── docs/               # Documentation (English)
+├── docs/               # Documentation (English + Simplified Chinese, kept as pairs)
 ├── electron/           # Desktop main/preload + release update check
 ├── packages/vscode/    # VSCode extension host (same backend runtime)
 ├── patches/            # Dependency patches (zmodem.js)
@@ -344,6 +346,7 @@ pnpm build-server     # backend only
 pnpm type-check       # vue-tsc
 pnpm lint             # eslint (+ --fix)
 pnpm check-pin        # verify pinned dependencies match the lockfile
+pnpm docker:build     # build the Docker image (--dry-run to see the command only)
 node scripts/migrate.mjs --status   # database schema state
 pnpm smoke            # terminal pipeline smoke test (does not send a token yet — see
                       # CONTRIBUTING "Test scripts"; it needs an admin token to pass)

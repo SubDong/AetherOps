@@ -20,11 +20,37 @@ supported build, and record the commit you run.
   inside their own language copy, and a row in both README tables. The two copies are **peers**: no
   "English wins" disclaimer, and
   [CONTRIBUTING.md](CONTRIBUTING.md#documentation) requires changing both in the same pull request.
+- **`pnpm docker:build`** (`scripts/docker-build.mjs`) as a one-command image build. It runs the checks
+  that would otherwise only surface halfway through the build — the files the `Dockerfile` copies,
+  whether the daemon is reachable, whether `.dockerignore` leaks a local build artifact or a foreign
+  `node_modules` into the context, and whether the working tree is dirty — then tags
+  `aetherops:<package.json version>` plus `:latest` with OCI `title` / `version` / `revision` /
+  `created` labels so an image can be traced back to a commit. `--platform` switches to
+  `docker buildx --load`, `--push` publishes each ref, `--dry-run` prints the command without needing
+  a daemon, and unrecognized flags are passed through. Documented in
+  [docs/deployment.md](docs/deployment.md#one-command) /
+  [docs/deployment.zh.md](docs/deployment.zh.md#一条命令).
 
 ### Changed
 
-Nothing else pending. Add entries under `Added` / `Changed` / `Fixed` / `Removed` / `Security` as part of
-the pull request that makes the change, not afterwards.
+- **`.dockerignore` tightened** to also exclude `packages`, `docs`, `.github`, `*.vsix` and
+  `dist.rootbak`. The `Dockerfile` uses `COPY . .`, so anything left out of this file is shipped into
+  the build context: the first time it is just slow, the second time it is wrong, because stale local
+  build output gets mixed into an image whose dependencies were installed with `--frozen-lockfile`.
+
+### Fixed
+
+- **`pnpm build` stopped after Vite finished, so the server bundle was never compiled.**
+  `vite.config.ts` imports `server/index` at module scope, because the dev server must reuse the same
+  service singletons; importing it constructs `MonitorService`, whose 5 s analysis `setInterval` was
+  created without `unref()`. The event loop therefore never drained: `vite build` printed the asset list
+  and stayed alive, the `&&` chain in `build-only` ended there, and `tsc -p tsconfig.server.json` never
+  ran — `dist/public` looked fresh while `dist/server` silently kept whatever an older build had left.
+  Anything that runs `pnpm build` inherited the hang, including the Docker image build and CI. The timer
+  is now `unref()`d, matching how `SSHService` has guarded its periodic cleanup timer.
+
+Add entries under `Added` / `Changed` / `Fixed` / `Removed` / `Security` as part of the pull request
+that makes the change, not afterwards.
 
 ## 1.0.26 — 2026-11-02
 

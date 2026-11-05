@@ -123,6 +123,36 @@ node scripts/verify-auth.mjs        # 登录、pending、权限、隔离、单�
 镜像是两阶段构建（构建和运行都用 `node:22-slim`，两个阶段里都是 pnpm 10），里面只有应用。MySQL 和 Redis
 **不在**其中。
 
+### 一条命令
+
+```bash
+pnpm docker:build           # → aetherops:<package.json 里的版本> + aetherops:latest
+```
+
+[`scripts/docker-build.mjs`](../scripts/docker-build.mjs) 包了一层 `docker build`，目的是把那些「事前就能看出
+来的失败」在构建开始前就报出来，而不是跑到第五层才炸：
+
+- Dockerfile 要 `COPY` 的文件（`package.json`、`pnpm-lock.yaml`、`pnpm-workspace.yaml`、`patches`）必须在；
+- daemon 必须能回 `docker version`，而且报错是 daemon 原话，不是一屏堆栈；
+- `.dockerignore` 必须真的排掉磁盘上那些很重的本地产物（`node_modules`、`dist*`、`release`、
+  `packages/vscode/runtime`、`*.vsix`）—— 因为 `COPY . .` 会把它们全送进构建上下文，而一份陈旧的、
+  原生模块已编译好的 `node_modules` 与一份 `--frozen-lockfile` 装出来的依赖混在一起，这个镜像就没人说得清
+  是哪一份了；
+- 每个产出的 tag 都带 OCI label（`image.title`、`image.version`、`image.revision`、`image.created`），
+  这样跑着的容器能反查它是从哪次提交构建的；工作树不干净时会提醒一句，因为那时候没有任何一次提交对得上字节。
+
+你没点名的 flag 原样透传给 `docker build`：
+
+```bash
+pnpm docker:build -- --tag registry.example.com/team/aetherops --version 1.0.27 --push
+pnpm docker:build -- --platform linux/amd64       # 交叉构建：自动改成 buildx + --load
+pnpm docker:build -- --no-cache --pull --dry-run  # --dry-run 只打印命令就退出
+```
+
+`--dry-run` 故意不要求 daemon 在跑，所以 Docker Desktop 关着的时候也能先看一遍要执行什么。
+
+手写 `docker build` 仍然可行 —— 包装脚本执行的正是它：
+
 ```bash
 docker build -t aetherops .
 

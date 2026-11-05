@@ -127,6 +127,39 @@ useful contribution — see [CONTRIBUTING.md](../CONTRIBUTING.md#test-scripts).
 The image is a two-stage build (`node:22-slim` for build and runtime, pnpm 10 in both) and contains
 only the application. MySQL and Redis are **not** inside it.
 
+### One command
+
+```bash
+pnpm docker:build           # → aetherops:<package.json version> + aetherops:latest
+```
+
+[`scripts/docker-build.mjs`](../scripts/docker-build.mjs) wraps `docker build` so that failure modes
+knowable in advance are reported before the build starts instead of five layers into:
+
+- the files the Dockerfile `COPY`s (`package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`, `patches`)
+  must be present;
+- the daemon must answer `docker version`, and the message is the raw daemon error rather than a stack;
+- `.dockerignore` must actually cover the heavy local artifacts on disk (`node_modules`, `dist*`,
+  `release`, `packages/vscode/runtime`, `*.vsix`) — `COPY . .` otherwise ships them into the context,
+  and a stale native `node_modules` sitting next to a `--frozen-lockfile` install makes the resulting
+  image unattributable;
+- every produced tag gets OCI labels (`image.title`, `image.version`, `image.revision`,
+  `image.created`) so a running container can be traced back to the commit it was built from; a dirty
+  working tree is warned about, because then no commit matches the bytes.
+
+Flags you do not name are forwarded to `docker build` verbatim:
+
+```bash
+pnpm docker:build -- --tag registry.example.com/team/aetherops --version 1.0.27 --push
+pnpm docker:build -- --platform linux/amd64       # cross-build: switches to buildx + --load
+pnpm docker:build -- --no-cache --pull --dry-run  # --dry-run prints the command and exits
+```
+
+`--dry-run` deliberately does not require a running daemon, so you can see what would run on a machine
+where Docker Desktop is closed.
+
+Plain `docker build` still works — it is what the wrapper execs:
+
 ```bash
 docker build -t aetherops .
 

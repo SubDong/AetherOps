@@ -47,7 +47,8 @@
     "build:vscode:ext": "cd packages/vscode && npm run compile",
     "build:vscode": "npm run build:vscode:web && npm run build:vscode:ext",
     "vscode:dev": "cd packages/vscode && npm run watch",
-    "vscode:package": "npm run build:vscode && node scripts/prepare-vscode-runtime.mjs && cd packages/vscode && vsce package"
+    "vscode:package": "npm run build:vscode && node scripts/prepare-vscode-runtime.mjs && cd packages/vscode && vsce package",
+    "docker:build": "node scripts/docker-build.mjs"
   },
   "dependencies": {
     "@cicctencent/agent-core": "1.0.80",

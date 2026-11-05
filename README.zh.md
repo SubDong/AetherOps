@@ -201,7 +201,7 @@ node server.js
 | 方式 | 命令 / 来源 | 适合 |
 |------|-------------|------|
 | 源码构建 | `pnpm install && pnpm build && node server.js` | 目前的主路径 |
-| Docker | `docker build -t aetherops .`，配合带 MySQL/Redis 的 compose | 服务器部署、团队共用 |
+| Docker | `pnpm docker:build`（或 `docker build -t aetherops .`），配合带 MySQL/Redis 的 compose | 服务器部署、团队共用 |
 | Electron 桌面端 | `pnpm electron:build:win \| :mac \| :linux` | 想要原生窗口的个人用户 |
 | VSCode 插件 | `pnpm vscode:package` 出 `.vsix`，再「从 VSIX 安装」 | 在编辑器里干活 |
 | GitHub Releases | 推送版本标签后由 CI 产出（**目前还没有发过任何 tag**） | 不想本地装工具链 |
@@ -214,12 +214,15 @@ pnpm build:vscode          # 前端 + 后端 + 插件宿主
 pnpm vscode:package        # 打包 .vsix
 
 # Docker
-docker build -t aetherops .
+pnpm docker:build      # 一条命令：前置检查 + aetherops:<version> + :latest
+pnpm docker:build -- --platform linux/amd64 --push   # 交叉构建 / 推到远端
+docker build -t aetherops .   # 上面这个包装最终执行的原生命令
 docker run -d -p 9802:9802 -v ~/.aetherops:/root/.aetherops aetherops
 ```
 
-把 MySQL、Redis 和应用一起拉起来的 compose 文件、反向代理配置（WebSocket 升级是必须的）、
-以及发版流程，见 [docs/deployment.zh.md](./docs/deployment.zh.md)。
+`docker:build` 开跑前会查什么（Dockerfile 要 COPY 的输入、daemon 是否可用、构建上下文有没有
+漏排、工作树是否干净）、把 MySQL、Redis 和应用一起拉起来的 compose 文件、反向代理配置
+（WebSocket 升级是必须的）、以及发版流程，见 [docs/deployment.zh.md](./docs/deployment.zh.md)。
 
 ### CLI
 
@@ -299,6 +302,7 @@ pnpm build-server     # 仅服务端
 pnpm type-check       # vue-tsc
 pnpm lint             # eslint（含 --fix）
 pnpm check-pin        # 校验钉住的依赖与锁文件版本一致
+pnpm docker:build     # 打 Docker 镜像（加 -- --dry-run 只看要执行什么命令）
 node scripts/migrate.mjs --status   # 查看库结构状态
 pnpm smoke            # 终端链路冒烟（脚本还没带令牌，见下文「已知边界」）
 BASE=http://127.0.0.1:9802 ADMIN_USER=admin ADMIN_PASS=... \

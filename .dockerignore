@@ -1,5 +1,6 @@
 node_modules
 dist
+dist.rootbak
 release
 nw-cache
 .git
@@ -9,3 +10,18 @@ nw-cache
 .DS_Store
 .env
 .env.*
+
+# 与镜像无关的目录，Dockerfile 是 `COPY . .`，不排掉就会被算进构建上下文
+# （第一次是白传几百 MB，第二次是错：把本地构建产物或别的平台的原生模块混进去，
+#   而依赖是 --frozen-lockfile 装的，两掺之后没人说得清镜像里跑的到底是哪一份）
+#
+# packages：VS Code 插件宿主。镜像里没有 pnpm workspace 概念
+#   （pnpm-workspace.yaml 没有 packages: 段，且依赖安装发生在 `COPY . .` 之前），
+#   插件的 .vsix 与 prepare-vscode-runtime 产出的 runtime/ 对服务端构建毫无用处。
+#   如果将来真的把它做成 workspace 包，这一行要跟着改，否则镜像装的依赖会不完整。
+# docs / .github：纯文档与 CI 模板，服务端构建与运行都不读它们
+# *.vsix：发版产物，不该出现在下一个镜像里
+packages
+docs
+.github
+*.vsix
