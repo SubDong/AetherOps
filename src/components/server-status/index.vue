@@ -41,6 +41,8 @@
           </div>
           <div v-if="data.os" class="ss-line">
             <i class="bi bi-info-circle"></i><span>{{ t('server.os') }}: {{ data.os }}</span>
+            <!-- 自识别结果做成徽标：同一份数据来自哪套采集脚本，一眼能看出来 -->
+            <em v-if="osFamilyLabel" class="ss-badge" :class="`family-${data.osFamily}`">{{ osFamilyLabel }}</em>
           </div>
           <div v-if="data.cpuModel" class="ss-line">
             <i class="bi bi-cpu"></i><span>{{ t('server.cpu') }}: {{ data.cpuModel }}</span>
@@ -50,32 +52,36 @@
           </div>
         </div>
 
-        <!-- 四项指标 -->
+        <!-- 四项指标：采不到的那项显示「不可用」，别用 0 骗人 -->
         <div class="ss-grid">
           <div class="ss-metric">
             <div class="ss-metric-head">
               <span><i class="bi bi-cpu"></i>{{ t('server.cpu') }}</span>
-              <b>{{ Math.round(data.cpuPercent) }}%</b>
+              <b :class="{ dim: !data.cpuSupported }">{{ data.cpuSupported ? `${Math.round(data.cpuPercent)}%` : '-' }}</b>
             </div>
-            <div class="ss-bar"><i :style="{ width: barWidth(data.cpuPercent), background: barColor(data.cpuPercent) }"></i></div>
-            <div class="ss-metric-foot">{{ t('server.usage') }} {{ fmtPercent(data.cpuPercent) }}</div>
+            <div class="ss-bar"><i v-if="data.cpuSupported" :style="{ width: barWidth(data.cpuPercent), background: barColor(data.cpuPercent) }"></i></div>
+            <div class="ss-metric-foot" :class="{ dim: !data.cpuSupported }">
+              {{ data.cpuSupported ? `${t('server.usage')} ${fmtPercent(data.cpuPercent)}` : t('server.cpuUnavailable') }}
+            </div>
           </div>
 
           <div class="ss-metric">
             <div class="ss-metric-head">
               <span><i class="bi bi-memory"></i>{{ t('server.mem') }}</span>
-              <b>{{ Math.round(memPercent) }}%</b>
+              <b :class="{ dim: !data.memSupported }">{{ data.memSupported ? `${Math.round(memPercent)}%` : '-' }}</b>
             </div>
-            <div class="ss-bar"><i :style="{ width: barWidth(memPercent), background: barColor(memPercent) }"></i></div>
-            <div class="ss-metric-foot">{{ fmtBytes(data.memUsed) }} / {{ fmtBytes(data.memTotal) }}</div>
+            <div class="ss-bar"><i v-if="data.memSupported" :style="{ width: barWidth(memPercent), background: barColor(memPercent) }"></i></div>
+            <div class="ss-metric-foot" :class="{ dim: !data.memSupported }">
+              {{ data.memSupported ? `${fmtBytes(data.memUsed)} / ${fmtBytes(data.memTotal)}` : t('server.memUnavailable') }}
+            </div>
           </div>
 
           <div class="ss-metric">
             <div class="ss-metric-head">
               <span><i class="bi bi-arrow-left-right"></i>{{ t('server.swap') }}</span>
-              <b :class="{ dim: !data.swapSupported }">{{ Math.round(swapPercent) }}%</b>
+              <b :class="{ dim: !data.swapSupported }">{{ data.swapSupported ? `${Math.round(swapPercent)}%` : '-' }}</b>
             </div>
-            <div class="ss-bar"><i :style="{ width: barWidth(swapPercent), background: barColor(swapPercent) }"></i></div>
+            <div class="ss-bar"><i v-if="data.swapSupported" :style="{ width: barWidth(swapPercent), background: barColor(swapPercent) }"></i></div>
             <div class="ss-metric-foot" :class="{ dim: !data.swapSupported }">
               {{ data.swapSupported ? `${fmtBytes(data.swapUsed)} / ${fmtBytes(data.swapTotal)}` : t('server.swapUnavailable') }}
             </div>
@@ -84,10 +90,12 @@
           <div class="ss-metric" :title="data.diskMount">
             <div class="ss-metric-head">
               <span><i class="bi bi-device-hdd"></i>{{ t('server.disk') }}</span>
-              <b>{{ Math.round(diskPercent) }}%</b>
+              <b :class="{ dim: !data.diskSupported }">{{ data.diskSupported ? `${Math.round(diskPercent)}%` : '-' }}</b>
             </div>
-            <div class="ss-bar"><i :style="{ width: barWidth(diskPercent), background: barColor(diskPercent) }"></i></div>
-            <div class="ss-metric-foot">{{ fmtBytes(data.diskUsed) }} / {{ fmtBytes(data.diskTotal) }}</div>
+            <div class="ss-bar"><i v-if="data.diskSupported" :style="{ width: barWidth(diskPercent), background: barColor(diskPercent) }"></i></div>
+            <div class="ss-metric-foot" :class="{ dim: !data.diskSupported }">
+              {{ data.diskSupported ? `${fmtBytes(data.diskUsed)} / ${fmtBytes(data.diskTotal)}` : t('server.diskUnavailable') }}
+            </div>
           </div>
         </div>
 
@@ -115,8 +123,8 @@
           </div>
         </div>
 
-        <!-- CPU 使用率曲线 -->
-        <div class="ss-card ss-chart-card">
+        <!-- CPU 使用率曲线（采不到时不画一条贴着 0 的假曲线） -->
+        <div v-if="data.cpuSupported" class="ss-card ss-chart-card">
           <div class="ss-chart-head">
             <span><i class="bi bi-graph-up"></i>{{ t('server.cpuUsage') }}</span>
             <b>{{ fmtPercent(data.cpuPercent) }}</b>
@@ -199,6 +207,15 @@ let requestSeq = 0;
 const memPercent = computed(() => ratio(data.value?.memUsed, data.value?.memTotal));
 const swapPercent = computed(() => ratio(data.value?.swapUsed, data.value?.swapTotal));
 const diskPercent = computed(() => ratio(data.value?.diskUsed, data.value?.diskTotal));
+
+/** 服务端识别出的系统家族 → 展示名；服务端加了新家族而这里没跟上时退回原始字符串 */
+const osFamilyLabel = computed(() => {
+  const family = data.value?.osFamily || '';
+  if (!family || family === 'unknown') return '';
+  const key = `server.family_${family}`;
+  const label = t(key);
+  return label === key ? family : label;
+});
 
 /** Windows 本机没有分网卡计数，服务端统一报 all，展示时换成整机说法 */
 const netIfaceLabel = computed(() => {
@@ -326,9 +343,12 @@ async function poll() {
     if (!alive || seq !== requestSeq) return;
     data.value = snapshot;
     error.value = '';
-    pushHistory(cpuHistory, snapshot.cpuPercent);
-    pushHistory(rxHistory, snapshot.netRxBps / 1024);
-    pushHistory(txHistory, snapshot.netTxBps / 1024);
+    // 采不到的指标不参与曲线采样：0 会伪装成「真的很空闲」
+    if (snapshot.cpuSupported) pushHistory(cpuHistory, snapshot.cpuPercent);
+    if (snapshot.netSupported) {
+      pushHistory(rxHistory, snapshot.netRxBps / 1024);
+      pushHistory(txHistory, snapshot.netTxBps / 1024);
+    }
   } catch (e: any) {
     if (!alive || seq !== requestSeq) return;
     error.value = e?.message || t('server.failed');
@@ -548,6 +568,31 @@ onBeforeUnmount(() => {
 
 .ss-line span {
   word-break: break-word;
+}
+
+/* 自识别出的系统家族徽标 */
+.ss-badge {
+  flex-shrink: 0;
+  font-style: normal;
+  font-size: 9.5px;
+  line-height: 1.5;
+  padding: 0 5px;
+  border-radius: 3px;
+  color: var(--accent);
+  background: rgb(var(--accent-rgb) / 14%);
+  border: 1px solid rgb(var(--accent-rgb) / 28%);
+}
+
+.ss-badge.family-harmony {
+  color: var(--warning);
+  background: rgb(var(--warning-rgb) / 12%);
+  border-color: rgb(var(--warning-rgb) / 26%);
+}
+
+.ss-badge.family-unknown {
+  color: var(--text-secondary);
+  background: rgb(var(--overlay-rgb) / 10%);
+  border-color: rgb(var(--overlay-rgb) / 20%);
 }
 
 .ss-grid {

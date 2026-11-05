@@ -9,6 +9,17 @@ import * as path from 'path';
 import { shellQuote } from '../utils/shell';
 import { stripAnsiEscapes } from '../utils/ansi';
 import { listSessionMeta, upsertSessionMeta, deleteSessionMeta } from '../db/repositories/session.repo';
+import {
+  PROBE_SCRIPT,
+  WINDOWS_PROBE_SCRIPT,
+  detectFamily,
+  localFamily,
+  readSections,
+  renderEnvInfo,
+  scriptFor,
+  scriptForWindowsWith,
+} from '../utils/os-detect';
+import type { OsFamily } from '../utils/os-detect';
 
 // 尝试加载 node-pty，如果可用则使用 PTY 模式
 let nodePty: any = null;
@@ -268,6 +279,35 @@ export interface RemoteFileInfo {
 }
 
 /**
+ * 提示符行特征：写进交互式终端抓回显时，shell 会在每段输出前后把提示符也打出来。
+ * 只认这几类固定形状，普通数据行（`- Memory: 16 GB`、`MemTotal: ...`）一律保留。
+ */
+const PROMPT_LINE_RES = [
+  // user@host:/path$ cmd 、 root@dev ~ # 、 [user@host ~]$
+  /^[\w.-]+@[\w.-]+(?::\S*)?\s*(?:\][\s]*)?[#$>]\s?/,
+  // PS C:\Users\admin> 、 C:\>
+  /^(?:PS\s+)?[A-Za-z]:\\\S*>\s?/,
+  // bash-5.1$ 、 sh-4.4# 、 msh 、 ohos_arm64:/ #
+  /^(?:[a-z]+-[\d.]+[#$>]|[\w.-]+:\/\s*[#$>])[\s$#>]*$/,
+  // 光剩一个提示符符尾
+  /^[#$>]$/,
+];
+
+/**
+ * 去掉回显里的提示符行，让 readSections 只看得到真正的输出。
+ */
+function stripPromptLines(raw: string): string {
+  return String(raw || '')
+    .split(/\r?\n/)
+    .filter((line) => {
+      const text = line.trim();
+      if (!text) return true;
+      return !PROMPT_LINE_RES.some((re) => re.test(text));
+    })
+    .join('\n');
+}
+
+/**
  * 终端会话管理服务
  * 支持 SSH 远程连接和本地 Shell
  */
@@ -278,6 +318,10 @@ export class SSHService {
   private outputListeners: Map<string, (data: string) => void> = new Map();
   /** SSH 会话 MOTD 捕获 Promise（连接后自动后台采集） */
   private pendingMOTDCaptures: Map<string, Promise<string>> = new Map();
+  /** 会话 → 识别出的系统家族：探一次就记住，Windows 探测要起 PowerShell，不能每轮都探 */
+  private osFamilies = new Map<string, OsFamily>();
+  /** 进行中的家族探测：面板与 AI 同时发问时只探一次 */
+  private osFamilyProbes = new Map<string, Promise<OsFamily>>();
   /** 是否曾在本实例创建过 session（用于区分主进程/渲染进程实例，仅主进程实例执行定时清理） */
   private hasCreatedSession: boolean = false;
   /** 定时清理僵尸 session 的定时器 */
@@ -792,10 +836,13 @@ export class SSHService {
       return meta.systemContext;
     }
 
-    // SSH 会话：等待后台 MOTD 捕获完成
+    // SSH 会话：等后台 MOTD 捕获完成
     const pending = this.pendingMOTDCaptures.get(sessionId);
     if (pending) {
-      const info = await pending;
+      const motdInfo = await pending;
+      // MOTD 抓不到东西太常见（Windows / 鸿蒙设备基本没有横幅）：
+      // 按识别出的家族主动采集一次，别把空上下文交给 AI，否则它只能猜
+      const info = motdInfo || await this.collectRemoteEnv(sessionId);
       if (meta) {
         meta.systemContext = info;
         await this.persistSession(sessionId);
@@ -807,8 +854,8 @@ export class SSHService {
     // local 会话或未捕获的 SSH 会话
     let info: string;
     if (meta?.type === 'ssh') {
-      // SSH 但没有 pending，主动运行命令采集系统信息
-      info = await this.activeCollectRemoteSystemInfo(sessionId);
+      // SSH 但没有 pending：走独立 exec 通道按家族采集，不再往交互式终端里插命令
+      info = await this.collectRemoteEnv(sessionId);
     } else {
       info = this.collectLocalSystemInfo();
     }
@@ -852,52 +899,41 @@ export class SSHService {
 
   /**
    * Active system info collection for SSH sessions (e.g. jump host)
-   * Sends a compact command to the remote terminal and captures the output
+   *
+   * 跳板机场景下 exec 通道落在跳板机上，只能把命令写进交互式终端、等目标机跑完再抓回显。
+   * 先探家族再发对应脚本：以前无条件写 bash 语法，碰上 Windows 目标机只会回显一串认不出的报错。
    */
   private async activeCollectRemoteSystemInfo(sessionId: string): Promise<string> {
-    const marker = '__AETHEROPS_SYS__';
-    const cmd = `echo "${marker}:$(uname -s 2>/dev/null || echo unknown):$(uname -r 2>/dev/null || echo unknown):$(hostname 2>/dev/null || echo unknown):$(whoami 2>/dev/null || echo unknown):$SHELL:$(uname -m 2>/dev/null || echo unknown)"`;
-    try {
-      // Start capture, then send the command
-      // Use longer timeout (5s) to account for slow SSH connections and MOTD output
-      const outputPromise = this.captureOutput(sessionId, 5000);
-      this.writeData(sessionId, cmd + '\r');
-      const output = await outputPromise;
-      // Clean ANSI escape codes for more reliable marker matching
-      const cleaned = stripAnsiEscapes(output).replace(/\r/g, '');
-      // Extract our marker line
-      for (const line of cleaned.split('\n')) {
-        const trimmed = line.trim();
-        // Handle possible command echo: skip lines that still contain the raw command prefix
-        if (trimmed.includes(marker + ':') && !trimmed.startsWith('echo')) {
-          const markerIdx = trimmed.indexOf(marker + ':');
-          const markerLine = trimmed.substring(markerIdx);
-          const parts = markerLine.split(':');
-          if (parts.length >= 7) {
-            const info: Record<string, string> = {
-              'OS': parts[1],
-              'Kernel': parts[2],
-              'Hostname': parts[3],
-              'User': parts[4],
-              'Shell': parts[5],
-              'Arch': parts[6] || '',
-            };
-            const lines = ['System environment info:'];
-            for (const [key, val] of Object.entries(info)) {
-              if (val && val !== 'unknown') lines.push(`- ${key}: ${val}`);
-            }
-            const result = lines.join('\n');
-            console.log(`[SSH] Active system info collected for ${sessionId}:`, result);
-            return result;
-          }
-        }
-      }
-      console.warn(`[SSH] Marker not found in output for ${sessionId}, marker=${marker}`);
-      return '';
-    } catch (e) {
-      console.warn(`[SSH] Failed to actively collect system info for ${sessionId}:`, e);
-      return '';
+    const family = await this.probeFamilyViaTerminal(sessionId);
+    const raw = await this.runInTerminal(sessionId, scriptFor(family), 15000, 1500);
+    const info = renderEnvInfo(family, readSections(stripPromptLines(raw)));
+    if (info) {
+      console.log(`[SSH] Active system info collected for ${sessionId} (${family}):\n${info}`);
+    } else {
+      console.warn(`[SSH] Active collection for ${sessionId} (${family}) 没解析出环境信息`);
     }
+    return info;
+  }
+
+  /**
+   * 交互式探测系统家族：判据与 exec 版一致，只是命令写进终端、靠回显拿答案。
+   */
+  private async probeFamilyViaTerminal(sessionId: string): Promise<OsFamily> {
+    const posix = readSections(stripPromptLines(await this.runInTerminal(sessionId, PROBE_SCRIPT, 8000, 800)));
+    const uname = (posix.UNAME || '').trim();
+    if (uname) return detectFamily(posix);
+    const winRaw = await this.runInTerminal(sessionId, WINDOWS_PROBE_SCRIPT, 8000, 800);
+    return detectFamily(posix, winRaw);
+  }
+
+  /**
+   * 把命令写进交互式终端并等输出平息（静默 idleMs 就收，最长 maxMs）。
+   * 先挂监听再写命令，否则首帧会丢。
+   */
+  private async runInTerminal(sessionId: string, command: string, maxMs: number, idleMs: number): Promise<string> {
+    const outputPromise = this.captureOutputIdle(sessionId, idleMs, maxMs);
+    this.writeData(sessionId, command + '\r');
+    return outputPromise;
   }
 
   /**
@@ -1027,128 +1063,37 @@ export class SSHService {
   }
 
   /**
-   * 采集本地系统环境信息（仅用于 local session）
+   * 采集本地系统环境信息（仅用于 local session）。
+   * 与远端共用同一套家族识别与采集脚本，避开原先「Windows 一份、Unix 一份」
+   * 且 Unix 那份带 $(...) 与 awk、Windows 那份带 chcp 的三处重复实现。
    */
   private collectLocalSystemInfo(): string {
-    if (process.platform === 'win32') {
-      return this.collectWindowsSystemInfo();
-    }
-    return this.collectUnixSystemInfo();
-  }
-
-  /**
-   * 采集 Windows 系统环境信息（PowerShell）
-   */
-  private collectWindowsSystemInfo(): string {
-    const psScript = `
-[Console]::OutputEncoding = [Text.Encoding]::UTF8;
-$os = (Get-CimInstance Win32_OperatingSystem).Caption
-$kernel = [System.Environment]::OSVersion.Version.ToString()
-$hostname = $env:COMPUTERNAME
-$arch = $env:PROCESSOR_ARCHITECTURE
-$user = $env:USERNAME
-$cpu = (Get-CimInstance Win32_Processor | Select-Object -First 1).Name
-$cpuCores = (Get-CimInstance Win32_Processor | Measure-Object -Property NumberOfLogicalProcessors -Sum).Sum
-$memBytes = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
-$memGB = [math]::Round($memBytes / 1GB, 1)
-$nodeVer = try { & node --version 2>$null } catch { 'none' }
-$pyVer = try { & python --version 2>$null } catch { try { & python3 --version 2>$null } catch { 'none' } }
-$dockerVer = try { & docker --version 2>$null } catch { 'none' }
-Write-Output "__OS__: $os"
-Write-Output "__KERNEL__: $kernel"
-Write-Output "__HOSTNAME__: $hostname"
-Write-Output "__SHELL__: PowerShell"
-Write-Output "__ARCH__: $arch"
-Write-Output "__USER__: $user"
-Write-Output "__CPU__: $cpu ($cpuCores cores)"
-Write-Output "__MEM__: \${memGB}GB"
-Write-Output "__NODE__: $nodeVer"
-Write-Output "__PYTHON__: $pyVer"
-Write-Output "__DOCKER__: $dockerVer"
-`.trim();
-
+    const family = localFamily();
     try {
-      const result = execSync(
-        `chcp 65001 >nul & powershell.exe -NoProfile -NonInteractive -Command "${psScript.replace(/"/g, '\\"').replace(/\n/g, '; ')}"`,
-        { encoding: 'utf-8', timeout: 10000 }
-      );
-      return this.formatSystemInfo(result);
-    } catch {
-      try {
-        const basic = execSync('chcp 65001 >nul & systeminfo | findstr /B /C:"OS Name" /C:"OS Version" /C:"System Type"', {
-          encoding: 'utf-8', timeout: 15000,
-        });
-        return `Basic system info:\n${basic}`;
-      } catch {
-        return 'Unable to collect system info';
-      }
+      const raw = execSync(scriptFor(family), {
+        encoding: 'utf-8',
+        timeout: family === 'windows' ? 20000 : 8000,
+        shell: family === 'windows' ? undefined : '/bin/bash',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+      });
+      const info = renderEnvInfo(family, readSections(raw));
+      if (info) return info;
+    } catch (error: any) {
+      console.warn(`[SSH] collectLocalSystemInfo(${family}) 失败: ${error?.message || error}`);
     }
-  }
-
-  /**
-   * 采集 Unix/macOS/Linux 系统环境信息（Bash）
-   */
-  private collectUnixSystemInfo(): string {
-    const commands = [
-      'echo "__OS__: $(uname -s 2>/dev/null || echo unknown)"',
-      'echo "__KERNEL__: $(uname -r 2>/dev/null || echo unknown)"',
-      'echo "__HOSTNAME__: $(hostname 2>/dev/null || echo unknown)"',
-      'echo "__SHELL__: $SHELL"',
-      'echo "__ARCH__: $(uname -m 2>/dev/null || echo unknown)"',
-      'echo "__USER__: $(whoami 2>/dev/null || echo unknown)"',
-      'if command -v apt-get >/dev/null 2>&1; then echo "__PM__: apt (Debian/Ubuntu)"; elif command -v yum >/dev/null 2>&1; then echo "__PM__: yum (RHEL/CentOS)"; elif command -v dnf >/dev/null 2>&1; then echo "__PM__: dnf (Fedora)"; elif command -v pacman >/dev/null 2>&1; then echo "__PM__: pacman (Arch)"; elif command -v brew >/dev/null 2>&1; then echo "__PM__: brew (macOS)"; else echo "__PM__: unknown"; fi',
-      'if command -v docker >/dev/null 2>&1; then echo "__DOCKER__: $(docker --version 2>/dev/null)"; else echo "__DOCKER__: none"; fi',
-      'if command -v nginx >/dev/null 2>&1; then echo "__WEBSERVER__: nginx"; elif command -v httpd >/dev/null 2>&1; then echo "__WEBSERVER__: apache"; elif command -v caddy >/dev/null 2>&1; then echo "__WEBSERVER__: caddy"; else echo "__WEBSERVER__: none"; fi',
-      'if command -v mysql >/dev/null 2>&1; then echo "__DB__: mysql"; elif command -v psql >/dev/null 2>&1; then echo "__DB__: postgresql"; elif command -v mongosh >/dev/null 2>&1; then echo "__DB__: mongodb"; else echo "__DB__: none"; fi',
-      'echo "__NODE__: $(node --version 2>/dev/null || echo none)"',
-      'echo "__PYTHON__: $(python3 --version 2>/dev/null || python --version 2>/dev/null || echo none)"',
-      'echo "__CPU__: $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo unknown) cores"',
-      'echo "__MEM__: $(free -h 2>/dev/null | awk \'/Mem:/{print $2}\' || sysctl -n hw.memsize 2>/dev/null | awk \'{printf \\"%.0fGB\\", $1/1024/1024/1024}\' || echo unknown)"',
+    // 脚本整体跑挂时至少给 Node 能直接读到的事实，别交空上下文让 AI 猜系统类型
+    return [
+      'System environment info (fallback):',
+      `- OS: ${os.type()}`,
+      `- Kernel: ${os.release()}`,
+      `- Hostname: ${os.hostname()}`,
+      `- Arch: ${os.arch()}`,
+      `- CPU cores: ${os.cpus().length}`,
+      `- Memory: ${os.totalmem()}`,
+      `- Shell: ${process.env.SHELL || process.env.COMSPEC || ''}`,
+      `- Node.js: ${process.version}`,
     ].join('\n');
-
-    try {
-      const result = execSync(commands, { encoding: 'utf-8', timeout: 5000, shell: process.platform === 'win32' ? undefined : '/bin/bash' });
-      return this.formatSystemInfo(result);
-    } catch {
-      try {
-        const basic = execSync('uname -a && whoami && echo $SHELL', { encoding: 'utf-8', timeout: 3000 });
-        return `Basic system info:\n${basic}`;
-      } catch {
-        return 'Unable to collect system info';
-      }
-    }
-  }
-
-  /**
-   * 格式化采集结果
-   */
-  private formatSystemInfo(raw: string): string {
-    const map: Record<string, string> = {};
-    const labelMap: Record<string, string> = {
-      '__OS__': 'OS', '__KERNEL__': 'Kernel', '__HOSTNAME__': 'Hostname',
-      '__SHELL__': 'Shell', '__ARCH__': 'Arch', '__USER__': 'User',
-      '__PM__': 'Package Manager', '__DOCKER__': 'Docker', '__WEBSERVER__': 'Web Server',
-      '__DB__': 'Database', '__FW__': 'Firewall', '__NODE__': 'Node.js',
-      '__PYTHON__': 'Python', '__CPU__': 'CPU', '__MEM__': 'Memory',
-    };
-    for (const line of raw.split('\n')) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      const match = trimmed.match(/^(__\w+__):\s*(.*)/);
-      if (match) {
-        const val = match[2].trim();
-        const label = labelMap[match[1]] || match[1];
-        if (val && val !== 'none' && val !== 'unknown') {
-          map[label] = val;
-        }
-      }
-    }
-    if (Object.keys(map).length === 0) return raw;
-    const lines = ['System environment info:'];
-    for (const [key, val] of Object.entries(map)) {
-      lines.push(`- ${key}: ${val}`);
-    }
-    return lines.join('\n');
   }
 
   /**
@@ -1459,6 +1404,81 @@ Write-Output "__DOCKER__: $dockerVer"
     return this.sessions.get(sessionId)?.type;
   }
 
+  // ========== 系统家族识别（Windows / macOS / Linux / HarmonyOS / 其它 Unix） ==========
+
+  /**
+   * 这台机器属于哪个系统家族。面板与 AI 环境信息共用同一个结果，避免两套判断口径。
+   * 本机会话直接看 process.platform，远程会话探测一次就缓存。
+   */
+  async detectOsFamily(sessionId: string): Promise<OsFamily> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return this.osFamilies.get(sessionId) || 'unknown';
+    if (session.type !== 'ssh') return localFamily();
+
+    const cached = this.osFamilies.get(sessionId);
+    if (cached) return cached;
+    const pending = this.osFamilyProbes.get(sessionId);
+    if (pending) return pending;
+
+    const probe = this.probeOsFamily(sessionId);
+    this.osFamilyProbes.set(sessionId, probe);
+    try {
+      const family = await probe;
+      this.osFamilies.set(sessionId, family);
+      return family;
+    } finally {
+      this.osFamilyProbes.delete(sessionId);
+    }
+  }
+
+  /** 同步读已识别的结果：还没探过返回 undefined，调用方别拿它编一个出来 */
+  getOsFamily(sessionId: string): OsFamily | undefined {
+    return this.osFamilies.get(sessionId);
+  }
+
+  /**
+   * 两轮探测：先问 POSIX 的问题，没声音再按 Windows 问一次。
+   * 顺序不能反：Windows 探测在 cmd 里靠 %OS% 展开，拿到 PowerShell 默认 shell 时
+   * 只会原样回显，真正能定性的是「uname 有没有输出」。
+   */
+  private async probeOsFamily(sessionId: string): Promise<OsFamily> {
+    const posix = readSections(await this.execRemote(sessionId, PROBE_SCRIPT, 8000));
+    const uname = (posix.UNAME || '').trim();
+    if (uname) {
+      const family = detectFamily(posix);
+      console.log(`[SSH] detectOsFamily ${sessionId}: uname=${uname} -> ${family}`);
+      return family;
+    }
+    const winRaw = await this.execRemote(sessionId, WINDOWS_PROBE_SCRIPT, 8000);
+    const family = detectFamily(posix, winRaw);
+    console.log(`[SSH] detectOsFamily ${sessionId}: 无 uname，Windows 探测${winRaw.trim() ? '命中' : '无结果'} -> ${family}`);
+    return family;
+  }
+
+  /**
+   * 按家族采集远端环境信息（给 AI 的上下文）。
+   * 走独立 exec 通道：不打断终端里的前台进程，也不会像以前那样把 bash 语法
+   * 写给 Windows 目标机，最后只回显一串看不懂的报错。
+   */
+  private async collectRemoteEnv(sessionId: string): Promise<string> {
+    const family = await this.detectOsFamily(sessionId);
+    if (family === 'unknown') return '';
+    const timeoutMs = family === 'windows' ? 20000 : 8000;
+    try {
+      let sections = readSections(await this.execRemote(sessionId, scriptFor(family), timeoutMs));
+      if (!Object.keys(sections).length && family === 'windows') {
+        // 只装了 pwsh 的机器没有 powershell.exe，换一次再试
+        sections = readSections(await this.execRemote(sessionId, scriptForWindowsWith(true), timeoutMs));
+      }
+      const info = renderEnvInfo(family, sections);
+      if (!info) console.warn(`[SSH] collectRemoteEnv ${sessionId}(${family}) 没有解析出任何环境信息`);
+      return info;
+    } catch (error: any) {
+      console.warn(`[SSH] collectRemoteEnv ${sessionId}(${family}) 失败:`, error?.message || error);
+      return '';
+    }
+  }
+
   /**
    * 在会话对应主机上跑一条只读命令（独立 exec 通道）。
    * 不会向交互式终端写入任何内容，因此不会打断 rz/vim 等前台进程。
@@ -1654,6 +1674,9 @@ Write-Output "__DOCKER__: $dockerVer"
    * 关闭会话
    */
   closeSession(sessionId: string): void {
+    // 家族识别结果跟着会话一起丢：同一个 id 将来可能是另一台机器
+    this.osFamilies.delete(sessionId);
+    this.osFamilyProbes.delete(sessionId);
     const session = this.sessions.get(sessionId);
     if (session) {
       if (session.cwdRefreshTimer) {
