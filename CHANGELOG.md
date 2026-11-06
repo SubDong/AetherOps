@@ -33,8 +33,8 @@ supported build, and record the commit you run.
 
 ### Changed
 
-- **`.dockerignore` tightened** to also exclude `packages`, `docs`, `.github`, `*.vsix` and
-  `dist.rootbak`. The `Dockerfile` uses `COPY . .`, so anything left out of this file is shipped into
+- **`.dockerignore` tightened** to also exclude `packages`, `docs`, `.github`, `*.vsix`, `dist.rootbak`
+  and `temp/`. The `Dockerfile` uses `COPY . .`, so anything left out of this file is shipped into
   the build context: the first time it is just slow, the second time it is wrong, because stale local
   build output gets mixed into an image whose dependencies were installed with `--frozen-lockfile`.
 

@@ -21,7 +21,10 @@ nw-cache
 #   如果将来真的把它做成 workspace 包，这一行要跟着改，否则镜像装的依赖会不完整。
 # docs / .github：纯文档与 CI 模板，服务端构建与运行都不读它们
 # *.vsix：发版产物，不该出现在下一个镜像里
+# temp：本地临时工作区（已写进 .gitignore），但 .gitignore 对构建上下文没有任何作用，
+#   而下面依赖的是 `COPY . .`，所以这里必须单独排掉
 packages
 docs
 .github
 *.vsix
+temp/

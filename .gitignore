@@ -51,3 +51,4 @@ dist.rootbak/
 *.vsix
 # 打包进扩展的后端运行时（由 scripts/prepare-vscode-runtime.mjs 生成，不入库）
 packages/vscode/runtime/
+temp/
