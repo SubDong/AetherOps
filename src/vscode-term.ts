@@ -7,7 +7,7 @@
  *
  * 一个连接打开一个独立 tab；连接信息由查询参数传入：
  *   ?connectionId=xxx&name=连接名
- * 缺省 connectionId 或不传时视为本地 Shell（id = __local__）。
+ * 缺省 connectionId 或不传时视为默认服务器 Shell（id = __local__）。
  */
 import { createApp } from 'vue';
 import { createPinia } from 'pinia';
@@ -38,7 +38,7 @@ const params = new URLSearchParams(location.search);
 const connectionId = params.get('connectionId') || '__local__';
 const name =
   params.get('name') ||
-  (connectionId === '__local__' ? '本地 Shell' : connectionId);
+  (connectionId === '__local__' ? i18n.global.t('app.localShell') : connectionId);
 
 // 每个 WebView 页生成独立 tabId，作为 AI 会话 / 组件 key
 const tabId = `vscode-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;

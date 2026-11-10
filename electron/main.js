@@ -350,7 +350,7 @@ function setupTerminalIPC() {
 
       switch (type) {
         case 'create': {
-          const { connectionId, cols, rows, name } = data || {};
+          const { connectionId, cols, rows, name, serverShellPassword } = data || {};
           if (!connectionId) {
             send({ type: 'error', data: 'Missing connectionId' });
             return;
@@ -363,7 +363,7 @@ function setupTerminalIPC() {
 
           const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, (msg) => {
             send({ type: 'conn-log', sessionId, data: msg });
-          }, user.userId);
+          }, user.userId, { serverShellPassword });
 
           // 绑定输出
           const sendOutput = (chunk) => {
@@ -405,7 +405,7 @@ function setupTerminalIPC() {
             sshService.closeSession(sid);
           }
           // 复用 create 逻辑
-          const { connectionId, cols, rows, name } = data || {};
+          const { connectionId, cols, rows, name, serverShellPassword } = data || {};
           if (!connectionId) {
             send({ type: 'error', data: 'Missing connectionId' });
             return;
@@ -417,7 +417,7 @@ function setupTerminalIPC() {
 
           const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, (msg) => {
             send({ type: 'conn-log', sessionId, data: msg });
-          }, user.userId);
+          }, user.userId, { serverShellPassword });
 
           const sendOutput = (chunk) => {
             if (win.isDestroyed()) return;
@@ -521,7 +521,7 @@ function setupTerminalIPC() {
       }
     } catch (err) {
       console.error('[IPC] Error processing message:', err);
-      send({ type: 'error', data: err.message || 'Internal error' });
+      send({ type: 'error', data: err.message || 'Internal error', code: err.code });
     }
   });
 }

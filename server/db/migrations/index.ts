@@ -3,6 +3,7 @@ import { ACCOUNTS_SQL } from './0002-accounts';
 import { MULTI_AI_SQL } from './0003-multi-ai';
 import { COST_CONTROL_SQL } from './0004-cost-control';
 import { BATCH_PERMISSION_SQL } from './0005-batch-permission';
+import { SYSTEM_CONFIG_SQL } from './0006-system-config';
 
 /**
  * 迁移清单。
@@ -30,6 +31,7 @@ export const MIGRATIONS: Migration[] = [
   { version: '0003', name: 'multi-ai-profiles-and-chats', sql: MULTI_AI_SQL },
   { version: '0004', name: 'ai-cost-control', sql: COST_CONTROL_SQL },
   { version: '0005', name: 'batch-permission', sql: BATCH_PERMISSION_SQL },
+  { version: '0006', name: 'system-config', sql: SYSTEM_CONFIG_SQL },
 ];
 
 /** 供 CLI 导出 .sql 文本 */

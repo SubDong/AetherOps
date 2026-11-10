@@ -8,6 +8,11 @@ import { BatchService } from './service/batch.service';
 import { SnippetService } from './service/snippet.service';
 import { SystemStatusService } from './service/system-status.service';
 import { kickUser } from './service/auth.service';
+import {
+  clearServerShellPassword,
+  getServerShellPasswordState,
+  setServerShellPassword,
+} from './service/server-shell.service';
 import { closeTerminalSockets, countTerminalSockets } from './utils/socket-registry';
 import { initAccounts } from './routes/auth.routes';
 
@@ -193,6 +198,30 @@ export async function handleRoutes(pathname: string, body: any, ctx: AuthContext
   assertPermission(pathname, ctx);
   assertSessionOwner(ctx, body);
   try {
+    // ========== 系统设置（全局配置；写操作仅管理员） ==========
+
+    // 「默认服务器 Shell」口令状态。不登记到权限表：assertAdmin 已把非管理员挡住，
+    // 再挂一个功能权限位会让「停掉 terminal 权限」反而能改主机口令。
+    if (pathname === '/api/system/getServerShell') {
+      assertAdmin(ctx);
+      return await getServerShellPasswordState();
+    }
+
+    if (pathname === '/api/system/setServerShellPassword') {
+      assertAdmin(ctx);
+      await setServerShellPassword(typeof body?.password === 'string' ? body.password : '');
+      console.log(`[Admin] ${ctx.username} 已更新默认服务器 Shell 口令`);
+      return true;
+    }
+
+    // 清除后不是免密，而是谁都打不开，需要管理员重新设置
+    if (pathname === '/api/system/clearServerShellPassword') {
+      assertAdmin(ctx);
+      const removed = await clearServerShellPassword();
+      console.log(`[Admin] ${ctx.username} 已清除默认服务器 Shell 口令（影响 ${removed} 条记录）`);
+      return removed;
+    }
+
     // ========== 连接管理 ==========
 
     // 获取所有连接

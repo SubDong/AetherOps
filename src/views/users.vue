@@ -16,6 +16,36 @@
         <button class="notice-close" @click="notice = null"><i class="bi bi-x"></i></button>
       </div>
 
+      <!-- 默认服务器 Shell：终端开在服务端主机上，口令对所有账号生效 -->
+      <div class="create-card">
+        <div class="shell-head">
+          <div class="shell-title"><i class="bi bi-terminal"></i>{{ t('app.localShell') }}</div>
+          <span class="shell-status" :class="{ on: shellState.required }">
+            {{ shellState.required ? t('serverShell.statusSet') : t('serverShell.statusUnset') }}
+          </span>
+        </div>
+        <p class="shell-hint">{{ t('serverShell.settingsHint') }}</p>
+        <div class="shell-form">
+          <input
+            v-model="shellPassword"
+            type="password"
+            class="field"
+            :placeholder="t('serverShell.newPassword')"
+            autocomplete="new-password"
+            @keydown.enter="saveShellPassword"
+          />
+          <button class="btn-new" :disabled="shellBusy || shellPassword.length < 8" @click="saveShellPassword">
+            {{ t('serverShell.set') }}
+          </button>
+          <button class="btn-ghost" :disabled="shellBusy || !shellState.required" @click="clearShellPassword">
+            {{ t('serverShell.clear') }}
+          </button>
+        </div>
+        <p v-if="shellState.required && shellState.updatedAt" class="shell-hint">
+          {{ t('serverShell.updatedAt', { time: formatTime(shellState.updatedAt) }) }}
+        </p>
+      </div>
+
       <!-- 新建账号 -->
       <div v-if="showCreate" class="create-card">
         <div class="create-grid">
@@ -157,6 +187,12 @@ import { toast } from '@/utils/toast';
 import { modal } from '@/utils/modal';
 import MemberConsole from '@/components/member-console/index.vue';
 import {
+  clearServerShellPassword as clearServerShellPasswordApi,
+  getServerShellState,
+  setServerShellPassword,
+  type ServerShellPasswordState,
+} from '@/service/system';
+import {
   PERMISSION_KEYS,
   adminCreateUser,
   adminDeleteUser,
@@ -188,6 +224,53 @@ const createForm = reactive({
   role: 'user' as UserRole,
   permissions: Object.fromEntries(PERMISSION_KEYS.map(k => [k, false])) as Record<string, boolean>,
 });
+
+/* ---------------- 默认服务器 Shell 口令 ---------------- */
+const shellPassword = ref('');
+const shellBusy = ref(false);
+const shellState = ref<ServerShellPasswordState>({ required: false, updatedAt: null });
+
+async function loadServerShell() {
+  try {
+    shellState.value = await getServerShellState();
+  } catch (e: any) {
+    notice.value = { type: 'error', text: e?.message || t('common.failed') };
+  }
+}
+
+async function saveShellPassword() {
+  if (shellBusy.value) return;
+  if (shellPassword.value.length < 8) {
+    notice.value = { type: 'error', text: t('serverShell.tooShort') };
+    return;
+  }
+  shellBusy.value = true;
+  try {
+    await setServerShellPassword(shellPassword.value);
+    shellPassword.value = '';
+    notice.value = { type: 'success', text: t('serverShell.setSuccess') };
+    await loadServerShell();
+  } catch (e: any) {
+    notice.value = { type: 'error', text: e?.message || t('common.failed') };
+  } finally {
+    shellBusy.value = false;
+  }
+}
+
+async function clearShellPassword() {
+  if (shellBusy.value) return;
+  if (!(await modal.confirm(t('serverShell.clearConfirm')))) return;
+  shellBusy.value = true;
+  try {
+    await clearServerShellPasswordApi();
+    notice.value = { type: 'success', text: t('serverShell.clearSuccess') };
+    await loadServerShell();
+  } catch (e: any) {
+    notice.value = { type: 'error', text: e?.message || t('common.failed') };
+  } finally {
+    shellBusy.value = false;
+  }
+}
 
 const PERM_LABELS: Record<PermissionKey, string> = {
   terminal: 'permTerminal',
@@ -294,7 +377,11 @@ async function removeUser(user: AuthUser) {
   }
 }
 
-onMounted(load);
+onMounted(() => {
+  void load();
+  // 口令状态读不到时不影响账号列表：loadServerShell 内部自己报 notice
+  void loadServerShell();
+});
 </script>
 
 <style scoped>
@@ -391,6 +478,58 @@ onMounted(load);
   border: 0;
   color: inherit;
   cursor: pointer;
+}
+
+.shell-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.shell-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.shell-status {
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 11px;
+  border: 1px solid #d29922;
+  color: #d29922;
+}
+
+.shell-status.on {
+  border-color: #2ea043;
+  color: #7ee787;
+}
+
+.shell-hint {
+  margin: 8px 0 10px;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-secondary, #8b949e);
+}
+
+.shell-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 口令输入框比账号表单宽，避免一屏内看不清自己输了什么 */
+.shell-form .field {
+  flex: 1 1 260px;
+  max-width: 360px;
+}
+
+/* .btn-new 默认 margin-left: auto 用来贴右，这里不靠右 */
+.shell-form .btn-new {
+  margin-left: 0;
 }
 
 .create-card {

@@ -208,10 +208,10 @@ export const useTerminalStore = defineStore('terminal', {
       // Session 信息由 server 端管理，浏览器端不再持久化
     },
 
-    // 创建本地 Shell TAB（不保存到连接列表，每次新建）
+    // 创建默认服务器 Shell TAB（不保存到连接列表，每次新建）
     openLocalShell(customName?: string) {
       const LOCAL_SHELL_ID = '__local__';
-      // 计算本地 Shell Tab 序号，用于显示名称
+      // 计算默认服务器 Shell Tab 序号，用于显示名称
       const localCount = this.tabs.filter(t => t.connectionId === LOCAL_SHELL_ID).length;
       const tabName = customName || (localCount === 0 ? t('app.localShell') : `${t('app.localShell')} ${localCount + 1}`);
 
@@ -229,7 +229,7 @@ export const useTerminalStore = defineStore('terminal', {
       return tab;
     },
 
-    // 获取本地 Shell 连接信息（虚拟连接，不保存）
+    // 获取默认服务器 Shell 连接信息（虚拟连接，不保存）
     getLocalShellConnection(): ConnectionEntity {
       return {
         id: '__local__',

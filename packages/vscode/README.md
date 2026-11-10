@@ -73,7 +73,7 @@ See [Local Development](#local-development). After compiling, press **F5** in VS
 
 After activating the extension, an **AetherOps** icon appears in the left Activity Bar. Click it to reveal the **Terminal** explorer view, which lists:
 
-- **Open Local Shell** — opens a native local shell (`__local__` connection) inside a VSCode WebView tab.
+- **Open Default Server Shell** — opens the server-shell terminal (`__local__` connection) inside a VSCode WebView tab.
 - **Saved connections** — the connection list owned by the signed-in account, read from the backend
   (it is stored in MySQL, not in a file). SSH connections show a globe icon; local connections show a
   terminal icon, with the host and username as a description.
@@ -84,7 +84,7 @@ After activating the extension, an **AetherOps** icon appears in the left Activi
 You can open a terminal in three ways:
 
 1. **Command Palette**: press `Ctrl/Cmd + Shift + P`, then run **`AetherOps: 打开终端`** (command id `aetherops.openTerminal`).
-2. **Activity Bar → Terminal view**: click the **Open Local Shell** entry, or click any connection node to open that connection.
+2. **Activity Bar → Terminal view**: click the **Open Default Server Shell** entry, or click any connection node to open that connection.
 3. **Connection node inline action**: hover a connection in the Terminal view and click the terminal icon that appears on the right.
 
 The first launch automatically finds an available port and starts the backend service, then opens the terminal UI in a WebView. Re-opening the same connection appends a number to the tab title (`server 2` / `server 3` …) so multiple sessions stay distinguishable.

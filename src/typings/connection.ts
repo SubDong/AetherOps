@@ -53,6 +53,8 @@ export interface WSMessage {
   sessionId?: string;
   data?: any;
   binary?: boolean;
+  /** 错误码（如默认服务器 Shell 口令缺失），前端据此决定弹框还是直接报错 */
+  code?: string;
   event?: any; // AI Agent 事件
 }
 

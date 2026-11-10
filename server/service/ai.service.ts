@@ -208,7 +208,7 @@ function terminalSessionOf(ctx: ToolContext): string {
 
 /** 这一轮压根没绑终端：让模型如实说「先打开终端」，而不是猜一个「断开」 */
 const NO_TERMINAL_MSG = 'NO_TERMINAL: this chat is not bound to any terminal session, so no command can run. '
-  + 'Ask the user to open a terminal (an SSH connection or the Local Shell) and retry. '
+  + 'Ask the user to open a terminal (an SSH connection or the Default Server Shell) and retry. '
   + 'Do NOT say the terminal session was "disconnected" - there is none attached here. '
   + 'Do NOT call execute_command / read_terminal again this round.';
 
@@ -1078,7 +1078,7 @@ export class AIService {
       systemPromptOverride += '\n\n[No live terminal session is attached to this chat right now. '
         + 'execute_command / read_terminal will not work. '
         + 'Answer from the information you already have, and tell the user to open a terminal '
-        + '(an SSH connection or the Local Shell) if the task really needs commands.]';
+        + '(an SSH connection or the Default Server Shell) if the task really needs commands.]';
     }
 
     if (opts?.skillId && this.skillService) {

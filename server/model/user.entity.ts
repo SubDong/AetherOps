@@ -13,7 +13,7 @@ export type UserStatus = 'pending' | 'active' | 'disabled';
 
 /** 功能权限；键名就是前端与 API 里用的名字 */
 export interface UserPermissions {
-  /** 终端：SSH / 本地 Shell */
+  /** 终端：SSH / 默认服务器 Shell */
   terminal: boolean;
   /** 批量操作：一次向多台主机并行下发同一条命令 */
   batch: boolean;

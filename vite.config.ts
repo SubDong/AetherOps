@@ -393,7 +393,7 @@ const config = defineConfig({
 
                             switch (type) {
                                 case 'create': {
-                                    const { connectionId, cols, rows, name } = data || {};
+                                    const { connectionId, cols, rows, name, serverShellPassword } = data || {};
                                     if (!connectionId) {
                                         safeSend(JSON.stringify({ type: 'error', data: 'Missing connectionId' }));
                                         return;
@@ -405,7 +405,7 @@ const config = defineConfig({
                                             safeSend(JSON.stringify({ type: 'conn-log', sessionId, data: msg }));
                                         };
 
-                                        const sshSession = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog, ownerId);
+                                        const sshSession = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog, ownerId, { serverShellPassword });
 
                                         // 根据会话类型设置数据接收
                                         const sendOutput = (chunk: any) => {
@@ -448,7 +448,7 @@ const config = defineConfig({
 
                                         safeSend(JSON.stringify({ type: 'status', sessionId, data: 'connected' }));
                                     } catch (err: any) {
-                                        safeSend(JSON.stringify({ type: 'error', sessionId, data: err.message || '连接失败' }));
+                                        safeSend(JSON.stringify({ type: 'error', sessionId, code: err.code, data: err.message || '连接失败' }));
                                     }
                                     break;
                                 }

@@ -364,7 +364,7 @@ function handleConnect(conn: ConnectionEntity) {
   store.openTab(conn);
 }
 
-// 打开本地 Shell
+// 打开默认服务器 Shell
 function handleOpenLocalShell() {
   store.openLocalShell();
 }
@@ -605,7 +605,7 @@ async function restoreOrCreateTabs() {
     console.warn('从 server 恢复 session 失败:', e);
   }
 
-  // 没有可恢复的 TAB，自动创建本地 Shell
+  // 没有可恢复的 TAB，自动创建默认服务器 Shell
   store.openLocalShell();
 }
 </script>

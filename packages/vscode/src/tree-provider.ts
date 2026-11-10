@@ -29,16 +29,16 @@ export class AetherOpsTreeProvider
     if (element) return [];
 
     const openAll = new vscode.TreeItem(
-      '打开本地 Shell',
+      '打开默认服务器 Shell',
       vscode.TreeItemCollapsibleState.None
     );
     openAll.iconPath = new vscode.ThemeIcon('terminal');
     openAll.command = {
       command: 'aetherops.openTerminal',
-      title: '打开本地 Shell',
-      arguments: [undefined, '本地 Shell']
+      title: '打开默认服务器 Shell',
+      arguments: [undefined, '默认服务器 Shell']
     };
-    openAll.tooltip = '在 VSCode 内打开一个本地 Shell 终端';
+    openAll.tooltip = '在 VSCode 内打开默认服务器 Shell（需管理员设置的口令）';
 
     try {
       const conns = await this.loadConnections();
@@ -47,7 +47,7 @@ export class AetherOpsTreeProvider
       for (const c of conns as AetherOpsConnection[]) {
         const isLocal = c.type === 'local';
         const item = new vscode.TreeItem(
-          c.name || (isLocal ? '本地 Shell' : c.host) || c.id,
+          c.name || (isLocal ? '默认服务器 Shell' : c.host) || c.id,
           vscode.TreeItemCollapsibleState.None
         );
         // 给 TreeItem 一个稳定身份，使右键菜单命令能正确取到 id
@@ -56,16 +56,16 @@ export class AetherOpsTreeProvider
         item.contextValue = 'connection';
         item.iconPath = new vscode.ThemeIcon(isLocal ? 'terminal' : 'globe');
         item.description = isLocal
-          ? '本地 Shell'
+          ? '默认服务器 Shell'
           : `${c.host || ''}${c.username ? ' · ' + c.username : ''}`;
         item.tooltip = `${c.name || ''}\n${
-          isLocal ? '本地 Shell' : (c.host || '') + ' ' + (c.username || '')
+          isLocal ? '默认服务器 Shell' : (c.host || '') + ' ' + (c.username || '')
         }`;
         // 点击连接节点 → 打开只含 xterm 的纯终端 WebView tab
         item.command = {
           command: 'aetherops.openTerminal',
           title: '打开',
-          arguments: [c.id, c.name || (isLocal ? '本地 Shell' : c.host)]
+          arguments: [c.id, c.name || (isLocal ? '默认服务器 Shell' : c.host)]
         };
         items.push(item);
       }

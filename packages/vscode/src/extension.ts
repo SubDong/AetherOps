@@ -240,15 +240,15 @@ function showTerminalPanel(
 ): void {
   // 复用完整 TerminalTab 的 WebView 页（自带 AI 对话 + 文件浏览，
   // 但不带侧边栏 / Tab 栏）。指定连接时带 connectionId + name，
-  // 不指定时（顶部「打开本地 Shell」）默认打开本地 Shell
+  // 不指定时（顶部「打开默认服务器 Shell」）默认打开默认服务器 Shell
   const src = connectionId
     ? `${url}/public/src/vscode-term.html?connectionId=${encodeURIComponent(
         connectionId
       )}&name=${encodeURIComponent(name || connectionId)}`
     : `${url}/public/src/vscode-term.html?connectionId=__local__&name=${encodeURIComponent(
-        name || '本地 Shell'
+        name || '默认服务器 Shell'
       )}`;
-  showPanel(context, src, name || '本地 Shell');
+  showPanel(context, src, name || '默认服务器 Shell');
 }
 
 /** 创建 WebView 面板并加载指定地址。 */

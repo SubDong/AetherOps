@@ -407,7 +407,7 @@ wss.on('connection', async (ws, req) => {
   async function createSSHSession(sid, data) {
     const serverModule = require('./dist/server/index.js');
     const { sshService } = serverModule;
-    const { connectionId, cols, rows, name } = data || {};
+    const { connectionId, cols, rows, name, serverShellPassword } = data || {};
     if (!connectionId) {
       ws.send(JSON.stringify({ type: 'error', data: '缺少 connectionId' }));
       return;
@@ -422,7 +422,7 @@ wss.on('connection', async (ws, req) => {
       safeSend(JSON.stringify({ type: 'conn-log', sessionId, data: msg }));
     };
 
-    const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog, ownerId);
+    const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog, ownerId, { serverShellPassword });
     console.log(`[WS] SSH session created: ${sessionId}`);
 
     // 根据会话类型绑定输出和关闭事件
@@ -506,7 +506,8 @@ wss.on('connection', async (ws, req) => {
             await createSSHSession(sid, data);
           } catch (err) {
             console.error(`[WS] SSH session creation failed: ${err.message}`);
-            ws.send(JSON.stringify({ type: 'error', sessionId, data: err.message || 'SSH 连接失败' }));
+            // code 透传给前端：口令缺失/未设置时要弹输入框，不能当成普通连接失败
+            ws.send(JSON.stringify({ type: 'error', sessionId, code: err.code, data: err.message || 'SSH 连接失败' }));
           }
           break;
         }
@@ -523,7 +524,7 @@ wss.on('connection', async (ws, req) => {
             await createSSHSession(sid, data);
           } catch (err) {
             console.error(`[WS] SSH session reconnect failed: ${err.message}`);
-            ws.send(JSON.stringify({ type: 'error', sessionId, data: err.message || '重连失败' }));
+            ws.send(JSON.stringify({ type: 'error', sessionId, code: err.code, data: err.message || '重连失败' }));
           }
           break;
         }

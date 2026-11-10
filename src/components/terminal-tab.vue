@@ -195,6 +195,7 @@ import { getToken } from '@/utils/auth';
 import { isVSCode } from '@/base/detect';
 import { useDraggableFloating } from '@/utils/draggable';
 import * as terminalService from '@/service/terminal';
+import { prompt } from '@/components/prompt';
 
 const { t } = useI18n();
 
@@ -334,6 +335,20 @@ let zmodemSession: any = null;
 let zmodemRole: string | null = null; // 'send' | 'receive'
 let offVscodeTheme: (() => void) | null = null; // VSCode 主题变化订阅
 let fileUploadResultCallback: ((msg: WSMessage) => void) | null = null;
+
+/**
+ * 「默认服务器 Shell」口令。
+ * 只存在内存里（不写 localStorage）：刷新页面就重新问，
+ * 避免把主机口令留在磁盘上。重连时复用同一份，免得每次重连都弹框。
+ */
+let serverShellPassword = '';
+let serverShellPasswordAttempts = 0;
+let promptOpening = false;
+const MAX_SERVER_SHELL_PASSWORD_ATTEMPTS = 3;
+
+/** 服务端拒开口令时回的错误码，须与 server/service/server-shell.service.ts 保持一致 */
+const ERR_PASSWORD_REQUIRED = 'server_shell_password_required';
+const ERR_PASSWORD_NOT_SET = 'server_shell_password_not_set';
 
 /**
  * 解析终端配色：
@@ -690,6 +705,56 @@ function createIPCAdapter(): WebSocket {
   return adapter as WebSocket;
 }
 
+/** create / reconnect 共用同一份参数：两条路径分头拼参数迟早会漏带口令 */
+function buildCreateData() {
+  return {
+    connectionId: props.connection.id,
+    cols: terminal?.cols || 80,
+    rows: terminal?.rows || 24,
+    name: props.connection.name,
+    ...(serverShellPassword ? { serverShellPassword } : {}),
+  };
+}
+
+/**
+ * 口令被拒：收一次口令再重发 create。
+ * 未设置口令不弹框——那是管理员还没配，输什么都没用，直接说明并停下。
+ */
+async function handleServerShellPasswordRejected(code: string | undefined, message?: string) {
+  if (code === ERR_PASSWORD_NOT_SET) {
+    setStatus('error', message || t('serverShell.notSet'));
+    return;
+  }
+  // 同一个错误可能连着来几条（create 与重连各一条），只允许一个弹框在跑
+  if (promptOpening) return;
+  if (serverShellPasswordAttempts >= MAX_SERVER_SHELL_PASSWORD_ATTEMPTS) {
+    setStatus('error', message || t('serverShell.passwordWrong'));
+    return;
+  }
+
+  promptOpening = true;
+  try {
+    const input = await prompt({
+      title: t('serverShell.title'),
+      message: serverShellPasswordAttempts === 0 ? t('serverShell.passwordPrompt') : t('serverShell.passwordWrong'),
+      placeholder: t('serverShell.passwordPlaceholder'),
+      inputType: 'password',
+      confirmText: t('common.confirm'),
+      cancelText: t('common.cancel'),
+    });
+    if (input === null) {
+      setStatus('error', t('serverShell.cancelled'));
+      return;
+    }
+    serverShellPassword = input;
+    serverShellPasswordAttempts++;
+    setStatus('connecting');
+    sendToServer({ type: 'create', sessionId: pendingSessionId, data: buildCreateData() });
+  } finally {
+    promptOpening = false;
+  }
+}
+
 // WebSocket / IPC 连接
 function connectWebSocket() {
   if (isElectronIPC()) {
@@ -715,12 +780,7 @@ function connectWebSocket() {
     sendToServer({
       type: 'create',
       sessionId: pendingSessionId,
-      data: {
-        connectionId: props.connection.id,
-        cols: terminal?.cols || 80,
-        rows: terminal?.rows || 24,
-        name: props.connection.name,
-      }
+      data: buildCreateData(),
     });
   };
 
@@ -795,12 +855,7 @@ function reconnect() {
     sendToServer({
       type: 'reconnect',
       sessionId: sessionId || pendingSessionId,
-      data: {
-        connectionId: props.connection.id,
-        cols: terminal?.cols || 80,
-        rows: terminal?.rows || 24,
-        name: props.connection.name,
-      }
+      data: buildCreateData(),
     });
   }
 }
@@ -1043,6 +1098,7 @@ function handleServerMessage(msg: WSMessage) {
       }
       if (msg.data === 'connected') {
         reconnectAttempts = 0; // 重置重连计数
+        serverShellPasswordAttempts = 0; // 口令已通过，下次不要弹框
         setStatus('connected', msg.sessionId);
       }
       break;
@@ -1052,6 +1108,11 @@ function handleServerMessage(msg: WSMessage) {
       break;
 
     case 'error':
+      // 口令相关失败不能只当普通连接失败：要弹框收集口令后重试
+      if (msg.code === ERR_PASSWORD_REQUIRED || msg.code === ERR_PASSWORD_NOT_SET) {
+        void handleServerShellPasswordRejected(msg.code, msg.data);
+        break;
+      }
       setStatus('error', msg.data || '连接失败');
       break;
 

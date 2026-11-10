@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { shellQuote } from '../utils/shell';
 import { stripAnsiEscapes } from '../utils/ansi';
+import { SERVER_SHELL_ERROR, verifyServerShellPassword } from './server-shell.service';
 import { listSessionMeta, upsertSessionMeta, deleteSessionMeta } from '../db/repositories/session.repo';
 import {
   PROBE_SCRIPT,
@@ -26,7 +27,7 @@ let nodePty: any = null;
 try {
   nodePty = require('node-pty');
 } catch (e) {
-  console.warn('[SSH] node-pty 不可用，本地 Shell 将使用降级模式（无 PTY）');
+  console.warn('[SSH] node-pty 不可用，默认服务器 Shell 将使用降级模式（无 PTY）');
 }
 
 /**
@@ -309,7 +310,7 @@ function stripPromptLines(raw: string): string {
 
 /**
  * 终端会话管理服务
- * 支持 SSH 远程连接和本地 Shell
+ * 支持 SSH 远程连接和默认服务器 Shell
  */
 export class SSHService {
   private sessions: Map<string, TerminalSession> = new Map();
@@ -346,9 +347,9 @@ export class SSHService {
   }
 
   /**
-   * 创建会话（自动判断 SSH 或本地 shell）
+   * 创建会话（自动判断 SSH 或默认服务器 Shell）
    */
-  async createSession(sessionId: string, connectionId: string, cols: number = 80, rows: number = 24, name?: string, onLog?: (msg: string) => void, ownerId: string = ''): Promise<TerminalSession> {
+  async createSession(sessionId: string, connectionId: string, cols: number = 80, rows: number = 24, name?: string, onLog?: (msg: string) => void, ownerId: string = '', options?: { serverShellPassword?: string }): Promise<TerminalSession> {
     // 标记本实例曾创建过 session（用于定时清理判断）
     this.hasCreatedSession = true;
     // 如果已存在同 ID 的会话，先关闭；但别人的 sessionId 不能被覆盖
@@ -360,11 +361,23 @@ export class SSHService {
       this.closeSession(sessionId);
     }
 
-    // 本地 Shell 使用特殊 connectionId
+    // 默认服务器 Shell 使用特殊 connectionId
     if (connectionId === '__local__') {
+      // 门禁：这个终端开在服务端主机上，口令由管理员在账号管理页设置。
+      // 校验放在建会话之前、任何进程创建之前——先给口令再开机，不能反过来。
+      const verdict = await verifyServerShellPassword(options?.serverShellPassword || '');
+      if (verdict !== 'ok') {
+        const err: any = new Error(
+          verdict === 'not_set'
+            ? '管理员尚未设置「默认服务器 Shell」口令，请在账号管理中设置后再打开'
+            : '「默认服务器 Shell」口令不正确',
+        );
+        err.code = verdict === 'not_set' ? SERVER_SHELL_ERROR.NOT_SET : SERVER_SHELL_ERROR.REQUIRED;
+        throw err;
+      }
       const localConn: ConnectionEntity = {
         id: '__local__',
-        name: name || '本地 Shell',
+        name: name || '默认服务器 Shell',
         type: 'local',
         host: '',
         port: 22,
@@ -430,16 +443,16 @@ export class SSHService {
   }
 
   /**
-   * 创建本地 Shell 会话（优先使用 node-pty，降级使用 child_process.spawn）
+   * 创建默认服务器 Shell 会话（优先使用 node-pty，降级使用 child_process.spawn）
    */
   private createLocalSession(sessionId: string, connectionId: string, connection: ConnectionEntity, cols: number, rows: number, name?: string, onLog?: (msg: string) => void): Promise<TerminalSession> {
     const log = (msg: string) => { console.log(`[SSH] ${msg}`); onLog?.(msg); };
     return new Promise<TerminalSession>((resolve, reject) => {
       try {
-        const sessionName = name || connection.name || '本地 Shell';
+        const sessionName = name || connection.name || '默认服务器 Shell';
         const shell = connection.shell || this.getDefaultShell();
         const homeDir = os.homedir();
-        log(`启动本地 Shell: ${shell}`);
+        log(`启动默认服务器 Shell: ${shell}`);
 
         // 构建干净的 Shell 环境（过滤掉 Node.js / npm 相关变量，避免 nvm 等工具警告）
         const cleanEnv = this.buildShellEnv(cols, rows);
@@ -530,7 +543,7 @@ export class SSHService {
 
         resolve(session);
       } catch (e) {
-        reject(new Error('创建本地 Shell 失败: ' + (e as Error).message));
+        reject(new Error('创建默认服务器 Shell 失败: ' + (e as Error).message));
       }
     });
   }
