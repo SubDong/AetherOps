@@ -160,6 +160,32 @@ supported build, and record the commit you run.
   skill: going from 3 to 10 skills adds seven lines, not seven documents (asserted in
   `temp/verify-p3-skills.mjs`). See [README.md](README.md#skills) /
   [README.zh.md](README.zh.md#skills-技能).
+- **Failure fingerprints: the same error on the same host is one row, not N audit lines.** `audit_events`
+  records every tool call as a separate row and prunes it after 30 days, which answers "what did this
+  command return" but never "is this an old problem, how many times has it happened, and when did it
+  start". Migration `0009` adds `error_fingerprints`, keyed on owner + connection + fingerprint: the
+  first occurrence inserts a row, every later one increments `occurrences` and moves `last_seen` while
+  `first_seen` stays put, and `sample_text` / `command` follow the latest occurrence so the row always
+  describes the most recent report. The fingerprint is `sha256(normalized representative line)[:16]`,
+  produced by a single pure module, `server/utils/fingerprint.ts`, that folds timestamps (ISO, syslog,
+  bare time), UUIDs, long hex and `0x` literals, PIDs, line/column numbers and the digits inside paths,
+  lowercases the result and hashes the first 200 characters. Only one line is hashed — the first that
+  matches a failure signature — so a run of `tail` output cannot split one error across many rows. This
+  stage is **write-only**: there is no endpoint, no panel and no tool, and rows are pruned after 30 days
+  by `last_seen` at startup and every six hours. **Boundary:** the audit hook's own `status: 'error'`
+  was not a usable trigger — the engine's soft-failure detector only matches a few prefixes, so
+  `bash: foo: command not found` is recorded as `success` — hence a second `after_tool` hook that
+  decides for itself: the engine's `isError` flag *or* a deliberately narrow failure-signature list
+  (`: command not found`, `No such file or directory`, `Permission denied`, `[emerg]` / `[error]`,
+  `fatal:`, `Traceback`, `npm ERR!`, `docker: Error response from daemon`, `Connection refused`, …).
+  Control-flow replies (`NEEDS_CONFIRM`, `BLOCKED`, `PERMISSION_DENIED`, `NO_LIVE_SESSION`,
+  `Invalid arguments`) are never recorded, because a policy refusal is not a host failure; a bare
+  `ERROR` inside grep output is not either. Only `execute_command` is aggregated — `run_on_hosts`
+  returns one blob for N hosts while the hook carries a single session, so recording it would blame the
+  wrong machine — and a run whose session is already gone has no connection to attribute to, so the
+  write is skipped rather than guessed. Fingerprinting never blocks anything: a database error is
+  logged and the command result is untouched (asserted in `temp/verify-p4-fingerprints.mjs`). The same
+  module will back P5's alert de-duplication, so the two phases cannot drift into two different keys.
 
 ### Changed
 

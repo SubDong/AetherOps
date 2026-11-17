@@ -3,6 +3,7 @@ import { SSHService, TRANSFER_AUDIT_TOOL } from './service/ssh.service';
 import { AIService } from './service/ai.service';
 import { SkillService } from './service/skill.service';
 import { AuditService } from './service/audit.service';
+import { FingerprintService } from './service/fingerprint.service';
 import { MonitorService } from './service/monitor.service';
 import { BatchService } from './service/batch.service';
 import { SnippetService } from './service/snippet.service';
@@ -32,6 +33,8 @@ interface ServiceGraph {
   sshService: SSHService;
   skillService: SkillService;
   auditService: AuditService;
+  /** 错误指纹（P4）：跟审计一起挂在 agent 的 after_tool 上 */
+  fingerprintService: FingerprintService;
   monitorService: MonitorService;
   batchService: BatchService;
   systemStatusService: SystemStatusService;
@@ -47,6 +50,7 @@ function createServiceGraph(): ServiceGraph {
   const sshService = new SSHService(connectionService);
   const skillService = new SkillService();
   const auditService = new AuditService();
+  const fingerprintService = new FingerprintService();
   const monitorService = new MonitorService(connectionService);
   const batchService = new BatchService(sshService, connectionService);
   // 顺序有依赖：采集器复用面板的状态采集（同一套口径）与连接配置（无会话采样要自己拨号），
@@ -54,7 +58,7 @@ function createServiceGraph(): ServiceGraph {
   // （一个只读清单、一个复用批量执行），都只声明工具真正用到的那几个方法。
   const systemStatusService = new SystemStatusService(sshService);
   const hostMetricsService = new HostMetricsService(sshService, systemStatusService, connectionService);
-  const aiService = new AIService(sshService, skillService, auditService, hostMetricsService, connectionService, batchService);
+  const aiService = new AIService(sshService, skillService, auditService, hostMetricsService, connectionService, batchService, fingerprintService);
   const snippetService = new SnippetService();
 
   // 传输审计：SSHService 不认识 AuditService，两个实例在这里接起来。
@@ -79,6 +83,7 @@ function createServiceGraph(): ServiceGraph {
     sshService,
     skillService,
     auditService,
+    fingerprintService,
     monitorService,
     batchService,
     systemStatusService,
@@ -99,6 +104,7 @@ const connectionService = services.connectionService;
 const sshService = services.sshService;
 const skillService = services.skillService;
 const auditService = services.auditService;
+const fingerprintService = services.fingerprintService;
 const monitorService = services.monitorService;
 const batchService = services.batchService;
 const systemStatusService = services.systemStatusService;
@@ -127,6 +133,7 @@ export async function initServices(): Promise<void> {
     await services.sshService.init();
     await services.skillService.init();
     await services.auditService.init();
+    await services.fingerprintService.init();
     await services.aiService.init();
     // 账号引导：users 表为空时创建 admin（密码只打启动日志一次）
     await initAccounts();

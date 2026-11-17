@@ -4,6 +4,7 @@ import * as crypto from 'crypto';
 import { getDataPath } from '../utils/data-dir';
 import { AuditService } from './audit.service';
 import type { AuditEntry } from './audit.service';
+import type { FingerprintService } from './fingerprint.service';
 import { assessDangerousCommand } from '../utils/shell';
 import type { CommandRiskLevel } from '../utils/shell';
 import { assertReadablePath } from '../utils/security';
@@ -625,6 +626,8 @@ export class AIService {
   private connections?: IConnectionDirectory;
   /** 批量执行（run_on_hosts）：并发与总预算由工具侧控制 */
   private batch?: IBatchRunner;
+  /** 错误指纹（P4）：与审计同挂在 after_tool 上，只做聚合记账 */
+  private fingerprints?: FingerprintService;
   private readonly MAX_MESSAGES = 50;
   private readonly MAX_AGENT_ITERATIONS = 15;
 
@@ -635,6 +638,7 @@ export class AIService {
     hostMetrics?: HostMetricsService,
     connections?: IConnectionDirectory,
     batch?: IBatchRunner,
+    fingerprints?: FingerprintService,
   ) {
     this.sshService = sshService;
     this.skillService = skillService;
@@ -642,6 +646,8 @@ export class AIService {
     this.hostMetrics = hostMetrics;
     this.connections = connections;
     this.batch = batch;
+    // 尾参可选：验证脚本只传前几个桩，指纹钩子缺失时整体跳过（不影响审计）
+    this.fingerprints = fingerprints;
 
     // 初始化 agent-core 组件
     this.toolRegistry = new ToolRegistry();
@@ -780,33 +786,63 @@ export class AIService {
    * 拿它去查终端归属永远查不到。
    */
   private buildHooks(ownerId: string, terminalSessionId?: string): import('@cicctencent/agent-core').Hook[] {
-    if (!this.auditService) return [];
+    const hooks: import('@cicctencent/agent-core').Hook[] = [];
     const auditService = this.auditService;
+    const fingerprints = this.fingerprints;
     const sshService = this.sshService;
     const sessionId = terminalSessionId || '';
-    return [{
-      name: 'audit-tool-call',
-      event: 'after_tool' as const,
-      handler: async (ctx) => {
-        try {
-          const command = ctx.tool === 'execute_command'
-            ? (ctx.args?.command as string || '')
-            : JSON.stringify(ctx.args);
-          // ownerId 从构造时闭包捕获：hooks 挂在某人的 engine 上，不会串号
-          await auditService.log(ownerId, {
-            sessionId,
-            sessionName: sshService?.getSession(sessionId)?.name,
-            connectionId: sshService?.getSession(sessionId)?.connectionId,
-            userMessage: '',
-            tool: ctx.tool || '',
-            command,
-            result: (ctx.result || '').substring(0, 5000),
-            duration: ctx.duration || 0,
-            status: ctx.isError ? 'error' : 'success',
-          });
-        } catch { /* 审计失败不影响主流程 */ }
-      },
-    }];
+
+    if (auditService) {
+      hooks.push({
+        name: 'audit-tool-call',
+        event: 'after_tool' as const,
+        handler: async (ctx) => {
+          try {
+            const command = ctx.tool === 'execute_command'
+              ? (ctx.args?.command as string || '')
+              : JSON.stringify(ctx.args);
+            // ownerId 从构造时闭包捕获：hooks 挂在某人的 engine 上，不会串号
+            await auditService.log(ownerId, {
+              sessionId,
+              sessionName: sshService?.getSession(sessionId)?.name,
+              connectionId: sshService?.getSession(sessionId)?.connectionId,
+              userMessage: '',
+              tool: ctx.tool || '',
+              command,
+              result: (ctx.result || '').substring(0, 5000),
+              duration: ctx.duration || 0,
+              status: ctx.isError ? 'error' : 'success',
+            });
+          } catch { /* 审计失败不影响主流程 */ }
+        },
+      });
+    }
+
+    // 错误指纹（P4）：与审计并列而非合并——审计是逐次流水，这张表是按指纹聚合。
+    // 只认 execute_command：run_on_hosts 的结果是 N 台主机拼成的文本，
+    // 而这里只有一个 sessionId，归到发起终端那台的头上会是错数据。
+    if (fingerprints) {
+      hooks.push({
+        name: 'record-error-fingerprint',
+        event: 'after_tool' as const,
+        handler: async (ctx) => {
+          if (ctx.tool !== 'execute_command') return;
+          try {
+            await fingerprints.record({
+              ownerId,
+              // 会话已断时为 undefined：服务层会直接跳过，写错主机比漏记更糟
+              connectionId: sshService?.getSession(sessionId)?.connectionId,
+              tool: ctx.tool,
+              command: (ctx.args?.command as string) || '',
+              output: ctx.result || '',
+              isError: ctx.isError === true,
+            });
+          } catch { /* 记账失败不影响主流程 */ }
+        },
+      });
+    }
+
+    return hooks;
   }
 
   // ========== 模型配置管理 ==========

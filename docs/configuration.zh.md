@@ -176,6 +176,7 @@ AI 服务商的设置（Base URL、Key、模型）**不能**通过环境变量�
 | `0006-system-config` | 新增 `sys_config`（键值对，不分归属）—— 目前只放服务端本机 Shell 的口令哈希 |
 | `0007-host-metrics` | 新增 `host_metrics_minute`：每个归属 / 连接 / 分钟一行，记 CPU %、内存 %、磁盘 % 与 load 1/5/15 的均值、峰值与样本数 |
 | `0008-connection-sampling` | `connections.sampling`（`''` = 跟随 `metrics.offlineSampling`，`skip` = 无人值守时永不拨号这个连接） |
+| `0009-error-fingerprints` | 新增 `error_fingerprints`：每个归属 / 连接 / 指纹一行，记 `occurrences`、`first_seen`、`last_seen`（由 Agent 的 `after_tool` 钩子写入） |
 
 如果你打算加迁移，这些表结构约束值得先知道：
 
@@ -214,6 +215,7 @@ node scripts/migrate.mjs --force     # 忽略 checksum 不一致 / 已应用的�
 | 技能 | MySQL `skills`（用户技能）+ `<app>/data/skills/*.md`（内置技能） | 否 |
 | 命令片段 | MySQL `snippets` | 否 |
 | 主机指标历史（每分钟的 CPU / 内存 / 磁盘 / load） | MySQL `host_metrics_minute`（按归属隔离） | 否 |
+| 错误指纹（每个归属 / 连接 / 归一化错误一行） | MySQL `error_fingerprints` | 否 |
 | 账号（scrypt 哈希、角色、状态、10 个权限位） | MySQL `users` | 只存口令哈希，不可逆 |
 | 登录令牌 | Redis（`aetherops:token:*`，哈希存储，滑动 TTL） | 不适用 |
 | 解密密钥 | 数据目录下的 `*.key` 文件 | 这些**就是**秘密本身 |

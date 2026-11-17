@@ -188,6 +188,7 @@ statement text with whitespace normalized.
 | `0006-system-config` | New `sys_config` (key/value, owner-agnostic) — currently the hashed password for the server-host shell |
 | `0007-host-metrics` | New `host_metrics_minute`: one row per owner / connection / minute with avg, peak and sample count for CPU %, memory %, disk % and load 1/5/15 |
 | `0008-connection-sampling` | `connections.sampling` (`''` = follow `metrics.offlineSampling`, `skip` = never dial this connection unattended) |
+| `0009-error-fingerprints` | New `error_fingerprints`: one row per owner / connection / fingerprint, with `occurrences`, `first_seen`, `last_seen` (written by the agent `after_tool` hook) |
 
 Schema constraints worth knowing if you intend to add a migration:
 
@@ -229,6 +230,7 @@ node scripts/migrate.mjs --force     # ignore checksum mismatch / already-applie
 | Skills | MySQL `skills` (user) + files in `<app>/data/skills/*.md` (built-in) | no |
 | Command snippets | MySQL `snippets` | no |
 | Host metrics history (per-minute CPU / memory / disk / load) | MySQL `host_metrics_minute` (owner-scoped) | no |
+| Error fingerprints (one row per owner / connection / normalized error) | MySQL `error_fingerprints` | no |
 | Accounts (scrypt hash, role, status, 10 permission bits) | MySQL `users` | password hash only, irreversible |
 | Login tokens | Redis (`aetherops:token:*`, hashed, sliding TTL) | n/a |
 | Decryption keys | data dir `*.key` files | these **are** the secrets |
