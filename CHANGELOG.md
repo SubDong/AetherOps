@@ -166,6 +166,22 @@ supported build, and record the commit you run.
   ran — `dist/public` looked fresh while `dist/server` silently kept whatever an older build had left.
   Anything that runs `pnpm build` inherited the hang, including the Docker image build and CI. The timer
   is now `unref()`d, matching how `SSHService` has guarded its periodic cleanup timer.
+- **Restarting the dev server no longer leaks MySQL connections.** Editing `vite.config.ts` — or any
+  module it imports — makes Vite re-evaluate the whole config module graph *inside the same process*.
+  `db/pool.ts` kept its pool in a module-scope variable, so the second evaluation saw `null`, opened a
+  second pool, and nothing ever `end()`ed the first: one extra connection per restart, permanently,
+  because `mysql2` only schedules its idle reaper when `maxIdle < connectionLimit` and both defaulted to
+  the same value. The target instance allows 50 connections and is shared, so a morning of restarts
+  exhausted it and every other client — including a running `server.js` — failed with
+  `Too many connections`. The pool, the Redis client and the service graph are now held on `globalThis`
+  under `Symbol.for(...)` keys, so a re-evaluated module reuses the live instance instead of building a
+  second one; `initServices()` caches its promise (no duplicated metrics timer) and clears it on failure
+  so a host that starts before MySQL can retry; and the pool finally sets `maxIdle` below
+  `connectionLimit` with a 60 s `idleTimeout`, so connections a burst opened are released again.
+  **Boundary:** measured on the dev server — five restarts, connection count stayed at 1, where a single
+  restart used to make it 2. The same `maxIdle` / `idleTimeout` pair also bounds idle connections in a
+  long-running process, but it cannot help a process that was killed and replaced: the old instance has
+  to be gone before the new one is useful.
 
 ### Security
 

@@ -19,58 +19,127 @@ import { openSecretInput } from './utils/transport-crypto';
 import { initAccounts } from './routes/auth.routes';
 
 // 初始化服务实例
-const connectionService = new ConnectionService();
-const sshService = new SSHService(connectionService);
-const skillService = new SkillService();
-const auditService = new AuditService();
-const monitorService = new MonitorService(connectionService);
-const batchService = new BatchService(sshService, connectionService);
-// 顺序有依赖：采集器复用面板的状态采集（同一套口径）与连接配置（无会话采样要自己拨号），
-// AI 又要拿采集器查历史；后两个参数供 list_connections / run_on_hosts 用
-// （一个只读清单、一个复用批量执行），都只声明工具真正用到的那几个方法。
-const systemStatusService = new SystemStatusService(sshService);
-const hostMetricsService = new HostMetricsService(sshService, systemStatusService, connectionService);
-const aiService = new AIService(sshService, skillService, auditService, hostMetricsService, connectionService, batchService);
-const snippetService = new SnippetService();
+//
+// 服务图挂在 globalThis 上，而不是模块作用域 —— 与 `db/pool.ts` / `db/redis.ts` 同因：
+// dev（vite）改配置会重启，整个模块图重新求值一遍，`new XxxService()` 全部重来一份。
+// 后果不只是连接翻倍：旧 hostMetricsService 的定时器还在跑（每分钟多采一轮），
+// 旧 sshService 还挂着上一份实例的会话表与传输审计接线，而路由用的是新实例。
+// 放到进程级后，重启复用同一套实例，initServices() 也只会真正初始化一次。
+const SERVICES_KEY = Symbol.for('aetherops.server.serviceGraph');
 
-// 传输审计：SSHService 不认识 AuditService，两个实例在这里接起来。
-// 写成注入而不是让 ssh.service 直接 import 审计实例：后者会把 index.ts 拽进一条
-// 循环依赖里，而且传输写入失败的归属判断（ownerId 从哪来）会失去唯一出口。
-sshService.setTransferLogger((record) => {
-  void auditService.log(record.ownerId, {
-    sessionId: record.sessionId,
-    sessionName: record.sessionName,
-    connectionId: record.connectionId,
-    userMessage: record.direction === 'upload' ? '上传文件' : '下载文件',
-    tool: TRANSFER_AUDIT_TOOL,
-    command: `${record.direction === 'upload' ? 'UPLOAD' : 'DOWNLOAD'} ${record.path}`,
-    result: record.ok ? `${record.bytes} bytes` : record.error,
-    duration: record.durationMs,
-    status: record.ok ? 'success' : 'error',
+interface ServiceGraph {
+  connectionService: ConnectionService;
+  sshService: SSHService;
+  skillService: SkillService;
+  auditService: AuditService;
+  monitorService: MonitorService;
+  batchService: BatchService;
+  systemStatusService: SystemStatusService;
+  hostMetricsService: HostMetricsService;
+  aiService: AIService;
+  snippetService: SnippetService;
+  /** 初始化只跑一次；失败时清空，允许宿主重试（dev 里库后起来是常态） */
+  initPromise?: Promise<void>;
+}
+
+function createServiceGraph(): ServiceGraph {
+  const connectionService = new ConnectionService();
+  const sshService = new SSHService(connectionService);
+  const skillService = new SkillService();
+  const auditService = new AuditService();
+  const monitorService = new MonitorService(connectionService);
+  const batchService = new BatchService(sshService, connectionService);
+  // 顺序有依赖：采集器复用面板的状态采集（同一套口径）与连接配置（无会话采样要自己拨号），
+  // AI 又要拿采集器查历史；后两个参数供 list_connections / run_on_hosts 用
+  // （一个只读清单、一个复用批量执行），都只声明工具真正用到的那几个方法。
+  const systemStatusService = new SystemStatusService(sshService);
+  const hostMetricsService = new HostMetricsService(sshService, systemStatusService, connectionService);
+  const aiService = new AIService(sshService, skillService, auditService, hostMetricsService, connectionService, batchService);
+  const snippetService = new SnippetService();
+
+  // 传输审计：SSHService 不认识 AuditService，两个实例在这里接起来。
+  // 写成注入而不是让 ssh.service 直接 import 审计实例：后者会把 index.ts 拽进一条
+  // 循环依赖里，而且传输写入失败的归属判断（ownerId 从哪来）会失去唯一出口。
+  sshService.setTransferLogger((record) => {
+    void auditService.log(record.ownerId, {
+      sessionId: record.sessionId,
+      sessionName: record.sessionName,
+      connectionId: record.connectionId,
+      userMessage: record.direction === 'upload' ? '上传文件' : '下载文件',
+      tool: TRANSFER_AUDIT_TOOL,
+      command: `${record.direction === 'upload' ? 'UPLOAD' : 'DOWNLOAD'} ${record.path}`,
+      result: record.ok ? `${record.bytes} bytes` : record.error,
+      duration: record.durationMs,
+      status: record.ok ? 'success' : 'error',
+    });
   });
-});
+
+  return {
+    connectionService,
+    sshService,
+    skillService,
+    auditService,
+    monitorService,
+    batchService,
+    systemStatusService,
+    hostMetricsService,
+    aiService,
+    snippetService,
+  };
+}
+
+function serviceGraph(): ServiceGraph {
+  const holder = globalThis as unknown as Record<symbol, ServiceGraph | undefined>;
+  if (!holder[SERVICES_KEY]) holder[SERVICES_KEY] = createServiceGraph();
+  return holder[SERVICES_KEY] as ServiceGraph;
+}
+
+const services = serviceGraph();
+const connectionService = services.connectionService;
+const sshService = services.sshService;
+const skillService = services.skillService;
+const auditService = services.auditService;
+const monitorService = services.monitorService;
+const batchService = services.batchService;
+const systemStatusService = services.systemStatusService;
+const hostMetricsService = services.hostMetricsService;
+const aiService = services.aiService;
+const snippetService = services.snippetService;
 
 // 初始化
 //
 // 注意时机：这里没有在模块顶层调 init()。存储切到 MySQL 后，服务启动时要先
 // 连库 + 跑迁移（server.js -> ensureDatabaseReady），才能读表。模块顶层执行时
 // 表可能还不存在，所以改由 server.js 在库就绪后调用 initServices()，失败则不启动。
+//
+// 重复调用只跑一次（服务图在进程级，两个宿主先后调也共享同一份）：
+// 没这道门，dev 重启会把同一批初始化再做一遍，定时器与订阅就多一套。
 export async function initServices(): Promise<void> {
-  console.log('[Server] Initializing services...');
-  console.log(`[Server] Node version: ${process.version}, platform: ${process.platform}, arch: ${process.arch}`);
-  console.log(`[Server] cwd: ${process.cwd()}`);
-  console.log(`[Server] __dirname: ${__dirname}`);
-  await connectionService.init();
-  console.log('[Server] connectionService.init() completed');
-  await sshService.init();
-  await skillService.init();
-  await auditService.init();
-  await aiService.init();
-  // 账号引导：users 表为空时创建 admin（密码只打启动日志一次）
-  await initAccounts();
-  // 指标留存：必须在库就绪之后（写 host_metrics_minute），且放最后——
-  // 首轮采集本身延后 15s，不会和上面这些启动动作抢 SSH 通道
-  hostMetricsService.start();
+  if (services.initPromise) return services.initPromise;
+
+  const started = (async () => {
+    console.log('[Server] Initializing services...');
+    console.log(`[Server] Node version: ${process.version}, platform: ${process.platform}, arch: ${process.arch}`);
+    console.log(`[Server] cwd: ${process.cwd()}`);
+    console.log(`[Server] __dirname: ${__dirname}`);
+    await services.connectionService.init();
+    console.log('[Server] connectionService.init() completed');
+    await services.sshService.init();
+    await services.skillService.init();
+    await services.auditService.init();
+    await services.aiService.init();
+    // 账号引导：users 表为空时创建 admin（密码只打启动日志一次）
+    await initAccounts();
+    // 指标留存：必须在库就绪之后（写 host_metrics_minute），且放最后——
+    // 首轮采集本身延后 15s，不会和上面这些启动动作抢 SSH 通道
+    services.hostMetricsService.start();
+  })();
+  services.initPromise = started;
+  // 失败要允许重试：缓存一个 rejected 的 promise 等于让这个进程永远起不来
+  started.catch(() => {
+    if (services.initPromise === started) services.initPromise = undefined;
+  });
+  return started;
 }
 
 /**

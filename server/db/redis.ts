@@ -8,9 +8,23 @@ import { loadConfig, type RedisConfig } from '../utils/config';
  */
 type RedisClient = RedisClientType<{}, {}, {}, 3, {}>;
 
-let client: RedisClient | null = null;
-/** 防止并发首次调用各自 connect 一遍（node-redis 重复 connect 会抛 Socket already opened） */
-let connecting: Promise<RedisClient> | null = null;
+/**
+ * 与 `db/pool.ts` 同一个理由：dev 重启会重新求值整个模块图，模块级的 client
+ * 回到 null，第二份模块又建一条连接，旧连接没人 quit。Redis 的连接比 MySQL
+ * 便宜，但同样是「重启几次就多几条」，而且旧客户端上的订阅会被静默丢掉。
+ */
+const REDIS_STATE_KEY = Symbol.for('aetherops.redis.state');
+
+interface RedisState {
+  client: RedisClient | null;
+  connecting: Promise<RedisClient> | null;
+}
+
+function redisState(): RedisState {
+  const holder = globalThis as unknown as Record<symbol, RedisState | undefined>;
+  if (!holder[REDIS_STATE_KEY]) holder[REDIS_STATE_KEY] = { client: null, connecting: null };
+  return holder[REDIS_STATE_KEY] as RedisState;
+}
 
 /** 把配置拼成连接串；配了 redis.url 就直接用 */
 export function buildRedisUrl(cfg: RedisConfig = loadConfig().redis): string {
@@ -60,11 +74,12 @@ export async function probeRedis(cfg: RedisConfig = loadConfig().redis, timeoutM
 
 /** 长连接单例；首次调用时才建连 */
 export async function getRedis(): Promise<RedisClient> {
-  if (client?.isReady) return client;
-  if (connecting) return connecting;
+  const state = redisState();
+  if (state.client?.isReady) return state.client;
+  if (state.connecting) return state.connecting;
 
   const cfg = loadConfig().redis;
-  connecting = (async () => {
+  state.connecting = (async () => {
     const c = createClient({
       url: buildRedisUrl(cfg),
       // 运行期允许重连：Redis 短暂重启不该让整个服务不可用
@@ -94,14 +109,14 @@ export async function getRedis(): Promise<RedisClient> {
     } finally {
       if (timer) clearTimeout(timer);
     }
-    client = c;
+    state.client = c;
     return c;
   })();
 
   try {
-    return await connecting;
+    return await state.connecting;
   } finally {
-    connecting = null;
+    state.connecting = null;
   }
 }
 
@@ -123,8 +138,9 @@ export function redisKey(suffix: string): string {
 }
 
 export async function closeRedis(): Promise<void> {
-  const c = client;
-  client = null;
+  const state = redisState();
+  const c = state.client;
+  state.client = null;
   if (!c) return;
   try {
     if (c.isOpen) await c.quit();

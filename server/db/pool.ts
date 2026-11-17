@@ -16,8 +16,29 @@ import type { DatabaseConfig } from '../utils/config';
  * - 目标实例 max_connections=50 且与别的业务共用，连接池上限要走配置而不是硬编码。
  */
 
-let pool: Pool | null = null;
-let poolSignature = '';
+/**
+ * 连接池状态挂在 globalThis 上，而不是模块作用域。
+ *
+ * dev 模式（vite）改配置会重启：整个配置模块图重新求值一遍，同一个进程里出现
+ * 第二份 `pool.ts`，模块级变量回到 null，于是又建一个新池 —— 旧池没有任何人
+ * `end()`。更糟的是 mysql2 只在 `maxIdle < connectionLimit` 时才启动空闲回收器
+ * （`lib/base/pool.js` 构造函数），默认两者相等，所以那些连接会一直挂到进程退出。
+ * 实测一次重启就永久多一条，目标实例 `max_connections=50`，跑一上午就把库占满，
+ * 表现是别的实例（包括生产 server.js）全报 `Too many connections`。
+ * 放到进程级后，重启只是复用同一个池；换库/改池上限靠 signature 判断。
+ */
+const POOL_STATE_KEY = Symbol.for('aetherops.db.poolState');
+
+interface PoolState {
+  pool: Pool | null;
+  signature: string;
+}
+
+function poolState(): PoolState {
+  const holder = globalThis as unknown as Record<symbol, PoolState | undefined>;
+  if (!holder[POOL_STATE_KEY]) holder[POOL_STATE_KEY] = { pool: null, signature: '' };
+  return holder[POOL_STATE_KEY] as PoolState;
+}
 
 /** 把配置里的 database 段翻译成 mysql2 的连接参数 */
 export function buildPoolOptions(db: DatabaseConfig, overrides: Partial<PoolOptions> = {}): PoolOptions {
@@ -31,6 +52,11 @@ export function buildPoolOptions(db: DatabaseConfig, overrides: Partial<PoolOpti
     timezone: db.timezone,
     waitForConnections: true,
     connectionLimit: db.connectionLimit,
+    // maxIdle 必须严格小于 connectionLimit，mysql2 才会调度空闲回收器：
+    // 高并发过后把多出来的连接放掉。目标实例的连接名额与别的业务共用，
+    // 不能因为一次导入高峰就长期占着十个。
+    maxIdle: Math.max(2, Math.ceil(db.connectionLimit / 2)),
+    idleTimeout: 60000,
     // 队列不设上限：宁可请求排队，也不要直接抛「connection pool is exhausted」把错误抛给用户
     queueLimit: 0,
     connectTimeout: db.connectTimeoutMs,
@@ -66,16 +92,18 @@ function signatureOf(db: DatabaseConfig): string {
 export function getPool(): Pool {
   const db = loadConfig().database;
   const sig = signatureOf(db);
-  if (pool && poolSignature === sig) return pool;
-  if (pool) {
-    // 配置在运行期变了（热重载 / 测试切库）：先丢弃旧池，避免连接数翻倍
-    const stale = pool;
-    pool = null;
+  const state = poolState();
+  if (state.pool && state.signature === sig) return state.pool;
+  if (state.pool) {
+    // 配置在运行期变了（换库 / 改池上限 / 另一个模块实例读到了新配置）：
+    // 先丢弃旧池，避免连接数翻倍
+    const stale = state.pool;
+    state.pool = null;
     stale.end().catch(() => undefined);
   }
-  pool = mysql.createPool(buildPoolOptions(db));
-  poolSignature = sig;
-  return pool;
+  state.pool = mysql.createPool(buildPoolOptions(db));
+  state.signature = sig;
+  return state.pool;
 }
 
 /**
@@ -200,16 +228,17 @@ export async function transaction<T>(fn: (conn: mysql.PoolConnection) => Promise
 export function getPoolStatus(): { initialized: boolean; connectionLimit: number; target: string } {
   const db = loadConfig().database;
   return {
-    initialized: !!pool,
+    initialized: !!poolState().pool,
     connectionLimit: db.connectionLimit,
     target: `${db.user}@${db.host}:${db.port}/${db.database}`,
   };
 }
 
 export async function closePool(): Promise<void> {
-  if (!pool) return;
-  const ending = pool;
-  pool = null;
-  poolSignature = '';
+  const state = poolState();
+  if (!state.pool) return;
+  const ending = state.pool;
+  state.pool = null;
+  state.signature = '';
   await ending.end().catch(() => undefined);
 }
