@@ -7,6 +7,7 @@ import { SYSTEM_CONFIG_SQL } from './0006-system-config';
 import { HOST_METRICS_SQL } from './0007-host-metrics';
 import { CONNECTION_SAMPLING_SQL } from './0008-connection-sampling';
 import { ERROR_FINGERPRINTS_SQL } from './0009-error-fingerprints';
+import { ALERTS_SQL } from './0010-alerts';
 
 /**
  * 迁移清单。
@@ -38,6 +39,7 @@ export const MIGRATIONS: Migration[] = [
   { version: '0007', name: 'host-metrics', sql: HOST_METRICS_SQL },
   { version: '0008', name: 'connection-sampling', sql: CONNECTION_SAMPLING_SQL },
   { version: '0009', name: 'error-fingerprints', sql: ERROR_FINGERPRINTS_SQL },
+  { version: '0010', name: 'alerts', sql: ALERTS_SQL },
 ];
 
 /** 供 CLI 导出 .sql 文本 */

@@ -4,6 +4,8 @@ import { AIService } from './service/ai.service';
 import { SkillService } from './service/skill.service';
 import { AuditService } from './service/audit.service';
 import { FingerprintService } from './service/fingerprint.service';
+import { AlertService } from './service/alert.service';
+import { AlertDispatcher } from './service/alert-dispatcher';
 import { MonitorService } from './service/monitor.service';
 import { BatchService } from './service/batch.service';
 import { SnippetService } from './service/snippet.service';
@@ -17,6 +19,7 @@ import {
 } from './service/server-shell.service';
 import { closeTerminalSockets, countTerminalSockets } from './utils/socket-registry';
 import { openSecretInput } from './utils/transport-crypto';
+import { loadConfig } from './utils/config';
 import { initAccounts } from './routes/auth.routes';
 
 // 初始化服务实例
@@ -35,6 +38,9 @@ interface ServiceGraph {
   auditService: AuditService;
   /** 错误指纹（P4）：跟审计一起挂在 agent 的 after_tool 上 */
   fingerprintService: FingerprintService;
+  /** 告警（P5）：日志规则命中后落库、可确认、可投递 */
+  alertService: AlertService;
+  alertDispatcher: AlertDispatcher;
   monitorService: MonitorService;
   batchService: BatchService;
   systemStatusService: SystemStatusService;
@@ -52,6 +58,11 @@ function createServiceGraph(): ServiceGraph {
   const auditService = new AuditService();
   const fingerprintService = new FingerprintService();
   const monitorService = new MonitorService(connectionService);
+  // 告警：监控只负责「这一行命中了规则」，去重/状态机/投递在 AlertService。
+  // 配置在投递时才读（loadConfig 进程内缓存，改完要重启 —— 已写进 docs）。
+  const alertDispatcher = new AlertDispatcher({ getConfig: () => loadConfig().alerts });
+  const alertService = new AlertService(alertDispatcher);
+  monitorService.setAlertSink((input) => { void alertService.recordFromMonitor(input); });
   const batchService = new BatchService(sshService, connectionService);
   // 顺序有依赖：采集器复用面板的状态采集（同一套口径）与连接配置（无会话采样要自己拨号），
   // AI 又要拿采集器查历史；后两个参数供 list_connections / run_on_hosts 用
@@ -84,6 +95,8 @@ function createServiceGraph(): ServiceGraph {
     skillService,
     auditService,
     fingerprintService,
+    alertService,
+    alertDispatcher,
     monitorService,
     batchService,
     systemStatusService,
@@ -105,6 +118,7 @@ const sshService = services.sshService;
 const skillService = services.skillService;
 const auditService = services.auditService;
 const fingerprintService = services.fingerprintService;
+const alertService = services.alertService;
 const monitorService = services.monitorService;
 const batchService = services.batchService;
 const systemStatusService = services.systemStatusService;
@@ -134,6 +148,7 @@ export async function initServices(): Promise<void> {
     await services.skillService.init();
     await services.auditService.init();
     await services.fingerprintService.init();
+    await services.alertService.init();
     await services.aiService.init();
     // 账号引导：users 表为空时创建 admin（密码只打启动日志一次）
     await initAccounts();
@@ -207,6 +222,9 @@ const PREFIX_PERMISSIONS: Array<[string, PermissionKey[]]> = [
   // 影响面比单个终端大，管理员必须能只收回这一项。
   ['/api/batch/', ['batch']],
   ['/api/monitor/', ['monitor']],
+  // 告警是监控的下游（规则命中后才产生），共用 monitor 权限位：
+  // 能看日志的人当然能看它产生的告警，反之不成立。
+  ['/api/alerts/', ['monitor']],
   ['/api/audit/', ['audit']],
   ['/api/snippet/', ['snippets']],
   ['/api/connection/', ['connections']],
@@ -253,6 +271,23 @@ function stripSecrets(connection: any): any {
   }
   copy.hasSecret = hasSecret;
   return copy;
+}
+
+/** 告警状态只能是我们认识的那三个；写错一个字母不能被当成「查全部」 */
+const ALERT_STATUSES = ['open', 'acked', 'resolved'] as const;
+function parseAlertStatus(value: any): 'open' | 'acked' | 'resolved' | '' {
+  if (value === undefined || value === null || value === '') return '';
+  const status = String(value);
+  if (!(ALERT_STATUSES as readonly string[]).includes(status)) {
+    throw new ApiError(`status 只能是 ${ALERT_STATUSES.join(' / ')}`, 400);
+  }
+  return status as 'open' | 'acked' | 'resolved';
+}
+
+function parseAlertId(value: any): number {
+  const id = Number(value);
+  if (!Number.isInteger(id) || id <= 0) throw new ApiError('Missing parameter: id', 400);
+  return id;
 }
 
 /**
@@ -658,6 +693,55 @@ export async function handleRoutes(pathname: string, body: any, ctx: AuthContext
       const { monitorId } = body;
       if (!monitorId) throw Error('Missing parameter: monitorId');
       return monitorService.getBatchForAnalysis(ownerId, monitorId);
+    }
+
+    // ========== 告警（P5：离开页面的告警） ==========
+
+    // 列表 + 按状态计数
+    if (pathname === '/api/alerts/list') {
+      const status = parseAlertStatus(body?.status);
+      return await alertService.list(ownerId, {
+        status,
+        connectionId: typeof body?.connectionId === 'string' ? body.connectionId.trim() : undefined,
+        limit: body?.limit,
+        offset: body?.offset,
+      });
+    }
+
+    // 确认（open → acked）：已确认/已解决的重复点按返回 409，让前端刷新而不是假装成功
+    if (pathname === '/api/alerts/ack') {
+      const id = parseAlertId(body?.id);
+      const updated = await alertService.ack(ownerId, id, ctx.userId);
+      if (!updated) throw new ApiError('告警不存在或已不是待确认状态', 409);
+      return updated;
+    }
+
+    // 标记已解决（open/acked → resolved）
+    if (pathname === '/api/alerts/resolve') {
+      const id = parseAlertId(body?.id);
+      const updated = await alertService.resolve(ownerId, id);
+      if (!updated) throw new ApiError('告警不存在或已解决', 409);
+      return updated;
+    }
+
+    // 当前生效的规则级静默窗口
+    if (pathname === '/api/alerts/mutes') {
+      return await alertService.mutes(ownerId);
+    }
+
+    // 静默某条规则 N 分钟（默认 60 分钟，上限 7 天）
+    if (pathname === '/api/alerts/mute') {
+      const rule = typeof body?.rule === 'string' ? body.rule : '';
+      if (!rule.trim()) throw Error('Missing parameter: rule');
+      const minutes = body?.minutes === undefined ? 60 : Number(body.minutes);
+      return await alertService.mute(ownerId, rule, minutes);
+    }
+
+    // 取消静默
+    if (pathname === '/api/alerts/unmute') {
+      const rule = typeof body?.rule === 'string' ? body.rule : '';
+      if (!rule.trim()) throw Error('Missing parameter: rule');
+      return await alertService.unmute(ownerId, rule);
     }
 
     // ========== 批量操作 ==========

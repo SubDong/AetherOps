@@ -105,6 +105,23 @@ export interface AppConfig {
   auth: AuthConfig;
   debug: DebugConfig;
   metrics: MetricsConfig;
+  alerts: AlertsConfig;
+}
+
+/**
+ * 告警投递（P5）。
+ *
+ * 只放「接收端与签名」这类部署者必须知道的东西；去抖窗口、重试退避是行为约定，
+ * 写死在 alert-dispatcher 里 —— 做成配置项等于允许把 5 分钟改成 0 秒，
+ * 而后者的效果是日志刷屏时把接收端打挂。
+ */
+export interface AlertsConfig {
+  /** 群机器人 / 接收器地址；留空 = 只落库、不投递 */
+  webhookUrl: string;
+  /** HMAC-SHA256 密钥；留空 = 不签名（接收端无法校验来源） */
+  webhookSecret: string;
+  /** 单次投递超时（毫秒） */
+  webhookTimeoutMs: number;
 }
 
 /**
@@ -154,6 +171,12 @@ const DEFAULTS: AppConfig = {
   metrics: {
     // 默认关：见 MetricsConfig.offlineSampling 的注释
     offlineSampling: false,
+  },
+  alerts: {
+    // 默认不投递：升级本身不该决定「把告警发到某个地址」
+    webhookUrl: '',
+    webhookSecret: '',
+    webhookTimeoutMs: 5000,
   },
 };
 
@@ -263,6 +286,9 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
     ['auth.maxUploadMb', num(env.AETHEROPS_MAX_UPLOAD_MB)],
     ['debug.sshDebug', bool(env.AETHEROPS_SSH_DEBUG)],
     ['metrics.offlineSampling', bool(env.AETHEROPS_METRICS_OFFLINE_SAMPLING)],
+    ['alerts.webhookUrl', str(env.AETHEROPS_ALERTS_WEBHOOK_URL)],
+    ['alerts.webhookSecret', str(env.AETHEROPS_ALERTS_WEBHOOK_SECRET)],
+    ['alerts.webhookTimeoutMs', num(env.AETHEROPS_ALERTS_WEBHOOK_TIMEOUT_MS)],
     ['database.host', str(env.AETHEROPS_DB_HOST)],
     ['database.port', num(env.AETHEROPS_DB_PORT)],
     ['database.user', str(env.AETHEROPS_DB_USER)],
@@ -362,6 +388,18 @@ export function validateConfig(config: AppConfig): string[] {
     problems.push(`auth.maxUploadMb 应大于 0: ${config.auth.maxUploadMb}`);
   }
 
+  const alerts = config.alerts;
+  if (alerts.webhookUrl && !/^https?:\/\//i.test(alerts.webhookUrl)) {
+    problems.push(`alerts.webhookUrl 必须是 http(s) 地址: ${alerts.webhookUrl}`);
+  }
+  if (alerts.webhookUrl && !alerts.webhookSecret) {
+    // 不是错误：有些内部接收器本来就不校验来源。但必须吼一声，否则「以为签了」
+    console.warn('[config] alerts.webhookUrl 已配置但 webhookSecret 为空：投递不带签名，接收端无法校验来源');
+  }
+  if (!Number.isFinite(alerts.webhookTimeoutMs) || alerts.webhookTimeoutMs < 1000) {
+    problems.push(`alerts.webhookTimeoutMs 应不小于 1000: ${alerts.webhookTimeoutMs}`);
+  }
+
   const redis = config.redis;
   if (!redis.url && !redis.host) problems.push('redis.host 未配置（或改用 redis.url 填完整连接串）');
   if (!Number.isInteger(redis.port) || redis.port < 1 || redis.port > 65535) problems.push(`redis.port 非法: ${redis.port}`);
@@ -426,6 +464,7 @@ export function loadConfig(force = false): AppConfig {
     auth: mergeSection(DEFAULTS.auth, dropDeprecated('auth', fromFile.auth)),
     debug: mergeSection(DEFAULTS.debug, fromFile.debug),
     metrics: mergeSection(DEFAULTS.metrics, fromFile.metrics),
+    alerts: mergeSection(DEFAULTS.alerts, fromFile.alerts),
   };
 
   cached = applyEnvOverrides(merged);
@@ -448,6 +487,7 @@ export function redactConfig(config: AppConfig = loadConfig()): any {
   clone.redis.password = mask(clone.redis.password);
   if (clone.redis.url) clone.redis.url = mask(clone.redis.url);
   clone.auth.launchToken = mask(clone.auth.launchToken);
+  clone.alerts.webhookSecret = mask(clone.alerts.webhookSecret);
   return clone;
 }
 

@@ -14,6 +14,9 @@
           <button class="ai-tab" :class="{ active: activeTab === 'monitor' }" @click="activeTab = 'monitor'">
             <i class="bi bi-activity"></i> {{ t('monitor.title') }}
           </button>
+          <button class="ai-tab" :class="{ active: activeTab === 'alerts' }" @click="activeTab = 'alerts'">
+            <i class="bi bi-bell"></i> {{ t('alerts.title') }}
+          </button>
         </div>
       </div>
       <div class="d-flex gap-1">
@@ -344,6 +347,11 @@
     <div v-show="activeTab === 'monitor'" class="ai-audit-wrapper">
       <LogMonitor ref="logMonitorRef" :sessionId="props.sessionId" :connectionId="props.connectionId" @ws-send="(msg: any) => emit('ws-send', msg)" />
     </div>
+    
+    <!-- 告警中心（P5）：持久化告警，不依赖当前终端/监控会话 -->
+    <div v-show="activeTab === 'alerts'" class="ai-audit-wrapper">
+      <AlertsPanel ref="alertsPanelRef" :active="activeTab === 'alerts'" />
+    </div>
 
     <!-- 已选 Skill 标签 -->
     <div v-if="selectedSkill && activeTab === 'chat'" class="selected-skill-bar">
@@ -468,6 +476,7 @@ import { useI18n } from 'vue-i18n';
 import * as aiService from '@/service/ai';
 import AuditPanel from '@/components/audit-panel/index.vue';
 import LogMonitor from '@/components/log-monitor/index.vue';
+import AlertsPanel from '@/components/alerts-panel/index.vue';
 import { escapeHtml, sanitizeHtml } from '@/utils/sanitize-html';
 import { readClipboard } from '@/utils/vscode-clipboard';
 import { toast } from '@/utils/toast';
@@ -573,11 +582,12 @@ interface QueuedMessage {
   approvalToken?: string;
 }
 
-const activeTab = ref<'chat' | 'audit' | 'monitor'>('chat');
+const activeTab = ref<'chat' | 'audit' | 'monitor' | 'alerts'>('chat');
 const messagesContainer = ref<HTMLElement>();
 const inputRef = ref<HTMLTextAreaElement>();
 const auditPanelRef = ref<InstanceType<typeof AuditPanel>>();
 const logMonitorRef = ref<InstanceType<typeof LogMonitor>>();
+const alertsPanelRef = ref<InstanceType<typeof AlertsPanel>>();
 const inputText = ref('');
 const isAgentRunning = ref(false);
 const messages = ref<ChatMessage[]>([]);

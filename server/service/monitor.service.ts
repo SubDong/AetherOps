@@ -55,6 +55,27 @@ export type MonitorEventCallback = (sessionId: string, event: {
 }) => void;
 
 /**
+ * 告警下沉入参（P5）。
+ *
+ * 监控只负责「这一行命中了规则」；去重、状态机、投递全在 AlertService。
+ * 写成回调而不是让 monitor 直接 import AlertService：后者会把服务图拽成双向依赖，
+ * 而 monitor 本身不需要知道告警存在哪里。
+ */
+export interface MonitorAlertSinkInput {
+  ownerId: string;
+  /** 可能是 '' / 'local'；AlertService 会统一成 __local__ */
+  connectionId: string;
+  monitorId: string;
+  /** 规则标识 = 监控用的匹配正则，规则级静默按它生效 */
+  rule: string;
+  level: 'error' | 'warning' | 'critical';
+  line: string;
+  at: number;
+}
+
+export type MonitorAlertSink = (input: MonitorAlertSinkInput) => void;
+
+/**
  * 实时日志监控服务
  * 支持 tail -f 远程/本地日志文件，AI 实时分析异常
  */
@@ -62,6 +83,7 @@ export class MonitorService {
   private monitors: Map<string, MonitorSession> = new Map();
   private connectionService: ConnectionService;
   private eventCallback: MonitorEventCallback | null = null;
+  private alertSink: MonitorAlertSink | null = null;
   private analysisTimer: NodeJS.Timeout | null = null;
   /** 分析间隔（毫秒） */
   private analysisInterval = 5000;
@@ -79,6 +101,15 @@ export class MonitorService {
    */
   onEvent(callback: MonitorEventCallback) {
     this.eventCallback = callback;
+  }
+
+  /**
+   * 注册告警下沉（P5）：命中的行除实时推送外，还要落库成有状态的告警。
+   * 回调实现必须自己吞错（AlertService.recordFromMonitor 就是），
+   * 否则一次写库失败会把 tail 的数据回调打断。
+   */
+  setAlertSink(sink: MonitorAlertSink | null) {
+    this.alertSink = sink;
   }
 
   /**
@@ -415,6 +446,20 @@ export class MonitorService {
           // 限制告警缓冲区
           if (monitor.alertBuffer.length > 200) {
             monitor.alertBuffer = monitor.alertBuffer.slice(-200);
+          }
+          // 下沉：实时面板用内存缓冲，历史与投递用 alerts 表（P5）
+          if (this.alertSink) {
+            try {
+              this.alertSink({
+                ownerId: monitor.ownerId,
+                connectionId: monitor.connectionId,
+                monitorId: monitor.id,
+                rule: monitor.pattern,
+                level,
+                line,
+                at: alert.timestamp,
+              });
+            } catch { /* 下沉失败不能打断 tail */ }
           }
           this.emitEvent(monitor.sessionId, {
             type: 'monitor-alert',

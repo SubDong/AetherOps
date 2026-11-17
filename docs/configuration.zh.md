@@ -118,6 +118,27 @@ AetherOps 实际连上的那台机器 —— 也就是跳板机本身，和状�
 开启之前会遇到的四个问题 —— 为什么默认关、跳板机连接采哪台、采不到的主机为什么不会每分钟重试、
 怎么把单个连接排除出去 —— 在 [offline-sampling-faq.zh.md](./offline-sampling-faq.zh.md) 里有完整回答。
 
+### `alerts`
+
+| 键 | 默认值 | 含义 |
+|----|--------|------|
+| `webhookUrl` | *空* | 告警通知的接收地址。留空表示告警只入库并在界面上展示，不往外推 |
+| `webhookSecret` | *空* | `X-AetherOps-Signature` 的 HMAC-SHA256 密钥；留空表示请求不签名（启动时打一条警告） |
+| `webhookTimeoutMs` | `5000` | 单次投递的超时时间（毫秒） |
+
+只有**新建**告警和**级别升级**才会往外推。同一个未关闭指纹的重复命中只累加 `occurrences`，不会再叫人一次。
+投递按指纹做 5 分钟去抖，失败后按 30 秒 / 2 分钟 / 10 分钟重试（重试 3 次，共 4 次尝试），并且永远不阻塞
+日志监控 —— 接收端不可达只会在 `server.log` 里留一条警告。
+
+签名头：`X-AetherOps-Signature: sha256=<hmac-sha256(secret, "<x-aetherops-timestamp>.<原始 body>")>`。
+时间戳参与签名，所以抓到的请求不能事后重放。
+
+规则级静默（告警页里的 **静默** 菜单，存在 `alert_mutes`）只压制投递。静默期间的命中照样计数，
+窗口过去后能看到那段时间到底发生了什么。
+
+`loadConfig` 在进程内缓存，也没有任何东西盯着文件：**改完这一段或 `AETHEROPS_ALERTS_*` 变量必须重启服务**。
+本页其它段落同理。
+
 ## 环境变量
 
 | 变量 | 映射到 | 说明 |
@@ -135,6 +156,7 @@ AetherOps 实际连上的那台机器 —— 也就是跳板机本身，和状�
 | `AETHEROPS_LAUNCH_TOKEN` | `auth.launchToken` | 由桌面/VSCode 宿主设置 |
 | `AETHEROPS_SSH_DEBUG` | `debug.sshDebug` | `1` 或 `true` |
 | `AETHEROPS_METRICS_OFFLINE_SAMPLING` | `metrics.offlineSampling` | `1` 或 `true`；对没有打开终端的机器也采样 |
+| `AETHEROPS_ALERTS_WEBHOOK_URL` / `_WEBHOOK_SECRET` / `_WEBHOOK_TIMEOUT_MS` | `alerts.*` | 接收地址、HMAC 密钥与单次投递超时 |
 | `AETHEROPS_NODE` | — | 用来拉起后端的 Node 可执行文件（VSCode 宿主） |
 | `AETHEROPS_BUNDLED` | — | 构建期由 `scripts/prepare-vscode-runtime.mjs` 写入，不要手工设置 |
 | `AETHEROPS_VSCODE_PRUNE_PREBUILDS` | — | 设为 `1` 时把 node-pty 的 prebuilds 裁到当前平台 |
@@ -177,6 +199,7 @@ AI 服务商的设置（Base URL、Key、模型）**不能**通过环境变量�
 | `0007-host-metrics` | 新增 `host_metrics_minute`：每个归属 / 连接 / 分钟一行，记 CPU %、内存 %、磁盘 % 与 load 1/5/15 的均值、峰值与样本数 |
 | `0008-connection-sampling` | `connections.sampling`（`''` = 跟随 `metrics.offlineSampling`，`skip` = 无人值守时永不拨号这个连接） |
 | `0009-error-fingerprints` | 新增 `error_fingerprints`：每个归属 / 连接 / 指纹一行，记 `occurrences`、`first_seen`、`last_seen`（由 Agent 的 `after_tool` 钩子写入） |
+| `0010-alerts` | 新增 `alerts`（有状态告警：`open` / `acked` / `resolved`，靠生成列 `open_key` 按归属 + 连接 + 指纹去重）与 `alert_mutes`（规则级静默窗口） |
 
 如果你打算加迁移，这些表结构约束值得先知道：
 
@@ -216,6 +239,7 @@ node scripts/migrate.mjs --force     # 忽略 checksum 不一致 / 已应用的�
 | 命令片段 | MySQL `snippets` | 否 |
 | 主机指标历史（每分钟的 CPU / 内存 / 磁盘 / load） | MySQL `host_metrics_minute`（按归属隔离） | 否 |
 | 错误指纹（每个归属 / 连接 / 归一化错误一行） | MySQL `error_fingerprints` | 否 |
+| 告警与规则级静默 | MySQL `alerts`、`alert_mutes`（按归属隔离） | 否 |
 | 账号（scrypt 哈希、角色、状态、10 个权限位） | MySQL `users` | 只存口令哈希，不可逆 |
 | 登录令牌 | Redis（`aetherops:token:*`，哈希存储，滑动 TTL） | 不适用 |
 | 解密密钥 | 数据目录下的 `*.key` 文件 | 这些**就是**秘密本身 |

@@ -129,6 +129,29 @@ The questions that come up before enabling it — why it is off by default, whic
 connection samples, why a failing host is not retried every minute, and how to exclude a single
 connection — are answered at length in [offline-sampling-faq.md](./offline-sampling-faq.md).
 
+### `alerts`
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `webhookUrl` | *empty* | Receiver for alert notifications. Empty = alerts are stored and shown in the UI, nothing is pushed |
+| `webhookSecret` | *empty* | HMAC-SHA256 key for `X-AetherOps-Signature`; empty = unsigned requests (a warning is logged at startup) |
+| `webhookTimeoutMs` | `5000` | Per-attempt request timeout in milliseconds |
+
+Only **new** alerts and **level escalations** are pushed. A repeated hit of an unresolved
+fingerprint only bumps `occurrences`, it does not page anyone again. Delivery is debounced per
+fingerprint for 5 minutes, retried after 30 s / 2 m / 10 m (three retries, four attempts total),
+and never blocks the log monitor — an unreachable receiver produces one warning in `server.log`.
+
+Signature header: `X-AetherOps-Signature: sha256=<hmac-sha256(secret, "<x-aetherops-timestamp>.<raw body>")>`.
+The timestamp is part of the signed string, so a captured request cannot be replayed later.
+
+Rule-level silence (the **Mute** menu in the Alerts tab, stored in `alert_mutes`) only suppresses
+delivery. Matching lines are still counted while muted, so you can see what happened during the
+silent window once it expires.
+
+`loadConfig` caches the file in-process and nothing watches it: **restart the server after editing
+this section or the `AETHEROPS_ALERTS_*` variables**. The same applies to every other section here.
+
 ## Environment variables
 
 | Variable | Maps to | Notes |
@@ -146,6 +169,7 @@ connection — are answered at length in [offline-sampling-faq.md](./offline-sam
 | `AETHEROPS_LAUNCH_TOKEN` | `auth.launchToken` | Set by desktop/VSCode hosts |
 | `AETHEROPS_SSH_DEBUG` | `debug.sshDebug` | `1` or `true` |
 | `AETHEROPS_METRICS_OFFLINE_SAMPLING` | `metrics.offlineSampling` | `1` or `true`; samples hosts without an open terminal |
+| `AETHEROPS_ALERTS_WEBHOOK_URL` / `_WEBHOOK_SECRET` / `_WEBHOOK_TIMEOUT_MS` | `alerts.*` | Receiver, HMAC key and per-attempt timeout |
 | `AETHEROPS_NODE` | — | Node binary used to launch the backend (VSCode host) |
 | `AETHEROPS_BUNDLED` | — | Set at build time by `scripts/prepare-vscode-runtime.mjs`; do not set by hand |
 | `AETHEROPS_VSCODE_PRUNE_PREBUILDS` | — | `1` trims node-pty prebuilds to the current platform |
@@ -189,6 +213,7 @@ statement text with whitespace normalized.
 | `0007-host-metrics` | New `host_metrics_minute`: one row per owner / connection / minute with avg, peak and sample count for CPU %, memory %, disk % and load 1/5/15 |
 | `0008-connection-sampling` | `connections.sampling` (`''` = follow `metrics.offlineSampling`, `skip` = never dial this connection unattended) |
 | `0009-error-fingerprints` | New `error_fingerprints`: one row per owner / connection / fingerprint, with `occurrences`, `first_seen`, `last_seen` (written by the agent `after_tool` hook) |
+| `0010-alerts` | New `alerts` (stateful alerts: `open` / `acked` / `resolved`, deduplicated by owner + connection + fingerprint through the generated column `open_key`) and `alert_mutes` (rule-level silence windows) |
 
 Schema constraints worth knowing if you intend to add a migration:
 
@@ -231,6 +256,7 @@ node scripts/migrate.mjs --force     # ignore checksum mismatch / already-applie
 | Command snippets | MySQL `snippets` | no |
 | Host metrics history (per-minute CPU / memory / disk / load) | MySQL `host_metrics_minute` (owner-scoped) | no |
 | Error fingerprints (one row per owner / connection / normalized error) | MySQL `error_fingerprints` | no |
+| Alerts and rule-level mutes | MySQL `alerts`, `alert_mutes` (owner-scoped) | no |
 | Accounts (scrypt hash, role, status, 10 permission bits) | MySQL `users` | password hash only, irreversible |
 | Login tokens | Redis (`aetherops:token:*`, hashed, sliding TTL) | n/a |
 | Decryption keys | data dir `*.key` files | these **are** the secrets |

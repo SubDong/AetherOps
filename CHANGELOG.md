@@ -186,6 +186,36 @@ supported build, and record the commit you run.
   write is skipped rather than guessed. Fingerprinting never blocks anything: a database error is
   logged and the command result is untouched (asserted in `temp/verify-p4-fingerprints.mjs`). The same
   module will back P5's alert de-duplication, so the two phases cannot drift into two different keys.
+- **Alerts leave the page: an error is now a stateful entity you can acknowledge, resolve and silence.**
+  A log-monitor rule hit used to be a line in a 200-entry in-memory buffer that vanished on reload and
+  could not reach anyone who was not looking at the panel. Migration `0010` adds `alerts` — one row per
+  owner / connection / fingerprint carrying `level`, `message`, `first_seen`, `last_seen`, `occurrences`
+  and a state of `open` / `acked` / `resolved` — plus `alert_mutes` for rule-level silence windows. The
+  chat panel gains a fourth tab listing them with the occurrence count, the rule that fired, the
+  connection and the account that acknowledged it; *Acknowledge* and *Resolve* act on a row and *Mute*
+  silences that rule for 30 m / 2 h / 24 h. De-duplication is a database fact rather than a read-then-write:
+  `status = 'resolved'` would make a plain unique key reject the next occurrence, so a stored generated
+  column `open_key` equals the fingerprint until the row is resolved and `NULL` afterwards, backed by
+  `UNIQUE (owner_id, connection_id, open_key)`; a concurrent insert that hits `ER_DUP_ENTRY` falls back
+  to the update path instead of failing. A repeat hit only bumps `occurrences` and `last_seen`, never
+  undoes an acknowledgement; an escalation (`warning` → `error` → `critical`) reopens the row, clears
+  `acked_by` / `acked_at` and pages again, and a hit after *Resolve* starts a fresh row. Pushes go to
+  `alerts.webhookUrl` with `X-AetherOps-Event` (`created` / `escalated`), an `X-AetherOps-Timestamp` and
+  `X-AetherOps-Signature: sha256=<hmac-sha256(secret, "<timestamp>.<body>")>`, and only for new and
+  escalated alerts — debounced per fingerprint for 5 minutes and retried after 30 s / 2 m / 10 m (three
+  retries, four attempts), fire-and-forget so an unreachable receiver produces one log line and no
+  blocked monitor. **Boundary:** only log-rule matches raise alerts (`source: 'log'`, `rule` being the
+  monitor's pattern); command failures stay fingerprints until a later phase, so nothing here fires on
+  `execute_command`; an alert belongs to owner + connection, not to a terminal session, and the three
+  spellings of the local connection (`''`, `local`, `__local__`) are folded into `__local__` so one
+  local error cannot split into three rows; silence suppresses delivery only, matching lines are still
+  counted while muted; retention deletes resolved rows older than 30 days and never an `open` / `acked`
+  one; pending retries live in the process, so a restart drops them while the rows themselves survive;
+  the same `fingerprintLine` export that P4 introduced produces the key, and the endpoint keeps the
+  monitor's permission bit. Asserted in `temp/verify-p5-alerts.mjs` (100 hits on one line → one open row,
+  `occurrences = 100`, one webhook). Documented under `alerts` in
+  [docs/configuration.md](docs/configuration.md#alerts) /
+  [docs/configuration.zh.md](docs/configuration.zh.md#alerts).
 
 ### Changed
 
