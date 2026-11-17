@@ -15,6 +15,52 @@ export interface Skill {
 }
 
 /**
+ * 技能目录条目：注入 prompt 只带这一份，正文不进目录。
+ * 有了它，技能数量增长只会把 prompt 撑长一行一条，而不是整篇。
+ */
+export interface SkillCatalogEntry {
+  id: string;
+  name: string;
+  /** 一句话用途；技能自己没写 description 时用正文首行标题推导 */
+  description: string;
+  tags: string[];
+}
+
+/** 目录里的描述有长度上限：一句话用途写成一段，目录就失去了意义 */
+const CATALOG_DESCRIPTION_MAX = 200;
+
+function clipText(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+/**
+ * 目录里那句「什么时候用」。
+ *
+ * description 优先（skill 文件里本来就有这个字段，老版本用户技能可能没填）；
+ * 缺失时用正文首个标题行推导 —— 为了这点距离不值得加一次数据库迁移。
+ */
+function catalogDescriptionOf(skill: Skill): string {
+  const explicit = String(skill.description || '').replace(/\s+/g, ' ').trim();
+  if (explicit) return clipText(explicit, CATALOG_DESCRIPTION_MAX);
+  const firstLine = String(skill.content || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line && !line.startsWith('```')) || '';
+  const title = firstLine.replace(/^#+\s*/, '').trim();
+  return title ? clipText(title, CATALOG_DESCRIPTION_MAX) : '(no description)';
+}
+
+/** 技能实体 → 目录条目。导出是为了让验证脚本能单独盯住「描述缺失时怎么推导」 */
+export function toCatalogEntry(skill: Skill): SkillCatalogEntry {
+  return {
+    id: skill.id,
+    name: skill.name,
+    description: catalogDescriptionOf(skill),
+    tags: skill.tags,
+  };
+}
+
+/**
  * Skill 服务 - 管理和加载 Skills
  *
  * 存储位置：
@@ -147,6 +193,16 @@ export class SkillService {
     const userSkills = await listUserSkills(ownerId);
     for (const skill of userSkills) merged.set(skill.id, skill);
     return Array.from(merged.values());
+  }
+
+  /**
+   * 技能目录：只有 id / 名字 / 一句话用途，不含正文。
+   *
+   * 按 id 排序是为了让每次注入的 prompt 完全一致（缓存与 diff 都靠这个稳定）。
+   */
+  async listSkills(ownerId: string): Promise<SkillCatalogEntry[]> {
+    const skills = await this.getSkills(ownerId);
+    return skills.map(toCatalogEntry).sort((a, b) => a.id.localeCompare(b.id));
   }
 
   /**

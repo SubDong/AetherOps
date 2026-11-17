@@ -269,6 +269,8 @@ interface ISSHService {
 
 interface ISkillService {
   getSkill(ownerId: string, id: string): Promise<{ name: string; content: string } | undefined>;
+  /** 技能目录：只有 id / 名字 / 一句话用途，正文留给 load_skill 按需取 */
+  listSkills(ownerId: string): Promise<Array<{ id: string; name: string; description: string; tags?: string[] }>>;
 }
 
 /** 连接清单：list_connections 只要元信息，所以这里只声明这一个方法 */
@@ -345,6 +347,43 @@ function unknownTerminalMsg(sessionId: string): string {
 function oneLine(value: string, max: number): string {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
   return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+/** agentRun 每轮通过 context.custom 带进来的「本轮已加载的技能」缓存 */
+const SKILL_CACHE_KEY = 'skillCache';
+
+/**
+ * 单个技能注入上限（字符）。
+ *
+ * 技能是写给模型看的 playbook，正常几 KB；上万字那种多半是把整份手册塞进来了，
+ * 整篇注入等于用一份技能把上下文吃穿，所以截断并告知模型剩下得问用户要。
+ */
+const MAX_SKILL_CHARS = 20000;
+
+/** 没有技能库时的固定文案：必须是「没这个能力」，不是「没找到」 */
+const SKILLS_UNAVAILABLE_MSG = 'SKILLS_UNAVAILABLE: the skill library is not available in this deployment.';
+
+/**
+ * 技能目录。
+ *
+ * 技能从「选一个、全文塞 prompt」改成「目录常驻、按需加载」：目录只占一行一条，
+ * 技能再多也不会把 system prompt 线性撑大；选中的那个仍然全文注入，
+ * 保持「手动选一个就直接生效」的旧行为。
+ */
+function renderSkillCatalog(catalog: Array<{ id: string; name: string; description: string }>): string {
+  const lines = [
+    '## Skills (catalog)',
+    '',
+    'Reusable runbooks written for this deployment. This is the catalog only - the id and a one-line purpose, '
+      + 'not the instructions themselves.',
+    '',
+  ];
+  for (const entry of catalog) {
+    lines.push(`- ${entry.id} — ${entry.name}: ${entry.description}`);
+  }
+  lines.push('', 'When a task matches one of these, call load_skill with its id before acting, so you follow this '
+    + 'deployment\'s own steps instead of inventing them. Load only the skills the task needs.');
+  return lines.join('\n');
 }
 
 // ========== 工具侧的权限判定 ==========
@@ -470,9 +509,10 @@ Your capabilities:
 5. List this account's connections and which of them have an open terminal via the list_connections tool
 6. Read the beginning of a file on a host that already has an open terminal via the read_file tool
 7. Run one command on several already-open hosts at once via the run_on_hosts tool
-8. Understand command execution results and make decisions accordingly
-9. Automatically complete multi-step tasks
-10. Generate script files to execute complex or multi-step operations
+8. Load a skill's full instructions on demand via the load_skill tool (only the catalog is in your prompt)
+9. Understand command execution results and make decisions accordingly
+10. Automatically complete multi-step tasks
+11. Generate script files to execute complex or multi-step operations
 
 Working principles:
 1. **Take action**: When the user asks you to do something, use tools to execute directly, don't just suggest commands
@@ -485,6 +525,7 @@ Working principles:
 8. **Reach**: apart from query_metrics and search_audit (which read stored history), every tool works only on hosts that already have an open terminal session - nothing dials a new connection. If the target host has no open terminal, say so and ask the user to open one; never describe it as the host being unreachable
 9. **Wide reach needs intent**: run_on_hosts runs the same command on every targeted host, so use it when the user actually asked for a sweep (inventory, health check, "all web servers"). Changing something on many hosts at once is not a decision you make on your own
 10. **Permission denials are final**: if a tool answers PERMISSION_DENIED, this account was never granted it. Report that to the user; do not retry with other arguments and do not try to reproduce the tool with execute_command
+11. **Skills are loaded, not assumed**: the catalog tells you which runbooks exist and what each is for, not what they contain. When a task matches one, call load_skill first and follow that playbook instead of improvising; load only what the task needs
 
 Script strategy (important):
 Generate a script file instead of executing commands one by one when the task meets any of the following conditions:
@@ -1312,6 +1353,34 @@ export class AIService {
       },
       category: 'builtin',
     });
+
+    // load_skill —— 只读技能库，不碰终端。目录常驻 prompt，正文在这里按需拉。
+    this.toolRegistry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'load_skill',
+          description: 'Load the full instructions of one skill from the catalog written into your system prompt. '
+            + 'The catalog lists which runbooks exist (id + one-line purpose) but not what they say: call this '
+            + 'before starting a task that matches one, so you follow this deployment\'s steps instead of improvising. '
+            + 'Load only the skills the task needs - each one costs context. A skill longer than 20k characters '
+            + 'returns its beginning plus a truncation notice.',
+          parameters: {
+            type: 'object',
+            properties: {
+              skill: { type: 'string', description: 'Skill id from the catalog (its name also works)' },
+            },
+            required: ['skill'],
+          },
+        },
+      },
+      executor: async (args: Record<string, unknown>, ctx: ToolContext) => {
+        const holder = ctx.custom?.[SKILL_CACHE_KEY];
+        const cache = holder instanceof Map ? holder as Map<string, string> : undefined;
+        return this.loadSkill(ownerIdOf(ctx), args, cache);
+      },
+      category: 'builtin',
+    });
   }
 
   // ========== 命令安全检查 ==========
@@ -1505,6 +1574,82 @@ export class AIService {
       scope: pending.scope,
       expiresAt: pending.expiresAt,
     };
+  }
+
+  // ========== 技能：目录 + 按需加载 ==========
+
+  /**
+   * 该账号可见的技能目录。
+   *
+   * 读失败按空目录处理：技能库挂了不该让整轮对话起不来（少一份目录比整轮报错好）。
+   */
+  private async skillCatalogOf(ownerId: string): Promise<Array<{ id: string; name: string; description: string }>> {
+    if (!this.skillService) return [];
+    try {
+      return await this.skillService.listSkills(ownerId);
+    } catch (error: any) {
+      console.warn(`[AIService] 技能目录读取失败：${error?.message || error}`);
+      return [];
+    }
+  }
+
+  /**
+   * 注入 system prompt 的技能片段。
+   *
+   * 目录永远在（没选技能时它就是全部）；选了技能再把全文接上去。
+   * 选中的 id 已经不存在时不报错，只少一段——技能被删掉是常态。
+   */
+  private async buildSkillPrompt(ownerId: string, skillId?: string): Promise<string> {
+    const catalog = await this.skillCatalogOf(ownerId);
+    const parts: string[] = [];
+    if (catalog.length) parts.push(renderSkillCatalog(catalog));
+    if (skillId) {
+      const skill = await this.skillService?.getSkill(ownerId, skillId);
+      if (skill) parts.push(`## Current Task Instructions (Skill: ${skill.name})\n\n${skill.content}`);
+    }
+    return parts.join('\n\n');
+  }
+
+  /**
+   * load_skill 的实现：按 id（或名字）取一份技能全文。
+   *
+   * 缓存挂在这一轮的 context.custom 上：同一轮里模型反复拉同一份时，
+   * 既不再查库，也不再多占一次上下文 —— 宁可回一句 already loaded，也不要重复正文。
+   * 匹配顺序是精确 id → 忽略大小写的 id → 忽略大小写的名字，没命中就报错并列出可用 id，
+   * 否则模型会自己编一个像样的名字接着试。
+   */
+  private async loadSkill(ownerId: string, args: Record<string, unknown>, cache?: Map<string, string>): Promise<string> {
+    if (!this.skillService) return SKILLS_UNAVAILABLE_MSG;
+    if (!ownerId) return 'SKILLS_UNAVAILABLE: this run has no account binding, so no skill can be loaded.';
+
+    const wanted = String(args?.skill ?? '').trim();
+    if (!wanted) return 'Invalid skill: pass the id from the catalog (or its name).';
+
+    const key = wanted.toLowerCase();
+    const cached = cache?.get(key);
+    if (cached) return `(already loaded in this turn)\n\n${cached}`;
+
+    const catalog = await this.skillCatalogOf(ownerId);
+    const hit = catalog.find((entry) => entry.id === wanted)
+      || catalog.find((entry) => entry.id.toLowerCase() === key)
+      || catalog.find((entry) => entry.name.toLowerCase() === key);
+    if (!hit) {
+      const ids = catalog.map((entry) => entry.id).slice(0, 20).join(', ');
+      return `SKILL_NOT_FOUND: no skill matches "${oneLine(wanted, 60)}". `
+        + `Available: ${ids || '(the catalog is empty)'}. Use an id exactly as listed; do not guess another name.`;
+    }
+
+    const skill = await this.skillService.getSkill(ownerId, hit.id);
+    if (!skill) return `SKILL_NOT_FOUND: skill "${hit.id}" is listed but its content could not be read.`;
+
+    const truncated = skill.content.length > MAX_SKILL_CHARS;
+    const body = truncated
+      ? `${skill.content.slice(0, MAX_SKILL_CHARS)}\n\n... (truncated at ${MAX_SKILL_CHARS} characters; ask the user for the rest instead of guessing)`
+      : skill.content;
+    const text = `## Skill loaded: ${skill.name} (id: ${hit.id})\n\n${body}`;
+    cache?.set(key, text);
+    cache?.set(hit.id.toLowerCase(), text);
+    return text;
   }
 
   // ========== 工具执行 ==========
@@ -2176,11 +2321,12 @@ export class AIService {
         + '(an SSH connection or the Default Server Shell) if the task really needs commands.]';
     }
 
-    if (opts?.skillId && this.skillService) {
-      const skill = await this.skillService.getSkill(ownerId, opts.skillId);
-      if (skill) {
-        systemPromptOverride += `\n\n## Current Task Instructions (Skill: ${skill.name})\n\n${skill.content}`;
-      }
+    // 技能：目录常驻，选中的那个再把全文接在后面。
+    // 以前只有「全文」没有目录，于是选了 A 就看不到 B，技能全靠人去选；
+    // 现在给了目录，模型能自己 load_skill 拉一份没被选中的技能。
+    if (this.skillService) {
+      const skillPrompt = await this.buildSkillPrompt(ownerId, opts?.skillId);
+      if (skillPrompt) systemPromptOverride += `\n\n${skillPrompt}`;
     }
 
     const ctrl = new AbortController();
@@ -2234,6 +2380,8 @@ export class AIService {
             // 已批准的一次性 token + 需要确认时的回调
             [APPROVAL_TOKENS_KEY]: approvalCtx.tokens,
             [CONFIRM_SINK_KEY]: approvalCtx.onConfirmRequired,
+            // 本轮已加载的技能：同一轮重复 load_skill 直接回缓存，不重读也不重复占上下文
+            [SKILL_CACHE_KEY]: new Map<string, string>(),
           };
           const eventStream = engine.run({
             sessionId: chatId,

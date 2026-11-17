@@ -75,6 +75,8 @@ backend, plus **multi-account access control** so a team can share one deploymen
   one command across up to 10 open hosts, 2 at a time with a 45 s budget. None of them dials a
   new connection, credential files are refused, and each needs its own permission bit
   (`connections` / `files` / `batch`).
+- **Runbooks on demand.** `load_skill` pulls the full text of one skill listed in the catalog
+  that is written into the system prompt — see [Skills](#skills).
 
 ### Server status & OS self-detection
 
@@ -189,9 +191,19 @@ backend, plus **multi-account access control** so a team can share one deploymen
 
 - Built-in operational playbooks shipped in `data/skills/`: server health check, log analysis,
   Docker management.
-- Markdown + YAML front matter, injected into the system prompt for that run. Selection is always
-  explicit: pick it in the skills panel, or type `/skill-id` (exact id match, optional trailing task
-  text). There is no tag-based auto-matching and the model does not choose a skill by itself.
+- **The catalog is always there; the body is not.** Every run starts with a one-line-per-skill
+  catalog (id, name, one-line purpose) in the system prompt. When a task matches an entry the model
+  calls `load_skill` itself and receives that skill's full Markdown — so the prompt grows by one
+  line per skill instead of one document per skill. Three skills or thirty, the catalog stays small.
+- **Manual selection still works, and still wins.** Pick a skill in the panel or type `/skill-id`
+  (exact id match, optional trailing task text): its full text is injected into that run *on top
+  of* the catalog, and the model may load further skills to combine them.
+- A skill whose front matter has no `description` gets its one-line purpose from the first heading
+  of its body — no migration needed for skills written before that field existed.
+- One `load_skill` call is capped at 20k characters (longer files come back with a truncation
+  notice), and repeated loads within the same turn are served from a per-turn cache.
+- There is no tag-based auto-matching: the match happens in the prompt, by the model reading the
+  catalog.
 - User-scoped skills live in the `skills` table (schema and service layer in place; the write API
   is not exposed yet — see [docs/skills-guide.md](./docs/skills-guide.md)).
 

@@ -102,36 +102,48 @@ Parser constraints that bite in practice:
 - The id is the file name: `nginx-management.md` → `/nginx-management`. Spaces and non-ASCII in file names
   make slash commands awkward — use kebab-case.
 
-There is no size limit enforced in code. Everything is injected verbatim on every turn of a run, so a
-50 KB playbook is 50 KB off your context window; the built-ins stay under a few KB on purpose.
+There is no size limit on a *selected* skill's body — it is injected verbatim on every turn of that run, so a
+50 KB playbook is 50 KB off your context window; the built-ins stay under a few KB on purpose. A body fetched
+through the catalog goes through `load_skill` instead, which returns at most 20k characters and says so when
+it truncates. Either way the catalog itself costs one line per skill, not one document per skill.
 
 ## How a skill is selected
 
-Two paths, both explicit — the agent never picks a skill by itself:
+Every run carries a **catalog** in the system prompt: one line per skill the account can see (`id — name:
+purpose`). Two paths follow from that, and they can be combined in the same turn:
 
-1. **Skills panel** — open it in the chat area and click a skill; it stays selected (with a clear button)
-   until you send, then resets.
-2. **Slash command** — type `/` + the skill id. Matching is exact and case-insensitive against the id,
-   and only when the message starts with `/`:
+1. **The agent loads one itself.** When your message matches an entry, the model calls `load_skill` with that
+   id and receives the body. This is how "帮我看看 docker 状态" reaches the Docker playbook with nothing
+   selected — the match happens in the prompt, not in a `tags` lookup in code. It costs one tool call, and the
+   model decides, so a catalog line that does not say *when to use* the skill is a skill that never gets loaded.
+2. **You select one explicitly** — the panel, or a slash command. Its full text is then injected *in addition
+   to* the catalog, and the model may load another skill to combine the two.
 
    | You type | What the agent receives |
    |----------|-------------------------|
    | `/docker-manage` | Instructions from that skill, with the skill's `description` as the task text |
    | `/docker-manage prune stopped containers` | Same instructions, task text = your words after the command |
-   | `/docke` | No exact match → sent to the agent as an ordinary message |
+   | `/docke` | No exact match → sent to the agent as an ordinary message (the catalog is still there) |
    | `please /docker-manage now` | Not at position 0 → ordinary message |
 
-There is **no** keyword/tag auto-matching and **no** "let the LLM choose the skill" step. Natural language
-like "帮我看看 docker 状态" works only if the model happens to be in a context where that skill is
-selected — the older revision of this guide claimed automatic tag matching, and the code has no such
-path.
+There is still **no** keyword/tag auto-matching in code. The older revision of this guide claimed tags did
+that, and a later one claimed the model could not choose at all; both described a codebase that no longer
+exists. Selecting a skill is now an optimisation (skip the tool call, pin one playbook), not the only way in.
 
 Access to the list is permission-gated: `/api/ai/getSkills` accepts either the `skills` bit or the `ai`
 bit, since picking a skill is part of chatting.
 
 ## What the agent actually receives
 
-When a run starts with a skill, the server appends to the system prompt:
+Every run starts with the catalog, appended to the system prompt:
+
+```
+## Skills (catalog)
+
+- <id> — <name>: <one-line purpose>
+```
+
+When a run starts with a skill selected, the server also appends:
 
 ```
 ## Current Task Instructions (Skill: <name>)
@@ -141,9 +153,14 @@ When a run starts with a skill, the server appends to the system prompt:
 
 Details worth knowing:
 
-- It is per **run**, not a persistent mode. The next message without a skill has no such section.
-- It is an *addition* to the base system prompt (which already carries terminal context and tool
+- Both are per **run**, not a persistent mode. The next message without a skill still has the catalog but no
+  `Current Task Instructions` section.
+- They are an *addition* to the base system prompt (which already carries terminal context and tool
   definitions), not a replacement.
+- A catalog line's purpose comes from front matter `description`; a skill without one falls back to the first
+  heading of its body (clipped to 200 characters), so a file with no front matter still gets a usable line.
+- The selected skill stays listed in the catalog too — the catalog answers "what exists and when to use it",
+  the injected section answers "what this run must do".
 - The skill id and name are stored on the user message in chat history, so the transcript shows which
   playbook produced which answer, and "retry" on that message re-uses the same skill.
 - Skills cannot grant capability. A skill that says "restart all services" only runs if the account's
@@ -257,7 +274,8 @@ High memory or CPU: `ps aux | grep nginx`, review `worker_connections`, check th
 | Did my file load? | Startup log: `[SkillService] Loaded N system skills (user skills are per-account, queried on demand)`. N lower than expected → look for the `Failed to parse skill` line above it |
 | Is the front matter parsed? | Panel shows the id instead of `name` → front matter not recognized (see [File format](#file-format) constraints) |
 | Which skills does this account see? | `POST /api/ai/getSkills` with the account's bearer token — it returns exactly the merged view (built-ins + this owner's rows) |
-| Was the skill injected into the prompt? | The turn's user message carries a skill badge in the transcript; the WS `ai-agent-run` frame carries `skillId` (DevTools → Messages) |
+| Was the skill injected into the prompt? | A selected skill: the turn's user message carries a skill badge, and the WS `ai-agent-run` frame carries `skillId`. A self-loaded skill: the transcript shows a `load_skill` tool call |
+| Why did the agent ignore my skill? | Check its catalog line — `description` (or the first heading) has to say *when* to use it. A one-word description never matches anything |
 | Why did nothing happen on `/myskill`? | Id mismatch (slash matching is exact on the file name), or the `/` is not the first character |
 | My edit did not appear | Built-ins are read at startup; restart the backend |
 

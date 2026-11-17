@@ -217,6 +217,7 @@
           <i class="bi bi-x"></i>
         </button>
       </div>
+      <div class="skills-hint">{{ t('ai.skillsHint') }}</div>
       <div class="skills-grid">
         <div
           v-for="skill in skills"
@@ -2774,6 +2775,14 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
 }
 .btn-skill-toggle:hover { background: rgb(var(--overlay-rgb) / 10%); color: var(--warning); }
 .btn-skill-toggle.active { color: var(--warning); background: rgb(var(--warning-rgb) / 10%); }
+
+/* 不选技能也能用：目录本来就在 prompt 里，这里只是把这件事说出来 */
+.skills-hint {
+  padding: 6px 16px 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-secondary);
+}
 
 /* Skills 面板 */
 .skills-panel {

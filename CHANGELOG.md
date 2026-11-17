@@ -140,6 +140,26 @@ supported build, and record the commit you run.
   command text and is not a sandbox (`bash -c "$(cat script)"` is outside what it can see); the legacy
   `safe` field keeps its old meaning for the batch panel (`confirm` counts as `safe` there, because a
   human clicking Execute *is* the confirmation), so `batch.service` needed no change.
+- **Skills load on demand: a catalog in the system prompt, the full text only when asked for.** A skill
+  used to reach the model one way only — a human picked it and the whole Markdown went into that run's
+  prompt — so the model could not choose a runbook and every selected skill cost its full length in
+  context. Every run now starts with a catalog: one line per skill (`id — name: one-line purpose`),
+  built by `SkillService.listSkills()` from what the account can actually see. When a task matches an
+  entry the model calls the new `load_skill` tool and receives that skill's body; a manually selected
+  skill is still injected in full *and* the catalog is still there, so an explicit pick and a
+  self-loaded runbook can be combined in the same turn. A skill written without `description` derives
+  its one-line purpose from the first heading of its body — no migration for skills that predate the
+  field — and a purpose longer than 200 characters is clipped instead of turning the catalog back into
+  prose. **Boundary:** `load_skill` resolves id first, then name, and refuses to guess on a miss — it
+  returns `SKILL_NOT_FOUND` with the ids that do exist; one call is capped at 20k characters and the
+  truncation is announced in the result, so the model asks for the rest rather than inventing it;
+  repeated loads inside one turn are served from a per-turn cache in the run context, which dies with
+  the run; the tool only reads the caller's own skills, owner taken from the run context and never from
+  arguments; with no skill service wired the catalog is omitted and the tool answers
+  `SKILLS_UNAVAILABLE` instead of pretending the library is empty. Prompt growth is now one line per
+  skill: going from 3 to 10 skills adds seven lines, not seven documents (asserted in
+  `temp/verify-p3-skills.mjs`). See [README.md](README.md#skills) /
+  [README.zh.md](README.zh.md#skills-技能).
 
 ### Changed
 

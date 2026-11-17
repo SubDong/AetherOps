@@ -226,6 +226,7 @@ export default {
     activeSkill: 'Active Skill',
     noSkills: 'No skills available',
     userSkill: 'Custom',
+    skillsHint: 'Optional. The AI always sees this catalog and loads a runbook by itself when a task matches.',
     history: 'History',
     noHistory: 'No history',
     modelList: 'Models',

@@ -226,6 +226,7 @@ export default {
     activeSkill: '已选技能',
     noSkills: '暂无可用技能',
     userSkill: '自定义',
+    skillsHint: '可不选：技能目录始终对 AI 可见，遇到匹配的任务它会自己加载正文。',
     history: '历史记录',
     noHistory: '暂无历史对话',
     modelList: '模型配置',
