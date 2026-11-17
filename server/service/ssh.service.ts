@@ -9,6 +9,7 @@ import * as path from 'path';
 import { shellQuote } from '../utils/shell';
 import { stripAnsiEscapes } from '../utils/ansi';
 import { SERVER_SHELL_ERROR, verifyServerShellPassword } from './server-shell.service';
+import { openSecretInput } from '../utils/transport-crypto';
 import { listSessionMeta, upsertSessionMeta, deleteSessionMeta } from '../db/repositories/session.repo';
 import {
   PROBE_SCRIPT,
@@ -365,7 +366,16 @@ export class SSHService {
     if (connectionId === '__local__') {
       // 门禁：这个终端开在服务端主机上，口令由管理员在账号管理页设置。
       // 校验放在建会话之前、任何进程创建之前——先给口令再开机，不能反过来。
-      const verdict = await verifyServerShellPassword(options?.serverShellPassword || '');
+      // 口令在链路上是密文（前端 src/utils/transport-crypto.ts），先解开再比对。
+      let shellPassword = '';
+      try {
+        shellPassword = openSecretInput(options?.serverShellPassword, 'serverShellPassword');
+      } catch (e: any) {
+        const err: any = new Error(e?.message || '口令必须以密文传输');
+        err.code = e?.code || 'cipher_invalid';
+        throw err;
+      }
+      const verdict = await verifyServerShellPassword(shellPassword);
       if (verdict !== 'ok') {
         const err: any = new Error(
           verdict === 'not_set'

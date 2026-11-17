@@ -1,4 +1,5 @@
 import { request } from '@/service/base';
+import { sealSecret } from '@/utils/transport-crypto';
 
 /**
  * 解包 API 响应
@@ -23,9 +24,9 @@ export function getServerShellState() {
   return request<ServerShellPasswordState>('/api/system/getServerShell', {}).then(unwrap);
 }
 
-/** 设置/更新口令（至少 8 位，由服务端校验） */
+/** 设置/更新口令（至少 8 位，由服务端校验）；口令以密文上传 */
 export function setServerShellPassword(password: string) {
-  return request<boolean>('/api/system/setServerShellPassword', { password }).then(unwrap);
+  return request<boolean>('/api/system/setServerShellPassword', { password: sealSecret(password) }).then(unwrap);
 }
 
 /** 清除口令：清除后该终端谁都打不开，需要重新设置 */

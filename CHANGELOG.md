@@ -49,6 +49,20 @@ supported build, and record the commit you run.
   Anything that runs `pnpm build` inherited the hang, including the Docker image build and CI. The timer
   is now `unref()`d, matching how `SSHService` has guarded its periodic cleanup timer.
 
+### Security
+
+- **Passwords no longer cross the network as plaintext.** Login, self-service registration, self-service
+  password change, admin account creation, admin password reset and the "default server shell" gate now
+  carry their password fields as an AES-256-GCM envelope
+  (`ao1.<base64url(iv)>.<base64url(ciphertext||tag)>`, key derived from a fixed passphrase, a fresh IV per
+  message, and a 10-minute freshness window so a captured packet cannot be replayed), and passwords the
+  server generates are sealed on the way back as well. The server **rejects plaintext** on those fields
+  with `400 cipher_required` — there is no readable fallback. The envelope exists because the common
+  deployment is plain HTTP on a LAN with no reverse proxy; the key necessarily ships in the client bundle,
+  so it defends against plaintext on the wire (capture, proxy logs, middleboxes) and TLS in front remains
+  the stronger control. See `server/utils/transport-crypto.ts`, `src/utils/transport-crypto.ts` and
+  [docs/accounts-and-permissions.md](docs/accounts-and-permissions.md#transport-encryption).
+
 Add entries under `Added` / `Changed` / `Fixed` / `Removed` / `Security` as part of the pull request
 that makes the change, not afterwards.
 

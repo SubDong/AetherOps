@@ -110,6 +110,8 @@ separate HTTP routes registered before that middleware, because they stream bina
 than JSON, and they perform their own permission + session-owner check. `/oauth/token` responses
 carry `Cache-Control: no-store` so an intermediary cannot cache and replay a token.
 
+Passwords on all of these endpoints are **ciphertext**, see [Transport encryption](#transport-encryption).
+
 - Tokens are `ao_` + 32 random bytes (base64url). Redis stores only a **hash** of the token as the
   key, with the payload (userId, role, status, permission snapshot) as the value.
 - TTL is 7200 s, **sliding**: each authenticated request extends it when less than 1000 s remain,
@@ -172,6 +174,39 @@ Consequences to plan for:
 - Losing the data directory means losing stored credentials (they cannot be decrypted).
 - A DB dump plus the data directory equals full exposure of stored SSH credentials — that is the
   normal trade-off for a credential store; protect both halves.
+
+## Transport encryption
+
+Password-carrying fields get an application-layer envelope, so a **plain-HTTP deployment is expected and
+supported**:
+
+| Field | Where |
+|-------|-------|
+| `password` | `/oauth/token`, `/api/auth/login`, `/api/auth/register`, `/api/users/create` |
+| `oldPassword` / `newPassword` | `/api/auth/changePassword` |
+| `password` | `/api/system/setServerShellPassword` |
+| `serverShellPassword` | the terminal WebSocket `create` / `reconnect` messages |
+| `password` (the server-generated one, in **responses**) | `/api/users/create`, `/api/users/resetPassword` |
+
+- AES-256-GCM with key = `SHA-256("aetherOps_ms")`. Every encryption uses a fresh random IV, the wire format
+  is `ao1.<base64url(iv)>.<base64url(ciphertext||tag)>`, and the sealed plaintext carries a timestamp: anything
+  older or newer than 10 minutes is rejected, so a captured packet cannot be replayed later.
+- The server **refuses plaintext**: these fields return `400 cipher_required` when they arrive readable — there
+  is deliberately no plaintext fallback. Scripts calling `/oauth/token` must encrypt; `scripts/verify-auth.mjs`
+  reuses the server-side implementation.
+- The key ships inside the front-end bundle (`src/utils/transport-crypto.ts`), so **anyone who can read the
+  client can decrypt the ciphertext**. What this layer buys is protection against plaintext on the wire (packet
+  capture, proxy access logs, middleboxes), not protection against someone who can modify the client. Against
+  that adversary you still want TLS in front; the two layers do not conflict.
+- Changing the key requires editing both sides (`server/utils/transport-crypto.ts` and
+  `src/utils/transport-crypto.ts`) — otherwise requests start failing with `cipher_invalid`.
+- Upgrade order matters: ship the server and the front-end bundle together, and tell users to force-reload
+  (Ctrl+F5) once. A browser still running the pre-upgrade page sends plaintext and gets `400 cipher_required`
+  instead of logging in.
+- **Not covered yet**: SSH connection credentials (`password` / `privateKey` / `passphrase`) and AI API keys still
+  cross the wire in plaintext (they are `enc:v1:` ciphertext at rest; the gap is only the transport leg), as does
+  terminal output. Extending it means wiring the same primitive into the request and response paths of
+  `src/service/connection.ts` and `src/service/ai.ts`.
 
 ## Rules for changes
 

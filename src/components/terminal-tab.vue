@@ -196,6 +196,7 @@ import { isVSCode } from '@/base/detect';
 import { useDraggableFloating } from '@/utils/draggable';
 import * as terminalService from '@/service/terminal';
 import { prompt } from '@/components/prompt';
+import { sealSecret } from '@/utils/transport-crypto';
 
 const { t } = useI18n();
 
@@ -712,7 +713,8 @@ function buildCreateData() {
     cols: terminal?.cols || 80,
     rows: terminal?.rows || 24,
     name: props.connection.name,
-    ...(serverShellPassword ? { serverShellPassword } : {}),
+    // 口令只以密文出内存（见 utils/transport-crypto）：明文留在 serverShellPassword 里供重连复用
+    ...(serverShellPassword ? { serverShellPassword: sealSecret(serverShellPassword) } : {}),
   };
 }
 

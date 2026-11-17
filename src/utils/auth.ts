@@ -10,6 +10,7 @@
  */
 import config from '@/base/config';
 import { isElectron } from '@/base/detect';
+import { openSecret, sealOptional, sealSecret } from '@/utils/transport-crypto';
 
 export type UserRole = 'admin' | 'user';
 export type UserStatus = 'pending' | 'active' | 'disabled';
@@ -170,7 +171,8 @@ export async function login(username: string, password: string): Promise<AuthUse
   const { status, data } = await callAccountApi('/oauth/token', {
     grant_type: 'password',
     username,
-    password,
+    // 口令不出明文：服务端只接受密文（见 utils/transport-crypto）
+    password: sealSecret(password),
   });
   if (status !== 200 || !data?.access_token) {
     throw new Error(errorMessage(data, `登录失败（HTTP ${status}）`));
@@ -181,7 +183,7 @@ export async function login(username: string, password: string): Promise<AuthUse
 
 /** 自助注册：落库即 pending，管理员授权前用不了任何功能 */
 export async function register(username: string, password: string, displayName?: string): Promise<AuthUser> {
-  const { status, data } = await callAccountApi('/api/auth/register', { username, password, displayName });
+  const { status, data } = await callAccountApi('/api/auth/register', { username, password: sealSecret(password), displayName });
   if (status !== 200 || data?.ret !== 0) {
     throw new Error(errorMessage(data, `注册失败（HTTP ${status}）`));
   }
@@ -198,7 +200,10 @@ export async function refreshMe(): Promise<AuthUser | null> {
 }
 
 export async function changePassword(oldPassword: string, newPassword: string): Promise<void> {
-  const { status, data } = await callAccountApi('/api/auth/changePassword', { oldPassword, newPassword });
+  const { status, data } = await callAccountApi('/api/auth/changePassword', {
+    oldPassword: sealSecret(oldPassword),
+    newPassword: sealSecret(newPassword),
+  });
   if (status !== 200 || data?.ret !== 0) {
     throw new Error(errorMessage(data, '修改密码失败'));
   }
@@ -261,9 +266,15 @@ export async function adminCreateUser(input: {
   status?: UserStatus;
   permissions?: Record<string, boolean>;
 }): Promise<{ user: AuthUser; password: string }> {
-  const { status, data } = await callAccountApi('/api/users/create', input);
+  const { status, data } = await callAccountApi('/api/users/create', {
+    ...input,
+    // 口令是密文；不填则不发该字段，由服务端随机生成
+    password: sealOptional(input.password),
+  });
   if (status !== 200 || data?.ret !== 0) throw new Error(errorMessage(data, '创建账号失败'));
-  return data.data;
+  const created = data.data;
+  // 服务端回包同样是密文，展示给管理员前在这里解开
+  return { ...created, password: openSecret(created?.password || '') };
 }
 
 export async function adminUpdateUser(input: {
@@ -281,7 +292,7 @@ export async function adminUpdateUser(input: {
 export async function adminResetPassword(id: string): Promise<string> {
   const { status, data } = await callAccountApi('/api/users/resetPassword', { id });
   if (status !== 200 || data?.ret !== 0) throw new Error(errorMessage(data, '重置密码失败'));
-  return data.data?.password || '';
+  return openSecret(data.data?.password || '');
 }
 
 export async function adminDeleteUser(id: string): Promise<void> {

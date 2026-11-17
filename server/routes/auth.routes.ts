@@ -17,6 +17,7 @@ import {
 } from '../service/auth.service';
 import type { PermissionKey, UserPermissions, UserRole, UserStatus } from '../model/user.entity';
 import type { TokenPayload } from '../service/auth.service';
+import { openSecretInput, sealSecretOutput } from '../utils/transport-crypto';
 
 export interface AccountRouteResult {
   status: number;
@@ -46,6 +47,19 @@ const UNAUTHORIZED = { status: 401, body: { error: 'unauthorized', error_descrip
 
 function ok(data: any): AccountRouteResult {
   return { status: 200, body: { ret: 0, msg: 'success', data } };
+}
+
+/**
+ * 读一个口令字段。
+ * 口令一律走密文（见 utils/transport-crypto）：明文到达时按 400 拒绝，
+ * 错误码 cipher_required 便于前端区分「口令错了」和「报文没加密」。
+ */
+function readSecret(body: any, field: string): string {
+  try {
+    return openSecretInput(body?.[field], field);
+  } catch (e: any) {
+    throw new AuthError(e?.code || 'cipher_invalid', e?.message || `字段 ${field} 必须以密文传输`, 400);
+  }
 }
 
 function fail(status: number, code: string, message: string): AccountRouteResult {
@@ -94,7 +108,8 @@ export async function handleAccountRoutes(
             body: { error: 'unsupported_grant_type', error_description: '仅支持 grant_type=password' },
           };
         }
-        const issued = await login(String(input.username || ''), String(input.password || ''), ctx.ip);
+        // 口令是密文：抓到请求体也只能看到 ao1.xxx.yyy（见 utils/transport-crypto）
+        const issued = await login(String(input.username || ''), readSecret(input, 'password'), ctx.ip);
         return {
           status: 200,
           headers: NO_STORE_HEADERS,
@@ -118,7 +133,7 @@ export async function handleAccountRoutes(
       /* ---------------- 自助 ---------------- */
 
       case '/api/auth/register': {
-        const user = await register(String(input.username || ''), String(input.password || ''), input.displayName);
+        const user = await register(String(input.username || ''), readSecret(input, 'password'), input.displayName);
         return ok({ user, expiresIn: TOKEN_TTL_SECONDS });
       }
 
@@ -139,7 +154,7 @@ export async function handleAccountRoutes(
 
       case '/api/auth/changePassword': {
         const user = requireUser(ctx);
-        await changeOwnPassword(user.userId, String(input.oldPassword || ''), String(input.newPassword || ''));
+        await changeOwnPassword(user.userId, readSecret(input, 'oldPassword'), readSecret(input, 'newPassword'));
         return ok(true);
       }
 
@@ -154,13 +169,15 @@ export async function handleAccountRoutes(
         requireAdmin(ctx);
         const result = await createUserByAdmin({
           username: String(input.username || ''),
-          password: String(input.password || ''),
+          password: readSecret(input, 'password'),
           displayName: input.displayName,
           role: input.role as UserRole | undefined,
           status: input.status as UserStatus | undefined,
           permissions: input.permissions as Partial<UserPermissions> | undefined,
         });
-        return ok(result);
+        // 服务端生成的口令也不许明文回包：管理员看到的是明文输入框里的解密结果，
+        // 中间链路上只有密文
+        return ok({ ...result, password: sealSecretOutput(result.password) });
       }
 
       case '/api/users/update': {
@@ -183,7 +200,7 @@ export async function handleAccountRoutes(
         requireAdmin(ctx);
         const targetId = String(input.id || '');
         if (!targetId) throw new AuthError('invalid_request', '缺少参数: id');
-        return ok({ password: await resetUserPassword(targetId) });
+        return ok({ password: sealSecretOutput(await resetUserPassword(targetId)) });
       }
 
       case '/api/users/delete': {

@@ -100,6 +100,8 @@ JSON 业务路由**只接受 POST**：`app.use('/api/')` 里处理 `POST`，其�
 传输的是二进制负载而不是 JSON，并且各自做权限校验 + 会话归属校验。`/oauth/token` 的响应带
 `Cache-Control: no-store`，避免中间设备缓存并重放令牌。
 
+上面这些端点里的**口令都是密文**，见下面的[传输加密](#传输加密)。
+
 - 令牌形如 `ao_` + 32 随机字节（base64url）。Redis 里只存令牌的**哈希**作为键，值是负载
   （userId、role、status、权限快照）。
 - TTL 是 7200 秒，**滑动续期**：每个已认证请求在剩余不足 1000 秒时把它延长，续期与账号索引更新写在同一个
@@ -155,6 +157,34 @@ JSON 业务路由**只接受 POST**：`app.use('/api/')` 里处理 `POST`，其�
 - `.key` 文件才是秘密本身。要备份它们，并且别混进数据库导出里。
 - 数据目录丢了，等于存下来的凭据全丢（无法再解密）。
 - 一份数据库 dump 加上数据目录，就等于存好的 SSH 凭据全部暴露 —— 这是凭据管理器的常规权衡，两半都要保护。
+
+## 传输加密
+
+口令类字段在应用层再包一层密文，因此**不要求部署在 HTTPS 后面**：
+
+| 字段 | 出现在 |
+|------|--------|
+| `password` | `/oauth/token`、`/api/auth/login`、`/api/auth/register`、`/api/users/create` |
+| `oldPassword` / `newPassword` | `/api/auth/changePassword` |
+| `password` | `/api/system/setServerShellPassword` |
+| `serverShellPassword` | 终端 WebSocket 的 `create` / `reconnect` 消息 |
+| `password`（**响应**里服务端生成的那个） | `/api/users/create`、`/api/users/resetPassword` |
+
+- 算法 AES-256-GCM，密钥 = `SHA-256("aetherOps_ms")`。每次加密都用随机 IV，密文形如
+  `ao1.<base64url(iv)>.<base64url(ciphertext||tag)>`；明文信封里带时间戳，时间差超过 10 分钟的密文直接拒收，
+  所以抓到一个旧包也重放不了。
+- 服务端**拒收明文**：这些字段收到可读明文时返回 `400 cipher_required`，没有留明文后门。用脚本调
+  `/oauth/token` 时要自己加密，`scripts/verify-auth.mjs` 用的就是服务端的同一份实现。
+- 密钥写在前端 bundle 里（`src/utils/transport-crypto.ts`），**能读前端代码的人就能解出密文**。这一层防的
+  是网络侧明文泄露（抓包、代理访问日志、链路中间设备），不是防住能改客户端的人；要抗后者仍然要在前面加
+  TLS / 反向代理，两者不冲突。
+- 换密钥必须前后端同时改（`server/utils/transport-crypto.ts` 与 `src/utils/transport-crypto.ts`），
+  否则会立刻报 `cipher_invalid`。
+- 升级时前后端一起发，并让用户强制刷新一次（Ctrl+F5）：还停留在旧页面的浏览器会继续发明文，
+  登录时拿到的是 `400 cipher_required` 而不是登录成功。
+- 目前**还没覆盖**：SSH 连接凭据（`password` / `privateKey` / `passphrase`）与 AI API Key 仍以明文过网
+  （它们在库里本来就是 `enc:v1:` 密文，缺的是链路这一段）；终端字节流同理。要补齐的话，用同一个原语接在
+  `src/service/connection.ts` 与 `src/service/ai.ts` 的入参与回包上即可。
 
 ## 改动规则
 

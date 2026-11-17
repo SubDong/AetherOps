@@ -72,6 +72,8 @@
     "@electron/rebuild": "^4.2.1",
     "@fefeding/eventemitter": "^1.0.5",
     "@fefeding/vite-nunjucks-plugin": "^1.0.2",
+    "@noble/ciphers": "^2.4.0",
+    "@noble/hashes": "^2.4.0",
     "@popperjs/core": "^2.11.8",
     "@types/bootstrap": "^5.2.11",
     "@types/jsdom": "^21.1.7",

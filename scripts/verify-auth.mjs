@@ -17,6 +17,12 @@ const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || '';
 
 const results = [];
+/**
+ * 口令字段一律以密文上行（服务端拒收明文），直接用服务端的同一实现。
+ * 这里是 Node 侧，不依赖浏览器环境。
+ */
+const { sealString } = require(path.join(root, 'dist/server/utils/transport-crypto.js'));
+const seal = (plain) => sealString(plain);
 function check(name, ok, detail = '') {
   results.push({ name, ok, detail });
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  |  ' + detail : ''}`);
@@ -36,19 +42,19 @@ const PASS = 'Passw0rd!23';
 
 async function main() {
   // 1. 管理员登录
-  const adminLogin = await post('/oauth/token', { grant_type: 'password', username: ADMIN_USER, password: ADMIN_PASS });
+  const adminLogin = await post('/oauth/token', { grant_type: 'password', username: ADMIN_USER, password: seal(ADMIN_PASS) });
   const tokA = adminLogin.json?.access_token;
   check('管理员登录签发 Bearer 令牌', adminLogin.status === 200 && !!tokA, `status=${adminLogin.status}`);
   check('令牌有效期 7200s', adminLogin.json?.expires_in === 7200, `expires_in=${adminLogin.json?.expires_in}`);
   if (!tokA) throw new Error('管理员登录失败，后续无法验证');
 
   // 2. 自助注册 -> pending
-  const reg = await post('/api/auth/register', { username: U1, password: PASS, displayName: '验证账号' });
+  const reg = await post('/api/auth/register', { username: U1, password: seal(PASS), displayName: '验证账号' });
   const u1 = reg.json?.data?.user;
   check('自助注册成功且状态 pending', reg.status === 200 && u1?.status === 'pending', `status=${reg.status} user.status=${u1?.status}`);
 
   // 3. pending 账号可以登录，但业务接口一律 403
-  const pendingLogin = await post('/oauth/token', { grant_type: 'password', username: U1, password: PASS });
+  const pendingLogin = await post('/oauth/token', { grant_type: 'password', username: U1, password: seal(PASS) });
   const tokPending = pendingLogin.json?.access_token;
   const pendingCall = await post('/api/connection/getConnections', {}, tokPending);
   check('待授权账号登录后调用业务接口被 403 拦截', pendingCall.status === 403, `status=${pendingCall.status}`);
@@ -65,7 +71,7 @@ async function main() {
   const oldTokenAfterUpdate = await post('/api/auth/me', {}, tokPending);
   check('改权限后旧令牌立即失效', oldTokenAfterUpdate.status === 401, `status=${oldTokenAfterUpdate.status}`);
 
-  const u1Login = await post('/oauth/token', { grant_type: 'password', username: U1, password: PASS });
+  const u1Login = await post('/oauth/token', { grant_type: 'password', username: U1, password: seal(PASS) });
   const tokU = u1Login.json?.access_token;
   check('授权后登录成功', u1Login.status === 200 && !!tokU, `status=${u1Login.status}`);
 
@@ -92,7 +98,7 @@ async function main() {
     `status=${adminPeek.status} body=${String(JSON.stringify(adminPeek.json)).slice(0, 60)}`);
 
   // 7. 单点登录：再次登录踢掉上一个令牌
-  const u1Login2 = await post('/oauth/token', { grant_type: 'password', username: U1, password: PASS });
+  const u1Login2 = await post('/oauth/token', { grant_type: 'password', username: U1, password: seal(PASS) });
   const tokU2 = u1Login2.json?.access_token;
   const kicked = await post('/api/connection/getConnections', {}, tokU);
   check('同账号二次登录后旧令牌失效（单点登录）', kicked.status === 401, `status=${kicked.status}`);
@@ -139,12 +145,17 @@ async function main() {
 
   const ownedAfter = await query('SELECT COUNT(*) AS c FROM connections WHERE owner_id = ?', [u1.id]);
   check('删号后其连接数据一并清除', Number(ownedAfter[0]?.c || 0) === 0, `left=${ownedAfter[0]?.c}`);
-  const ghost = await post('/oauth/token', { grant_type: 'password', username: U1, password: PASS });
+  const ghost = await post('/oauth/token', { grant_type: 'password', username: U1, password: seal(PASS) });
   check('已删账号无法登录', ghost.status === 401, `status=${ghost.status}`);
 
   // 13. 错误口令统一 invalid_grant（不泄露账号是否存在）
-  const badPass = await post('/oauth/token', { grant_type: 'password', username: U1, password: 'wrong-pass' });
+  const badPass = await post('/oauth/token', { grant_type: 'password', username: U1, password: seal('wrong-pass') });
   check('密码错误返回 401 invalid_grant', badPass.status === 401 && badPass.json?.error === 'invalid_grant', `error=${badPass.json?.error}`);
+
+  // 13b. 明文口令一律拒收：链路上不允许出现可读的口令
+  const plainPass = await post('/oauth/token', { grant_type: 'password', username: U1, password: 'wrong-pass' });
+  check('明文口令被拒（cipher_required）', plainPass.status === 400 && plainPass.json?.error === 'cipher_required',
+    `status=${plainPass.status} error=${plainPass.json?.error}`);
 
   // 14. 终端 WebSocket 门禁：没令牌直接关连接，有令牌才放行
   const WS = require('ws');

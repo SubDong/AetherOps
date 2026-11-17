@@ -14,6 +14,7 @@ import {
   setServerShellPassword,
 } from './service/server-shell.service';
 import { closeTerminalSockets, countTerminalSockets } from './utils/socket-registry';
+import { openSecretInput } from './utils/transport-crypto';
 import { initAccounts } from './routes/auth.routes';
 
 // 初始化服务实例
@@ -209,7 +210,14 @@ export async function handleRoutes(pathname: string, body: any, ctx: AuthContext
 
     if (pathname === '/api/system/setServerShellPassword') {
       assertAdmin(ctx);
-      await setServerShellPassword(typeof body?.password === 'string' ? body.password : '');
+      // 口令必须是密文：这个终端开在服务端主机上，链路上被抓到明文等于主机交给对方
+      let password = '';
+      try {
+        password = openSecretInput(body?.password, 'password');
+      } catch (e: any) {
+        throw new ApiError(e?.message || '口令必须以密文传输', 400);
+      }
+      await setServerShellPassword(password);
       console.log(`[Admin] ${ctx.username} 已更新默认服务器 Shell 口令`);
       return true;
     }
