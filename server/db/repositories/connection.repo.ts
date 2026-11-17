@@ -17,7 +17,7 @@ const COLUMNS = [
   'password_enc', 'private_key_enc', 'passphrase_enc',
   'shell', 'startup_script', 'forward_agent',
   'term_cols', 'term_rows', 'term_font_size', 'term_font_family', 'term_theme', 'term_cursor_style',
-  'options', 'enabled', 'created_at', 'updated_at',
+  'options', 'enabled', 'sampling', 'created_at', 'updated_at',
 ];
 
 const SELECT_SQL = `SELECT ${COLUMNS.map((c) => '`' + c + '`').join(', ')} FROM connections`;
@@ -57,6 +57,8 @@ function toEntity(row: any): ConnectionEntity {
     },
     options,
     enabled: !!row.enabled,
+    // 只有 'skip' 有意义，其它值（含旧数据里的空串）一律当作「跟随全局」
+    sampling: row.sampling === 'skip' ? 'skip' : undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -89,6 +91,7 @@ function toRow(c: ConnectionEntity, isInsert: boolean): any[] {
     cursor,
     JSON.stringify(c.options || {}),
     c.enabled === false ? 0 : 1,
+    c.sampling === 'skip' ? 'skip' : '',
     isInsert ? (c.createdAt || now) : now,
     now,
   ];
@@ -102,6 +105,16 @@ export async function listConnections(ownerId: string): Promise<ConnectionEntity
 export async function getConnectionById(ownerId: string, id: string): Promise<ConnectionEntity | null> {
   const row = await queryOne<any>(`${SELECT_SQL} WHERE owner_id = ? AND id = ?`, [ownerId, id]);
   return row ? toEntity(row) : null;
+}
+
+/**
+ * 跨账号列出全部连接，供定时采集这类后台任务使用。
+ * 先带出 owner_id：定时器没有「当前登录人」，归属只能来自数据行本身。
+ * 密文字段原样返回，解密仍由 ConnectionService 负责。
+ */
+export async function listConnectionsForSampling(): Promise<Array<{ ownerId: string; connection: ConnectionEntity }>> {
+  const rows = await query<any>(`SELECT owner_id, ${COLUMNS.map((c) => '`' + c + '`').join(', ')} FROM connections ORDER BY owner_id ASC, id ASC`);
+  return rows.map((row) => ({ ownerId: row.owner_id, connection: toEntity(row) }));
 }
 
 export async function insertConnection(ownerId: string, c: ConnectionEntity): Promise<void> {

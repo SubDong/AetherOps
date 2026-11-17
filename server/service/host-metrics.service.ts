@@ -1,6 +1,10 @@
 import { SSHService } from './ssh.service';
+import type { OneShotChannel } from './ssh.service';
+import type { ConnectionService } from './connection.service';
 import { SystemStatusService } from './system-status.service';
 import type { ServerStatusSnapshot } from './system-status.service';
+import { loadConfig } from '../utils/config';
+import type { ConnectionEntity } from '../model/connection.entity';
 import {
   listMetricHosts,
   listMinuteMetrics,
@@ -20,6 +24,12 @@ import type { MinuteMetricRow } from '../db/repositories/host-metrics.repo';
  * 什么时候采：服务端自己定时采，不挂在面板轮询上。挂在面板上等于
  * 「没人看就没数据」，而留存的全部意义就是事后能回看。同一分钟内同一连接
  * 只采一次（多个终端连同一台机器不会重复计数），写入走增量聚合，天然幂等。
+ *
+ * 两条入口：
+ *  1) 活会话优先：有人开着终端的主机走会话通道，零新增登录；
+ *  2) 无会话兜底：没人连的机器按连接配置另开一次性通道（默认关闭，见
+ *     metrics.offlineSampling）。这条会对目标机产生可见副作用（每分钟多一条
+ *     登录记录），所以默认关，并且可以用连接的 sampling='skip' 单独退出。
  *
  * 保留期：默认 7 天。每分钟每主机一行，一台主机 7 天约 1 万行，可以忽略。
  */
@@ -42,6 +52,24 @@ const MAX_WINDOW_MINUTES = 24 * 60;
 const CPU_HIGH = 80;
 const MEM_HIGH = 90;
 const DISK_HIGH = 85;
+/**
+ * 无会话采集的并发上限。
+ * 比会话路径（4）更保守：每一次都是一次完整的 TCP 握手 + 认证，
+ * 而不是在已建立的连接上开个 channel。
+ */
+const OFFLINE_CONCURRENCY = 2;
+/**
+ * 单轮时间预算。一轮必须在下一轮开始前收尾：
+ * 剩下的主机留给下一轮（它们在候选列表里会被排到前面，不会被饿死）。
+ */
+const OFFLINE_BUDGET_MS = 45 * 1000;
+/** 失败退避阶梯（分钟）：连不上 / 采不到的主机不该每分钟被敲一次 */
+const OFFLINE_BACKOFF_MS = [1, 2, 4, 8, 15].map((minute) => minute * 60 * 1000);
+/**
+ * 认证类失败单独一档：撞上目标机的 fail2ban 会把本服务所在 IP 关掉，
+ * 连带所有人正在用的终端一起断，代价远大于少几个样本。
+ */
+const AUTH_BACKOFF_MS = [30, 30, 60].map((minute) => minute * 60 * 1000);
 
 function percent(used: number, total: number): number | null {
   if (!total || total <= 0) return null;
@@ -58,6 +86,32 @@ function round(value: number | null, digits = 2): number | null {
 /** 分钟桶起点（服务端本地时间，与 DATETIME 列同口径） */
 function bucketOf(ms: number): Date {
   return new Date(Math.floor(ms / COLLECT_INTERVAL_MS) * COLLECT_INTERVAL_MS);
+}
+
+/**
+ * 无会话采样的差值基线键。
+ * 与会话路径共用 SystemStatusService 的差值逻辑，但基线不能互相污染：
+ * 会话那条 key 是 sessionId，这条是 offline:<owner>:<connection>。
+ */
+function offlineKey(ownerId: string, connectionId: string): string {
+  return `offline:${ownerId}:${connectionId}`;
+}
+
+/** 走活会话的采集任务 */
+interface SessionTask {
+  sessionId: string;
+  ownerId: string;
+  connectionId: string;
+  hostname: string;
+}
+
+/** 走一次性通道的采集任务 */
+interface OfflineTask {
+  ownerId: string;
+  connectionId: string;
+  connection: ConnectionEntity;
+  /** `ownerId:connectionId`，与去抖表同键 */
+  key: string;
 }
 
 /** 一列指标的统计口径 */
@@ -128,16 +182,28 @@ export interface MetricHostSummary {
 export class HostMetricsService {
   private ssh: SSHService;
   private status: SystemStatusService;
+  private connections: ConnectionService;
   private collectTimer: ReturnType<typeof setInterval> | null = null;
   private firstTimer: ReturnType<typeof setTimeout> | null = null;
   private purgeTimer: ReturnType<typeof setInterval> | null = null;
   /** `ownerId:connectionId` → 已写入的分钟桶。同一分钟内不重复采集，避免写放大 */
   private writtenBucket = new Map<string, number>();
+  /** 无会话采集：`ownerId:connectionId` → 退避结束前不再尝试的时刻 */
+  private retryAt = new Map<string, number>();
+  /** 无会话采集：连续失败次数（成功即清） */
+  private failures = new Map<string, number>();
+  /** 失败日志节流：一台机器密码填错不能把日志刷满 */
+  private lastFailureLog = new Map<string, number>();
+  /** 本次启动时间：无会话采样的首次相位以它为原点 */
+  private readonly startedAt = Date.now();
+  /** 候选轮转游标：候选数超出一轮预算时，保证尾部主机不会永远轮不到 */
+  private offlineCursor = 0;
   private stopped = true;
 
-  constructor(ssh: SSHService, status: SystemStatusService) {
+  constructor(ssh: SSHService, status: SystemStatusService, connections: ConnectionService) {
     this.ssh = ssh;
     this.status = status;
+    this.connections = connections;
   }
 
   start(): void {
@@ -159,7 +225,10 @@ export class HostMetricsService {
     }, PURGE_INTERVAL_MS);
     this.purgeTimer.unref?.();
 
-    console.log(`[Metrics] 指标留存已启动：每 ${COLLECT_INTERVAL_MS / 1000}s 采集，保留 ${RETENTION_DAYS} 天`);
+    console.log(
+      `[Metrics] 指标留存已启动：每 ${COLLECT_INTERVAL_MS / 1000}s 采集，保留 ${RETENTION_DAYS} 天，`
+      + `无会话采集${loadConfig().metrics.offlineSampling ? '已开启' : '未开启（仅采集有终端的主机）'}`,
+    );
   }
 
   stop(): void {
@@ -180,12 +249,15 @@ export class HostMetricsService {
    *    照 meta 采会每轮都抛一次「会话不存在」，日志里全是噪音。
    *  - 同一连接开了多个终端只采一次：它们看的是同一台主机，
    *    采多次只会让 samples 虚高。
+   *
+   * 会话采完之后才跑无会话路径：两台机器都不想重复采，
+   * 有活会话的主机必须优先走那条零新增登录的路。
    */
   private async collectOnce(): Promise<void> {
     if (this.stopped) return;
     const bucketMs = bucketOf(Date.now()).getTime();
-    const pending: Array<{ sessionId: string; ownerId: string; connectionId: string; hostname: string }> = [];
-    const seen = new Set<string>();
+    const pending: SessionTask[] = [];
+    const live = new Set<string>();
 
     for (const info of this.ssh.getSessions()) {
       const ownerId = this.ssh.getSessionOwner(info.sessionId);
@@ -194,9 +266,11 @@ export class HostMetricsService {
       if (!this.ssh.getSession(info.sessionId)) continue;
 
       const key = `${ownerId}:${info.connectionId}`;
-      if (seen.has(key)) continue;
+      // live 与 pending 分开记：即使这一分钟已经采过，这台主机也算「有人连着」，
+      // 不能再让无会话路径补一次
+      live.add(key);
       if (this.writtenBucket.get(key) === bucketMs) continue;
-      seen.add(key);
+      if (pending.some((task) => `${task.ownerId}:${task.connectionId}` === key)) continue;
       pending.push({ sessionId: info.sessionId, ownerId, connectionId: info.connectionId, hostname: info.name || '' });
     }
 
@@ -204,8 +278,13 @@ export class HostMetricsService {
     for (const [key, ms] of this.writtenBucket) {
       if (ms !== bucketMs) this.writtenBucket.delete(key);
     }
-    if (!pending.length) return;
 
+    if (pending.length) await this.collectSessions(pending, bucketMs);
+    await this.collectOffline(live, bucketMs);
+  }
+
+  /** 活会话路径：并发开 exec 通道，同一个 SSH 连接上不会互相干扰 */
+  private async collectSessions(pending: SessionTask[], bucketMs: number): Promise<void> {
     let index = 0;
     const worker = async () => {
       while (index < pending.length) {
@@ -222,6 +301,135 @@ export class HostMetricsService {
       }
     };
     await Promise.all(Array.from({ length: Math.min(COLLECT_CONCURRENCY, pending.length) }, worker));
+  }
+
+  /**
+   * 无会话采集：给「此刻没人连着的机器」补样本。
+   *
+   * 全程按连接配置拨号，所以默认关闭（metrics.offlineSampling）；
+   * 单台机器不想被采，把连接的 sampling 置为 'skip'。
+   * 有活会话的主机不走这里：那台机器已经被会话路径采过了，
+   * 两条路都采会让同一分钟出现两个样本、登录次数也翻倍。
+   */
+  private async collectOffline(live: Set<string>, bucketMs: number): Promise<void> {
+    if (!loadConfig().metrics.offlineSampling) return;
+
+    let rows: Array<{ ownerId: string; connection: ConnectionEntity }>;
+    try {
+      rows = await this.connections.listForSampling();
+    } catch (error: any) {
+      console.warn(`[Metrics] 读取连接列表失败，本轮跳过无会话采集: ${error?.message || error}`);
+      return;
+    }
+
+    const now = Date.now();
+    const candidates: OfflineTask[] = [];
+    for (const { ownerId, connection } of rows) {
+      if (!ownerId || !connection?.id) continue;
+      // __local__ 是虚拟连接（没有配置行、也没法拨），它的历史只能来自真开着的本地 Shell
+      if (connection.id === '__local__') continue;
+      if (connection.sampling === 'skip') continue;
+
+      const key = `${ownerId}:${connection.id}`;
+      if (live.has(key)) continue;
+      if (this.writtenBucket.get(key) === bucketMs) continue;
+      if ((this.retryAt.get(key) ?? 0) > now) continue;
+      // 刚打开开关的这一分钟内，按连接 ID 哈希把首次登录错开，避免所有主机同一秒齐发；
+      // 一分钟后这条判断自然失效，之后靠「一轮一分钟 + 分钟去抖」限频
+      if (now - this.startedAt < this.phaseMs(key)) continue;
+
+      candidates.push({ ownerId, connectionId: connection.id, connection, key });
+    }
+    if (!candidates.length) return;
+
+    // 轮转起点：上一轮被预算挤掉的主机这一轮排到前面，否则候选多于一轮容量时尾部永远轮不到
+    const start = this.offlineCursor % candidates.length;
+    const ordered = candidates.slice(start).concat(candidates.slice(0, start));
+
+    const roundStart = Date.now();
+    let index = 0;
+    let processed = 0;
+    const worker = async () => {
+      while (index < ordered.length) {
+        if (Date.now() - roundStart > OFFLINE_BUDGET_MS) {
+          // 预算用完就收手：下一轮从这里接着来，不把整轮拖成两分钟
+          return;
+        }
+        const task = ordered[index++];
+        processed += 1;
+        await this.collectOfflineOne(task, bucketMs);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(OFFLINE_CONCURRENCY, ordered.length) }, worker));
+    this.offlineCursor = (start + processed) % candidates.length;
+  }
+
+  /**
+   * 首次采集的相位（0 ~ 59.999s）：同一个连接每次都落在同一相位上（哈希只依赖键）。
+   * 它解决的是「刚打开开关那一秒所有主机同时登录」，不是长期限频——
+   * 长期靠的是「一轮一分钟 + writtenBucket 分钟去抖」。
+   */
+  private phaseMs(key: string): number {
+    let hash = 2166136261;
+    for (let i = 0; i < key.length; i += 1) {
+      hash ^= key.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0) % COLLECT_INTERVAL_MS;
+  }
+
+  /** 采一台无活会话的主机：握手一次，探测家族 + 取指标共用这条连接 */
+  private async collectOfflineOne(task: OfflineTask, bucketMs: number): Promise<void> {
+    const { ownerId, connectionId, connection, key } = task;
+    let channel: OneShotChannel | null = null;
+    try {
+      let snapshot: ServerStatusSnapshot;
+      if (connection.type === 'local') {
+        // 本地连接没有远端可拨：直接读 Node 的 os / statfs，也不经过「默认服务器 Shell」口令门禁
+        snapshot = await this.status.collectLocalHost(offlineKey(ownerId, connectionId));
+      } else {
+        channel = await this.ssh.openOneShot(connection);
+        const family = await this.ssh.detectFamilyVia(channel, connection);
+        const pipe = channel;
+        snapshot = await this.status.probeRemote(
+          offlineKey(ownerId, connectionId),
+          family,
+          (command, timeoutMs) => pipe.exec(command, timeoutMs),
+        );
+      }
+      await this.record(ownerId, connectionId, snapshot);
+      this.writtenBucket.set(key, bucketMs);
+      this.failures.delete(key);
+      this.retryAt.delete(key);
+    } catch (error: any) {
+      this.noteOfflineFailure(key, connection, error);
+    } finally {
+      channel?.close();
+    }
+  }
+
+  /**
+   * 无会话采集失败后的退避。
+   * 连续失败不该每分钟再敲一次；认证类失败单独放宽到半小时——
+   * 被目标机的 fail2ban 关掉 IP，连带的是所有人正在用的终端。
+   */
+  private noteOfflineFailure(key: string, connection: ConnectionEntity, error: any): void {
+    const message = String(error?.message || error);
+    const authFailure = /authentication|permission denied|no supported authentication/i.test(message);
+    const failures = (this.failures.get(key) || 0) + 1;
+    this.failures.set(key, failures);
+    const ladder = authFailure ? AUTH_BACKOFF_MS : OFFLINE_BACKOFF_MS;
+    const wait = ladder[Math.min(failures, ladder.length) - 1];
+    this.retryAt.set(key, Date.now() + wait);
+
+    const lastLog = this.lastFailureLog.get(key) || 0;
+    if (Date.now() - lastLog > 10 * 60 * 1000) {
+      this.lastFailureLog.set(key, Date.now());
+      console.warn(
+        `[Metrics] 无会话采集失败 ${connection.host || connection.id}（第 ${failures} 次，`
+        + `${Math.round(wait / 60000)} 分钟内不再重试）: ${message}`,
+      );
+    }
   }
 
   /**
@@ -468,8 +676,9 @@ export class HostMetricsService {
     if (!report.buckets) {
       const lines = [
         `No metrics recorded for connection "${report.connectionId}" in the last ${report.windowMinutes} min.`,
-        'The collector samples every 60s, and only for connections that currently have an open terminal session.',
-        'If this host was just connected (or has been idle without a terminal), wait about a minute or open a terminal and retry.',
+        'The collector samples every 60s, and covers connections that have an open terminal session.',
+        'Hosts nobody is connected to are only sampled when metrics.offlineSampling is enabled in the server config.',
+        'If this host was just connected (or sits idle without a terminal), wait about a minute or open a terminal and retry.',
       ];
       if (options.hosts?.length) {
         lines.push('', 'Hosts that do have recent data:');

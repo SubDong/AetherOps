@@ -65,6 +65,13 @@ export class ConnectionEntity {
   /** 是否启用 */
   enabled: boolean = true;
 
+  /**
+   * 无会话采集标记。
+   * 'skip' = 定时采集器不要主动拨号这台机器（手动开终端不受影响）；
+   * 不填 = 跟随全局 metrics.offlineSampling。
+   */
+  sampling?: 'skip';
+
   /** 创建时间 */
   createdAt: Date = new Date();
 

@@ -5,6 +5,7 @@ import { COST_CONTROL_SQL } from './0004-cost-control';
 import { BATCH_PERMISSION_SQL } from './0005-batch-permission';
 import { SYSTEM_CONFIG_SQL } from './0006-system-config';
 import { HOST_METRICS_SQL } from './0007-host-metrics';
+import { CONNECTION_SAMPLING_SQL } from './0008-connection-sampling';
 
 /**
  * 迁移清单。
@@ -34,6 +35,7 @@ export const MIGRATIONS: Migration[] = [
   { version: '0005', name: 'batch-permission', sql: BATCH_PERMISSION_SQL },
   { version: '0006', name: 'system-config', sql: SYSTEM_CONFIG_SQL },
   { version: '0007', name: 'host-metrics', sql: HOST_METRICS_SQL },
+  { version: '0008', name: 'connection-sampling', sql: CONNECTION_SAMPLING_SQL },
 ];
 
 /** 供 CLI 导出 .sql 文本 */

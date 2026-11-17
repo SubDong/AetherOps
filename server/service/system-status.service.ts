@@ -95,6 +95,14 @@ interface PrevSample {
   snapshot: ServerStatusSnapshot;
 }
 
+/**
+ * 差值基线的可信期。
+ * 超过这个时长的「上一次采样」不能再用：差值会横跨整段空窗，
+ * 算出来的是「这段时间的平均占用」而不是此刻，而且会写进指标留存。
+ * 面板长时间隐藏后再打开、无会话采样因退避或活会话而缺轮，都会遇到陈基线。
+ */
+const BASELINE_TTL_MS = 5 * 60 * 1000;
+
 /** 单块网卡的累计收发字节 */
 interface NetSample {
   iface: string;
@@ -554,16 +562,33 @@ export class SystemStatusService {
   /** 远端：先定系统家族，再按家族下发脚本，最后统一归一化 */
   private async collectRemote(sessionId: string): Promise<ServerStatusSnapshot> {
     const family = await this.ssh.detectOsFamily(sessionId);
+    return this.probeRemote(sessionId, family, (command, timeoutMs) => this.ssh.execReadonly(sessionId, command, timeoutMs));
+  }
+
+  /**
+   * 用给定的执行器采远端主机。
+   *
+   * 拆出来是为了让「有会话」与「无会话」两条路走同一段解析与差值：
+   * 会话路径传 execReadonly，无会话路径传一次性通道的 exec。
+   * 差别只在「怎么问」，不在「怎么算」—— 两处各写一遍就会立刻出现两套口径。
+   *
+   * @param key 差值基线键。会话路径用 sessionId；无会话路径用 offline:<owner>:<connection>
+   */
+  async probeRemote(
+    key: string,
+    family: OsFamily,
+    run: (command: string, timeoutMs: number) => Promise<string>,
+  ): Promise<ServerStatusSnapshot> {
     if (family === 'unknown') {
       throw new Error('无法识别远端系统类型：既不是类 Unix（uname 无输出），也不认得 Windows 探测结果');
     }
 
     // Windows 要起 PowerShell，光进程启动就一两秒；其它家族一条 shell 内建命令足够快
     const timeoutMs = family === 'windows' ? 20000 : 8000;
-    let sections = readSections(await this.ssh.execReadonly(sessionId, scriptFor(family), timeoutMs));
+    let sections = readSections(await run(scriptFor(family), timeoutMs));
     if (!Object.keys(sections).length && family === 'windows') {
       // 只装了 pwsh 的机器没有 powershell.exe，换一次再试
-      sections = readSections(await this.ssh.execReadonly(sessionId, scriptForWindowsWith(true), timeoutMs));
+      sections = readSections(await run(scriptForWindowsWith(true), timeoutMs));
     }
 
     const parsed = normalize(family, sections);
@@ -573,7 +598,28 @@ export class SystemStatusService {
         + `${looksLikeShellEcho(Object.values(sections).join('\n')) ? '远端 shell 可能不支持脚本里的命令' : '该账号可能无权读取系统信息'}`,
       );
     }
-    return this.assemble(sessionId, family, parsed);
+    return this.assemble(key, family, parsed);
+  }
+
+  /**
+   * 无会话路径：本地连接没有远端可拨，直接读 Node 的 os / statfs。
+   * 不需要会话，也不经过「默认服务器 Shell」的口令门禁 —— 它只是读本机数据。
+   */
+  collectLocalHost(key: string): Promise<ServerStatusSnapshot> {
+    return this.collectLocal(key);
+  }
+
+  /**
+   * 上一次采样。超过可信期的基线直接丢掉当不存在（见 BASELINE_TTL_MS）。
+   */
+  private prevSample(key: string, now: number): PrevSample | undefined {
+    const prev = this.samples.get(key);
+    if (!prev) return undefined;
+    if (now - prev.at > BASELINE_TTL_MS) {
+      this.samples.delete(key);
+      return undefined;
+    }
+    return prev;
   }
 
   /** 一个字段都没有就当采集失败：否则面板会显示一片 0，比报错更容易骗人 */
@@ -585,9 +631,9 @@ export class SystemStatusService {
   }
 
   /** 归一化结果 → 面板快照：差值在这里算，本机与远端共用同一段逻辑 */
-  private assemble(sessionId: string, family: OsFamily, parsed: NormalizedStatus): ServerStatusSnapshot {
+  private assemble(key: string, family: OsFamily, parsed: NormalizedStatus): ServerStatusSnapshot {
     const now = Date.now();
-    const prev = this.samples.get(sessionId);
+    const prev = this.prevSample(key, now);
 
     // 瞬时口径（Windows / macOS）一次采样就够；累计口径必须与上一采样点配对
     const cpuPrimed = parsed.cpuInstant !== undefined
@@ -640,7 +686,7 @@ export class SystemStatusService {
       netSupported: !!parsed.net || !!parsed.netInstant,
     };
 
-    this.samples.set(sessionId, {
+    this.samples.set(key, {
       at: now,
       cpuTotal: parsed.cpuStat?.total || 0,
       cpuIdle: parsed.cpuStat?.idle || 0,
@@ -652,9 +698,9 @@ export class SystemStatusService {
   }
 
   /** 本机会话：Node 直接取本机指标，网络 / Swap 走各平台自己的口径 */
-  private async collectLocal(sessionId: string): Promise<ServerStatusSnapshot> {
+  private async collectLocal(key: string): Promise<ServerStatusSnapshot> {
     const now = Date.now();
-    const prev = this.samples.get(sessionId);
+    const prev = this.prevSample(key, now);
 
     const [netList, swap] = await Promise.all([readLocalNet(), readLocalSwap()]);
     const net = summarizeNet(netList || []);
@@ -731,7 +777,7 @@ export class SystemStatusService {
       netSupported: !!net,
     };
 
-    this.samples.set(sessionId, {
+    this.samples.set(key, {
       at: now,
       cpuTotal,
       cpuIdle,

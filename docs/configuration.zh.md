@@ -97,6 +97,27 @@ AetherOps 只有一份配置文件、一套环境变量命名空间，以及数�
 |----|--------|------|
 | `sshDebug` | `false` | 把 ssh2 协议层的 debug 输出转发到前端的终端里 |
 
+### `metrics`
+
+| 键 | 默认值 | 含义 |
+|----|--------|------|
+| `offlineSampling` | `false` | 对**没有**打开终端的机器，也按它保存的连接配置主动拨号采样 |
+
+这个开关改了什么：每分钟一次的采集器原本只遍历活着的会话，从不自己发起连接，所以一台没人连着的机器
+在那段时间里没有历史。设 `offlineSampling: true` 后，无人连接的机器会用一个按连接配置建起来的一次性
+SSH 通道去采 —— 每台每分钟一次握手，最多 2 台并行，单轮总预算 45 秒，出错后指数退避（1→2→4→8→15 分钟；
+认证失败时 30 分钟起）。已经有终端的机器仍然走那条终端，所以这个开关只会为「本来会被跳过」的机器增加登录。
+
+打开之前请先确认副作用：这是一次真实的 SSH 登录，目标机的 `sshd` 会在认证日志里看到它。
+要排除某一台机器，把那个连接的 `sampling` 设成 `skip`（见[表结构与迁移](#表结构与迁移)）；
+它不影响手动打开终端，也不影响状态面板。
+
+采集器仍然跟着连接的 `host` 走，所以对跳板机连接（带 `startupScript` 继续往里跳的那种），记下来的历史描述的是
+AetherOps 实际连上的那台机器 —— 也就是跳板机本身，和状态面板完全一致。跳转这一步不会被重现。
+
+开启之前会遇到的四个问题 —— 为什么默认关、跳板机连接采哪台、采不到的主机为什么不会每分钟重试、
+怎么把单个连接排除出去 —— 在 [offline-sampling-faq.zh.md](./offline-sampling-faq.zh.md) 里有完整回答。
+
 ## 环境变量
 
 | 变量 | 映射到 | 说明 |
@@ -113,6 +134,7 @@ AetherOps 只有一份配置文件、一套环境变量命名空间，以及数�
 | `AETHEROPS_MAX_UPLOAD_MB` | `auth.maxUploadMb` | |
 | `AETHEROPS_LAUNCH_TOKEN` | `auth.launchToken` | 由桌面/VSCode 宿主设置 |
 | `AETHEROPS_SSH_DEBUG` | `debug.sshDebug` | `1` 或 `true` |
+| `AETHEROPS_METRICS_OFFLINE_SAMPLING` | `metrics.offlineSampling` | `1` 或 `true`；对没有打开终端的机器也采样 |
 | `AETHEROPS_NODE` | — | 用来拉起后端的 Node 可执行文件（VSCode 宿主） |
 | `AETHEROPS_BUNDLED` | — | 构建期由 `scripts/prepare-vscode-runtime.mjs` 写入，不要手工设置 |
 | `AETHEROPS_VSCODE_PRUNE_PREBUILDS` | — | 设为 `1` 时把 node-pty 的 prebuilds 裁到当前平台 |
@@ -151,6 +173,9 @@ AI 服务商的设置（Base URL、Key、模型）**不能**通过环境变量�
 | `0003-multi-ai` | `ai_config.cost_tier` / `sort_order`；新增 `ai_chats`（按连接划分的会话，各有自己的 `chatId` 与模型绑定） |
 | `0004-cost-control` | `cost_tier_source`、`price_in` / `price_out`；新增 `ai_usage`（逐次调用的 token 数，外加调用当时固化的成本快照）与 `ai_budget` |
 | `0005-batch-permission` | `users.can_use_batch`，初始值取自 `can_use_terminal`，保证没人丢掉本来就有权限 |
+| `0006-system-config` | 新增 `sys_config`（键值对，不分归属）—— 目前只放服务端本机 Shell 的口令哈希 |
+| `0007-host-metrics` | 新增 `host_metrics_minute`：每个归属 / 连接 / 分钟一行，记 CPU %、内存 %、磁盘 % 与 load 1/5/15 的均值、峰值与样本数 |
+| `0008-connection-sampling` | `connections.sampling`（`''` = 跟随 `metrics.offlineSampling`，`skip` = 无人值守时永不拨号这个连接） |
 
 如果你打算加迁移，这些表结构约束值得先知道：
 
@@ -188,6 +213,7 @@ node scripts/migrate.mjs --force     # 忽略 checksum 不一致 / 已应用的�
 | 审计事件（命令、传输、被拦截/被改写） | MySQL `audit_events` | 否 |
 | 技能 | MySQL `skills`（用户技能）+ `<app>/data/skills/*.md`（内置技能） | 否 |
 | 命令片段 | MySQL `snippets` | 否 |
+| 主机指标历史（每分钟的 CPU / 内存 / 磁盘 / load） | MySQL `host_metrics_minute`（按归属隔离） | 否 |
 | 账号（scrypt 哈希、角色、状态、10 个权限位） | MySQL `users` | 只存口令哈希，不可逆 |
 | 登录令牌 | Redis（`aetherops:token:*`，哈希存储，滑动 TTL） | 不适用 |
 | 解密密钥 | 数据目录下的 `*.key` 文件 | 这些**就是**秘密本身 |

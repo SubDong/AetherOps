@@ -7,6 +7,7 @@ import { getDataPath } from '../utils/data-dir';
 import { loadConfig } from '../utils/config';
 import {
   listConnections,
+  listConnectionsForSampling,
   getConnectionById as getConnectionRow,
   insertConnection,
   replaceConnection,
@@ -56,6 +57,18 @@ export class ConnectionService {
   }
 
   /**
+   * 跨账号列出全部连接（已解密），只给定时采集用。
+   *
+   * 与 getAllConnections 的区别在于归属：定时器没有「当前登录人」，
+   * 每条都要带上自己的 ownerId，否则写库时不知道该记到谁名下。
+   * 解密在这里做而不是在仓储层：密钥由本服务持有。
+   */
+  async listForSampling(): Promise<Array<{ ownerId: string; connection: ConnectionEntity }>> {
+    const rows = await listConnectionsForSampling();
+    return rows.map((row) => ({ ownerId: row.ownerId, connection: this.decryptConnection(row.connection) }));
+  }
+
+  /**
    * 添加 SSH 连接配置
    */
   async addConnection(ownerId: string, connection: ConnectionEntity): Promise<ConnectionEntity> {
@@ -101,6 +114,14 @@ export class ConnectionService {
     // 不需要先解密再加密（避免密钥不可用时把密文写坏）
     const merged: ConnectionEntity = { ...existing, ...updates, id, updatedAt: new Date() } as ConnectionEntity;
     if (!merged.terminal) merged.terminal = existing.terminal;
+    // sampling 同理：连接表单不认识这个字段，回传时不会带它。
+    // 只有显式传 'skip' 才算设置，显式传 null / '' 才是清除，
+    // 否则「保存一次表单就把 skip 标记弄丢」这种事故查都不知道从哪查。
+    if ((updates as any).sampling === null || (updates as any).sampling === '') {
+      merged.sampling = undefined;
+    } else if (merged.sampling !== 'skip') {
+      merged.sampling = existing.sampling;
+    }
     await replaceConnection(ownerId, this.encryptConnection(merged));
     return this.decryptConnection(merged);
   }

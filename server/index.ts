@@ -25,9 +25,10 @@ const skillService = new SkillService();
 const auditService = new AuditService();
 const monitorService = new MonitorService(connectionService);
 const batchService = new BatchService(sshService, connectionService);
-// 顺序有依赖：采集器复用面板的状态采集（同一套口径），AI 又要拿采集器查历史
+// 顺序有依赖：采集器复用面板的状态采集（同一套口径）与连接配置（无会话采样要自己拨号），
+// AI 又要拿采集器查历史
 const systemStatusService = new SystemStatusService(sshService);
-const hostMetricsService = new HostMetricsService(sshService, systemStatusService);
+const hostMetricsService = new HostMetricsService(sshService, systemStatusService, connectionService);
 const aiService = new AIService(sshService, skillService, auditService, hostMetricsService);
 const snippetService = new SnippetService();
 

@@ -82,12 +82,29 @@ export interface DebugConfig {
   sshDebug: boolean;
 }
 
+/**
+ * 主机指标留存的行为开关。
+ * 只放「会对外部产生可见副作用」的项：周期、保留期这类属于实现细节，
+ * 写死在 host-metrics.service 里，免得配置项变成第二套默认值。
+ */
+export interface MetricsConfig {
+  /**
+   * 没有终端会话时是否也定时采集。
+   *
+   * 默认 false：打开后采集器会按连接配置**主动拨号**，目标机的 sshd 认证日志里
+   * 每分钟会多出一条登录记录。这个副作用不该由升级本身决定，所以默认关、
+   * 由部署者显式开启；单独某台机器不想被采，把该连接的 sampling 置为 'skip'。
+   */
+  offlineSampling: boolean;
+}
+
 export interface AppConfig {
   server: ServerConfig;
   database: DatabaseConfig;
   redis: RedisConfig;
   auth: AuthConfig;
   debug: DebugConfig;
+  metrics: MetricsConfig;
 }
 
 /**
@@ -133,6 +150,10 @@ const DEFAULTS: AppConfig = {
   },
   debug: {
     sshDebug: false,
+  },
+  metrics: {
+    // 默认关：见 MetricsConfig.offlineSampling 的注释
+    offlineSampling: false,
   },
 };
 
@@ -241,6 +262,7 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
     ['auth.launchToken', str(env.AETHEROPS_LAUNCH_TOKEN)],
     ['auth.maxUploadMb', num(env.AETHEROPS_MAX_UPLOAD_MB)],
     ['debug.sshDebug', bool(env.AETHEROPS_SSH_DEBUG)],
+    ['metrics.offlineSampling', bool(env.AETHEROPS_METRICS_OFFLINE_SAMPLING)],
     ['database.host', str(env.AETHEROPS_DB_HOST)],
     ['database.port', num(env.AETHEROPS_DB_PORT)],
     ['database.user', str(env.AETHEROPS_DB_USER)],
@@ -403,6 +425,7 @@ export function loadConfig(force = false): AppConfig {
     redis: mergeSection(DEFAULTS.redis, fromFile.redis),
     auth: mergeSection(DEFAULTS.auth, dropDeprecated('auth', fromFile.auth)),
     debug: mergeSection(DEFAULTS.debug, fromFile.debug),
+    metrics: mergeSection(DEFAULTS.metrics, fromFile.metrics),
   };
 
   cached = applyEnvOverrides(merged);

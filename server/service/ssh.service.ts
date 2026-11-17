@@ -86,6 +86,16 @@ const CWD_TRACK_GRACE = 5000;
 const CWD_REFRESH_MIN_INTERVAL = 15000;
 
 /**
+ * 无会话（一次性）通道的握手超时。
+ * connect 配置里的 30s 是给「有人正盯着的终端」用的；后台采集每分钟一轮，
+ * 不能有一台机器连不上就卡住 30 秒，否则同一轮里其它主机全被耽误。
+ */
+const ONESHOT_HANDSHAKE_TIMEOUT_MS = 12000;
+
+/** 连接 → 系统家族的缓存有效期：操作系统不会在两次采集之间变，换目标地址靠缓存键自行失效 */
+const CONNECTION_FAMILY_TTL_MS = 24 * 60 * 60 * 1000;
+
+/**
  * 远端进程探测脚本（通过独立 exec 通道执行，不会向交互式终端写入任何内容）。
  *
  * 输出格式（每行一条，可能 0~2 行）：
@@ -310,6 +320,17 @@ function stripPromptLines(raw: string): string {
 }
 
 /**
+ * 无会话的一次性通道：连一次、跑几条命令、然后断开。
+ * 只给后台采集这类「不需要人看输出」的场景用，不是终端会话的替代品。
+ */
+export interface OneShotChannel {
+  /** 在该通道上跑一条命令（独立 exec 通道，不碰任何交互式终端） */
+  exec: (command: string, timeoutMs?: number) => Promise<string>;
+  /** 断开连接。必须调用，否则 sshd 侧的登录会话会一直挂着 */
+  close: () => void;
+}
+
+/**
  * 终端会话管理服务
  * 支持 SSH 远程连接和默认服务器 Shell
  */
@@ -322,6 +343,8 @@ export class SSHService {
   private pendingMOTDCaptures: Map<string, Promise<string>> = new Map();
   /** 会话 → 识别出的系统家族：探一次就记住，Windows 探测要起 PowerShell，不能每轮都探 */
   private osFamilies = new Map<string, OsFamily>();
+  /** 连接（含目标地址）→ 识别出的系统家族：无会话通道没有 sessionId 可用 */
+  private connectionFamilies = new Map<string, { family: OsFamily; at: number }>();
   /** 进行中的家族探测：面板与 AI 同时发问时只探一次 */
   private osFamilyProbes = new Map<string, Promise<OsFamily>>();
   /** 是否曾在本实例创建过 session（用于区分主进程/渲染进程实例，仅主进程实例执行定时清理） */
@@ -1382,12 +1405,18 @@ export class SSHService {
    * 不会向交互式终端写入任何内容，因此不会打断 rz/vim 等前台进程。
    */
   private execRemote(sessionId: string, command: string, timeoutMs = 5000): Promise<string> {
+    const session = this.sessions.get(sessionId);
+    if (!session?.client) return Promise.resolve('');
+    return this.execOnClient(session.client, command, timeoutMs);
+  }
+
+  /**
+   * 在给定 SSH 客户端上跑一条只读命令（独立 exec 通道）。
+   * 会话路径（execRemote）与无会话路径（openOneShot）共用这一段：
+   * 通道必须显式关闭，否则 OpenSSH 默认 MaxSessions=10 会被慢慢吃满。
+   */
+  private execOnClient(client: Client, command: string, timeoutMs = 8000): Promise<string> {
     return new Promise((resolve) => {
-      const session = this.sessions.get(sessionId);
-      if (!session?.client) {
-        resolve('');
-        return;
-      }
       let stdout = '';
       let settled = false;
       let streamRef: ClientChannel | null = null;
@@ -1395,16 +1424,14 @@ export class SSHService {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
-        // 必须显式关闭 channel：OpenSSH 默认 MaxSessions=10，
-        // 泄漏的 channel 累积后会导致后续 SFTP channel 打开失败（上传时好时坏）。
         try { streamRef?.end(); } catch { /* ignore */ }
         resolve(stdout);
       };
       const timer = setTimeout(finish, timeoutMs);
       try {
-        session.client.exec(command, (err: Error | undefined, stream: ClientChannel) => {
+        client.exec(command, (err: Error | undefined, stream: ClientChannel) => {
           if (err) {
-            console.log('[SSH] execRemote error:', err.message);
+            console.log('[SSH] exec error:', err.message);
             finish();
             return;
           }
@@ -1418,6 +1445,75 @@ export class SSHService {
         finish();
       }
     });
+  }
+
+  /**
+   * 打开一条「无会话」通道：按连接配置连一次，可跑多条命令，用完必须 close()。
+   *
+   * 为什么不走 createSession：那条路要建 PTY、写会话元数据、还要过「默认服务器 Shell」的
+   * 口令门禁，这些对后台采集都是多余的副作用；这里只要一条能 exec 的连接。
+   *
+   * 不执行 startupScript：它是往交互式 shell 里写跳转命令，一次性通道跑它只会把
+   * 「跳转过程」执行在一个没有 PTY 的会话里，然后落在跳板机上。所以本通道采到的永远是
+   * connection.host 那台机器 —— 与状态面板的 execReadonly 同一台，不会出现两套口径。
+   *
+   * 一轮采集里「探测系统家族 + 取指标」要跑 2~3 条命令，共用一次握手
+   * 才能把每分钟的登录次数压到 1 次。
+   */
+  openOneShot(connection: ConnectionEntity): Promise<OneShotChannel> {
+    return new Promise((resolve, reject) => {
+      const sshConfig = this.connectionService.getSSHConfig(connection);
+      // 握手超时必须比执行超时短得多：连不上就赶紧放弃，别让一轮采集卡在这里
+      sshConfig.readyTimeout = ONESHOT_HANDSHAKE_TIMEOUT_MS;
+      const client = new Client();
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        try { client.end(); } catch { /* ignore */ }
+        reject(new Error(`SSH 握手超时（${ONESHOT_HANDSHAKE_TIMEOUT_MS / 1000}s）`));
+      }, ONESHOT_HANDSHAKE_TIMEOUT_MS + 3000);
+
+      client.on('ready', () => {
+        if (settled) {
+          try { client.end(); } catch { /* ignore */ }
+          return;
+        }
+        settled = true;
+        clearTimeout(timer);
+        resolve({
+          exec: (command, timeoutMs = 8000) => this.execOnClient(client, command, timeoutMs),
+          close: () => { try { client.end(); } catch { /* ignore */ } },
+        });
+      }).on('error', (err: Error) => {
+        // ready 之后的 error（连接中断）不在这里抛：调用方靠 exec 的空输出和超时判失败
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      }).connect(sshConfig);
+    });
+  }
+
+  /**
+   * 一次性通道上的系统家族识别。
+   * 结果按「连接 + 目标地址」缓存：探测 Windows 要起一次 PowerShell，
+   * 每分钟重探一遍纯属浪费——操作系统不会在两次采集之间变。
+   * 缓存键带 host/port，改过目标地址的连接会重新探测。
+   */
+  async detectFamilyVia(channel: OneShotChannel, connection: ConnectionEntity): Promise<OsFamily> {
+    const key = `${connection.id}@${connection.host}:${connection.port || 22}`;
+    const cached = this.connectionFamilies.get(key);
+    if (cached && Date.now() - cached.at < CONNECTION_FAMILY_TTL_MS) return cached.family;
+
+    const posix = readSections(await channel.exec(PROBE_SCRIPT, 8000));
+    const uname = (posix.UNAME || '').trim();
+    const family = uname
+      ? detectFamily(posix)
+      : detectFamily(posix, await channel.exec(WINDOWS_PROBE_SCRIPT, 8000));
+    // unknown 不落缓存：这次探不到（网络抖动、账号权限不足）不代表下次也不行
+    if (family !== 'unknown') this.connectionFamilies.set(key, { family, at: Date.now() });
+    return family;
   }
 
   /**

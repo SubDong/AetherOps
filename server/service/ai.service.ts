@@ -1046,7 +1046,8 @@ export class AIService {
         const hosts = await this.hostMetrics.listHosts(ownerId, windowMinutes);
         if (!hosts.length) {
           return `No metrics recorded for any host in the last ${windowMinutes} min. `
-            + 'The collector runs every 60s and only covers connections that have an open terminal session.';
+            + 'The collector runs every 60s and covers connections that have an open terminal session; '
+            + 'hosts nobody is connected to are sampled only when metrics.offlineSampling is enabled.';
         }
         const lines = [`Hosts with recorded metrics in the last ${windowMinutes} min (${hosts.length}):`];
         for (const host of hosts) {

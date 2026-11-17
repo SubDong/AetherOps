@@ -102,6 +102,33 @@ ignored by the loader, and so is any other unrecognized key — with a warning, 
 |-----|---------|---------|
 | `sshDebug` | `false` | Forward ssh2 protocol-level debug output into the front-end terminal |
 
+### `metrics`
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `offlineSampling` | `false` | Also sample hosts that have **no** open terminal, by dialing them from their saved connection |
+
+What the switch changes: the per-minute metrics collector normally walks the list of live sessions and
+never opens a connection by itself, so an idle host has no history for that period. With
+`offlineSampling: true` a host nobody is connected to is sampled through a one-shot SSH channel built
+from its connection config — one handshake per host per minute, up to 2 hosts in parallel, 45 s of
+total round budget, with exponential backoff (1→2→4→8→15 min; 30 min and up when authentication
+fails) after errors. Hosts that do have a live terminal keep using it, so the switch adds logins only
+for the hosts that would otherwise be skipped.
+
+Be aware of the side effect before turning it on: this is a real SSH login every minute, so the
+target's `sshd` will show it in its auth log. To exclude a single host, set that connection's
+`sampling` to `skip` (see [Database schema](#database-schema-and-migrations)); it does not affect
+opening a terminal to that host or the status panel.
+
+The collector still follows the connection's `host`, so for a jump-host connection (one with a
+`startupScript` that hops onward) the recorded history describes the machine AetherOps actually
+connects to — the jump host itself, exactly like the status panel. The hop is not reproduced.
+
+The questions that come up before enabling it — why it is off by default, which machine a jump-host
+connection samples, why a failing host is not retried every minute, and how to exclude a single
+connection — are answered at length in [offline-sampling-faq.md](./offline-sampling-faq.md).
+
 ## Environment variables
 
 | Variable | Maps to | Notes |
@@ -118,6 +145,7 @@ ignored by the loader, and so is any other unrecognized key — with a warning, 
 | `AETHEROPS_MAX_UPLOAD_MB` | `auth.maxUploadMb` | |
 | `AETHEROPS_LAUNCH_TOKEN` | `auth.launchToken` | Set by desktop/VSCode hosts |
 | `AETHEROPS_SSH_DEBUG` | `debug.sshDebug` | `1` or `true` |
+| `AETHEROPS_METRICS_OFFLINE_SAMPLING` | `metrics.offlineSampling` | `1` or `true`; samples hosts without an open terminal |
 | `AETHEROPS_NODE` | — | Node binary used to launch the backend (VSCode host) |
 | `AETHEROPS_BUNDLED` | — | Set at build time by `scripts/prepare-vscode-runtime.mjs`; do not set by hand |
 | `AETHEROPS_VSCODE_PRUNE_PREBUILDS` | — | `1` trims node-pty prebuilds to the current platform |
@@ -157,6 +185,9 @@ statement text with whitespace normalized.
 | `0003-multi-ai` | `ai_config.cost_tier` / `sort_order`; new `ai_chats` (per-connection conversations with their own `chatId` + model binding) |
 | `0004-cost-control` | `cost_tier_source`, `price_in` / `price_out`; new `ai_usage` (per-call tokens, plus the cost snapshot fixed at call time) and `ai_budget` |
 | `0005-batch-permission` | `users.can_use_batch`, seeded from `can_use_terminal` so nobody loses access they already had |
+| `0006-system-config` | New `sys_config` (key/value, owner-agnostic) — currently the hashed password for the server-host shell |
+| `0007-host-metrics` | New `host_metrics_minute`: one row per owner / connection / minute with avg, peak and sample count for CPU %, memory %, disk % and load 1/5/15 |
+| `0008-connection-sampling` | `connections.sampling` (`''` = follow `metrics.offlineSampling`, `skip` = never dial this connection unattended) |
 
 Schema constraints worth knowing if you intend to add a migration:
 
@@ -197,6 +228,7 @@ node scripts/migrate.mjs --force     # ignore checksum mismatch / already-applie
 | Audit events (commands, transfers, blocked/rewritten) | MySQL `audit_events` | no |
 | Skills | MySQL `skills` (user) + files in `<app>/data/skills/*.md` (built-in) | no |
 | Command snippets | MySQL `snippets` | no |
+| Host metrics history (per-minute CPU / memory / disk / load) | MySQL `host_metrics_minute` (owner-scoped) | no |
 | Accounts (scrypt hash, role, status, 10 permission bits) | MySQL `users` | password hash only, irreversible |
 | Login tokens | Redis (`aetherops:token:*`, hashed, sliding TTL) | n/a |
 | Decryption keys | data dir `*.key` files | these **are** the secrets |

@@ -25,9 +25,29 @@ supported build, and record the commit you run.
   **Boundary:** the collector walks the list of live sessions and never opens a connection by itself,
   so a host nobody is connected to has no history for that period, and a three-minute session leaves
   three minutes of history; an empty window says so explicitly instead of returning zeros. Sampling
-  idle hosts would need a connection-driven scheduler, which is not part of this change. See
-  [README.md](README.md#host-metrics-history--query_metrics) and
+  idle hosts through a connection-driven scheduler is a separate, opt-in switch — see the next entry.
+  See [README.md](README.md#host-metrics-history--query_metrics) and
   [README.zh.md](README.zh.md#主机指标留存与-query_metrics).
+- **Optional unattended sampling (`metrics.offlineSampling`) with a per-connection `sampling: 'skip'`
+  opt-out.** Off by default. When enabled, the collector also samples hosts that have **no** open
+  terminal, by building a one-shot SSH channel from the saved connection: one handshake per host per
+  minute, 2 in parallel, 45 s of round budget, a rotating cursor so a candidate list longer than one
+  round's capacity is not starved, and a per-connection hash that staggers each host's first sample
+  across the minute so enabling the switch does not fire every host at once. Failures back off
+  exponentially (1→2→4→8→15 min, and 30 min upward when authentication itself fails, which is what
+  `fail2ban` notices), with the log line throttled to once per 10 minutes. Hosts that do have a live
+  session keep using it, so the switch adds logins only where there would otherwise be no data. Every
+  dial is a real SSH login the target's `sshd` auth log will show — hence off by default, hence
+  migration `0008` adding `connections.sampling` (`''` = follow the global switch, `skip` = never dial
+  this connection unattended; it affects neither opening a terminal nor the status panel). The
+  connection's `startupScript` is not replayed, so a jump-host connection is sampled on the machine it
+  actually logs into — the bastion, matching the status panel. A stored baseline older than 5 minutes
+  is discarded rather than diffed against, so a sample that resumes after a gap is not averaged across
+  the whole of it. Documented under `metrics` in
+  [docs/configuration.md](docs/configuration.md#metrics) / [docs/configuration.zh.md](docs/configuration.zh.md#metrics),
+  with the four questions that come up before enabling it — default-off rationale, jump-host target,
+  failure backoff, per-connection `skip` — in [docs/offline-sampling-faq.md](docs/offline-sampling-faq.md) /
+  [docs/offline-sampling-faq.zh.md](docs/offline-sampling-faq.zh.md).
 - **Open-source community files**: [LICENSE](LICENSE) (MIT, with the upstream attribution kept in
   `packages/vscode/LICENSE`), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), this
   changelog, and issue / pull request templates under `.github/`.

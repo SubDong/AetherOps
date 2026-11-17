@@ -106,12 +106,16 @@ backend, plus **multi-account access control** so a team can share one deploymen
   first-half average*, deliberately not first-vs-last point, so one noisy sample cannot fake a slope.
   Windows run from 1 minute to 24 hours; anything over 120 points is merged into coarser rows so a
   full-day query does not flood the context.
-- **Boundary: no terminal, no sample.** The collector walks the list of live sessions and never dials
-  a host on its own. So a host nobody is connected to has no history for that period, and a host you
-  were connected to for three minutes has exactly three minutes of history. This is stated rather
-  than papered over: an empty window returns *"no metrics recorded for connection ... in the last N
-  min"* plus the list of hosts that do have data, so the agent says "I have no data for that window"
-  instead of inventing a trend.
+- **Boundary: no terminal, no sample — unless you opt in.** By default the collector walks the list
+  of live sessions and never dials a host on its own. So a host nobody is connected to has no history
+  for that period, and a host you were connected to for three minutes has exactly three minutes of
+  history. Setting `metrics.offlineSampling: true` lifts that for hosts with *no* session: they are
+  dialed once a minute through a one-shot channel built from their saved connection (2 in parallel,
+  45 s per round, exponential backoff on failure), and any connection can opt out with
+  `sampling: 'skip'`. It is off by default because every one of those is a real SSH login the
+  target's auth log will show. Gaps are stated rather than papered over: an empty window returns
+  *"no metrics recorded for connection ... in the last N min"* plus the list of hosts that do have
+  data, so the agent says "I have no data for that window" instead of inventing a trend.
 - **Missing is not zero.** Anything the platform cannot report (load average on Windows, CPU busy % on
   some BSDs) stays `NULL` and prints as `-`. So does the first CPU sample of a session: utilization
   comes from diffing two samples, and the first one has nothing to diff against — storing it as `0 %`
@@ -466,10 +470,12 @@ Honest status, so nobody files the same issue twice:
   probe output.
 - **CPU utilization on BSD-family systems** may be unavailable; the panel degrades instead of
   guessing.
-- **Host metrics are only sampled while a terminal is open.** The collector reaches a host through a
-  live session and never starts a connection by itself, so an idle or never-connected machine has
-  gaps — or nothing — in `host_metrics_minute`. Sampling on a fixed schedule would need a
-  connection-driven scheduler, which does not exist yet.
+- **Host metrics come from a live terminal by default.** The collector reaches a host through an
+  open session and does not start a connection of its own, so an idle or never-connected machine has
+  gaps — or nothing — in `host_metrics_minute`. `metrics.offlineSampling: true` (off by default)
+  adds a scheduled sampler that dials session-less connections once a minute; a single connection
+  can be excluded with `sampling: 'skip'`. Even then a jump-host connection is sampled on the machine
+  it actually logs into — the bastion — because the startup script's hop is not reproduced.
 - **Jump-host sessions**: the AI environment context describes the *target* machine, but the status
   panel and file manager use the direct SSH channel, so on a bastion-only connection they describe
   the bastion. Use a real `-J`/ProxyJump style connection when you need end-to-end tooling.
@@ -502,6 +508,7 @@ change the other in the same pull request (see [CONTRIBUTING.md](./CONTRIBUTING.
 | [jump-host.md](./docs/jump-host.md) | [jump-host.zh.md](./docs/jump-host.zh.md) | Startup scripts, agent forwarding, multi-hop chains |
 | [skills-guide.md](./docs/skills-guide.md) | [skills-guide.zh.md](./docs/skills-guide.zh.md) | Writing agent skills, front matter, built-in catalog |
 | [troubleshooting.md](./docs/troubleshooting.md) | [troubleshooting.zh.md](./docs/troubleshooting.zh.md) | Startup failures, WS proxy issues, pin-check errors |
+| [offline-sampling-faq.md](./docs/offline-sampling-faq.md) | [offline-sampling-faq.zh.md](./docs/offline-sampling-faq.zh.md) | Why `metrics.offlineSampling` is off by default, which machine a jump-host connection samples, failure backoff, `sampling: 'skip'` |
 | [packages/vscode/README.md](./packages/vscode/README.md) | — | Extension-specific settings and packaging |
 
 ## Contributing
