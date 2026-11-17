@@ -25,6 +25,7 @@ import type { AutoRouteDecision, AutoRouteInput, ModelHealthStat } from './ai-au
 import { analyzeProfiles, estimateCostUsd } from './ai-cost-analyzer';
 import type { CostAnalysisResult, CostTierInput } from './ai-cost-analyzer';
 import { prefetchCatalog, lookupPrice } from './ai-pricing';
+import type { HostMetricsService } from './host-metrics.service';
 import {
   insertUsageRow, sumUsage, groupUsageByModel, groupUsageByChat,
   loadModelHealth, deleteUsageByChat, startOfToday,
@@ -206,6 +207,20 @@ function terminalSessionOf(ctx: ToolContext): string {
   return (ctx.custom?.[TERMINAL_SESSION_KEY] as string) || '';
 }
 
+/** agentRun 每轮通过 context.custom 带进来的「这一轮是哪个账号在跑」的 key */
+const OWNER_ID_KEY = 'ownerId';
+
+/**
+ * 从工具上下文里取归属账号。
+ *
+ * 指标类工具必须按账号隔离：ctx.sessionId 是 chatId，拿它分不清是谁的数据，
+ * 而 host_metrics_minute 的主键第一列就是 owner_id。
+ * 不要从 args 里取 —— 那是模型可控的输入，等于让它自己选查谁的机器。
+ */
+function ownerIdOf(ctx: ToolContext): string {
+  return (ctx.custom?.[OWNER_ID_KEY] as string) || '';
+}
+
 /** 这一轮压根没绑终端：让模型如实说「先打开终端」，而不是猜一个「断开」 */
 const NO_TERMINAL_MSG = 'NO_TERMINAL: this chat is not bound to any terminal session, so no command can run. '
   + 'Ask the user to open a terminal (an SSH connection or the Default Server Shell) and retry. '
@@ -226,9 +241,10 @@ const AGENT_SYSTEM_PROMPT = `You are a powerful AI terminal Agent that can direc
 Your capabilities:
 1. Execute commands directly in the terminal via the execute_command tool
 2. Read the terminal's current output via the read_terminal tool
-3. Understand command execution results and make decisions accordingly
-4. Automatically complete multi-step tasks
-5. Generate script files to execute complex or multi-step operations
+3. Query the recorded per-minute history of CPU / memory / disk / load via the query_metrics tool
+4. Understand command execution results and make decisions accordingly
+5. Automatically complete multi-step tasks
+6. Generate script files to execute complex or multi-step operations
 
 Working principles:
 1. **Take action**: When the user asks you to do something, use tools to execute directly, don't just suggest commands
@@ -236,6 +252,7 @@ Working principles:
 3. **Safety first**: rm commands automatically move files to a recycle bin (~/.aetherops/.trash/) instead of permanent deletion; extremely destructive operations will be blocked. For other dangerous operations (format, overwrite disk, etc.), explain the risk in content first and let the user confirm before executing
 4. **Step-by-step**: Complete complex tasks step by step, checking results after each step
 5. **Error handling**: If a command fails, analyze the cause and try to fix it or use an alternative
+6. **Past vs now**: top / df / free only show this instant. For anything about trends, peaks, or "what happened earlier" (e.g. "why was it slow at 3am"), call query_metrics instead of extrapolating from a single snapshot
 
 Script strategy (important):
 Generate a script file instead of executing commands one by one when the task meets any of the following conditions:
@@ -321,13 +338,20 @@ export class AIService {
   private sshService?: ISSHService;
   private skillService?: ISkillService;
   private auditService?: AuditService;
+  private hostMetrics?: HostMetricsService;
   private readonly MAX_MESSAGES = 50;
   private readonly MAX_AGENT_ITERATIONS = 15;
 
-  constructor(sshService?: ISSHService, skillService?: ISkillService, auditService?: AuditService) {
+  constructor(
+    sshService?: ISSHService,
+    skillService?: ISkillService,
+    auditService?: AuditService,
+    hostMetrics?: HostMetricsService,
+  ) {
     this.sshService = sshService;
     this.skillService = skillService;
     this.auditService = auditService;
+    this.hostMetrics = hostMetrics;
 
     // 初始化 agent-core 组件
     this.toolRegistry = new ToolRegistry();
@@ -838,6 +862,47 @@ export class AIService {
       },
       category: 'builtin',
     });
+
+    // query_metrics —— 只读历史，不碰终端。没有绑定终端时也能用（显式给 connection_id），
+    // 这就是它与上面两个工具的根本区别：查过去不需要连上主机。
+    this.toolRegistry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'query_metrics',
+          description: 'Query recorded host metrics aggregated per minute: CPU %, memory %, disk % and load 1/5/15, '
+            + 'with avg / max / min and a trend across the window. Use this for anything about the past '
+            + '(trends, peaks, "why was it slow last night", when a resource started climbing). '
+            + 'It only reads what the collector already stored - it cannot observe the present moment.',
+          parameters: {
+            type: 'object',
+            properties: {
+              scope: {
+                type: 'string',
+                enum: ['current', 'all'],
+                description: 'current = host behind the current terminal (default); all = list which hosts have recorded data',
+              },
+              window_minutes: {
+                type: 'number',
+                description: 'How far back to look, in minutes. Default 30, max 1440 (24h).',
+              },
+              connection_id: {
+                type: 'string',
+                description: 'Optional: query a specific connection instead of the current terminal host',
+              },
+            },
+          },
+        },
+      },
+      executor: async (args: Record<string, unknown>, ctx: ToolContext) => {
+        return this.queryMetrics(
+          ownerIdOf(ctx),
+          terminalSessionOf(ctx),
+          args as { scope?: string; window_minutes?: number; connection_id?: string },
+        );
+      },
+      category: 'builtin',
+    });
   }
 
   // ========== 命令安全检查 ==========
@@ -955,6 +1020,60 @@ export class AIService {
       return output.split('\n').slice(-200).join('\n');
     } catch (error: any) {
       return `Failed to read terminal: ${error.message}`;
+    }
+  }
+
+  /**
+   * query_metrics 的实现。
+   *
+   * 与 executeCommand 不同，这条路不要求有活终端：查历史不需要碰主机。
+   * 但必须有归属账号 —— 指标按 owner_id 存，没账号就等于什么都查不到，
+   * 而不是「查全表」（那会把别人的机器漏给模型）。
+   */
+  private async queryMetrics(
+    ownerId: string,
+    sessionId: string,
+    args: { scope?: string; window_minutes?: number; connection_id?: string },
+  ): Promise<string> {
+    if (!this.hostMetrics) return 'METRICS_UNAVAILABLE: host metrics collection is not enabled in this deployment.';
+    if (!ownerId) return 'METRICS_UNAVAILABLE: this run has no account binding, so no metrics can be queried.';
+
+    const windowMinutes = Math.max(1, Math.min(24 * 60, Math.round(Number(args?.window_minutes) || 30)));
+    const explicit = typeof args?.connection_id === 'string' ? args.connection_id.trim() : '';
+
+    try {
+      if (String(args?.scope || 'current').toLowerCase() === 'all') {
+        const hosts = await this.hostMetrics.listHosts(ownerId, windowMinutes);
+        if (!hosts.length) {
+          return `No metrics recorded for any host in the last ${windowMinutes} min. `
+            + 'The collector runs every 60s and only covers connections that have an open terminal session.';
+        }
+        const lines = [`Hosts with recorded metrics in the last ${windowMinutes} min (${hosts.length}):`];
+        for (const host of hosts) {
+          const at = new Date(host.lastAt).toISOString().slice(0, 16).replace('T', ' ');
+          lines.push(
+            `  - connection_id=${host.connectionId}${host.hostname ? ` (${host.hostname})` : ''}`
+            + ` | last sample ${at} UTC | ${host.samples} samples`,
+          );
+        }
+        lines.push('', 'Call query_metrics again with connection_id=<id above> for the actual series.');
+        return lines.join('\n');
+      }
+
+      const report = await this.hostMetrics.query(ownerId, {
+        connectionId: explicit || undefined,
+        sessionId: sessionId || undefined,
+        windowMinutes,
+      });
+      if (!report) {
+        return 'METRICS_NO_TARGET: no terminal is bound to this chat and no connection_id was given. '
+          + 'Call query_metrics with scope="all" to see which hosts have recorded data, then pass its connection_id.';
+      }
+      // 窗口内没数据时把有数据的主机一并回给模型，省掉一次「猜 connection_id」的往返
+      const hosts = report.buckets ? [] : await this.hostMetrics.listHosts(ownerId, 24 * 60);
+      return this.hostMetrics.formatReport(report, { hosts });
+    } catch (error: any) {
+      return `Failed to query metrics: ${error?.message || error}`;
     }
   }
 
@@ -1120,7 +1239,12 @@ export class AIService {
           // ctx.shell.exec/read，不注入则落到 noop shell（捕不到任何输出）。
           // terminalSessionId 必须一起放进 custom：ctx.sessionId 是对话 key，不是终端会话。
           const shellExecutor = this.buildShellExecutor(terminalSessionId);
-          const runCustom = { shell: shellExecutor, [TERMINAL_SESSION_KEY]: terminalSessionId };
+          const runCustom = {
+            shell: shellExecutor,
+            [TERMINAL_SESSION_KEY]: terminalSessionId,
+            // ownerId 一并带进去：query_metrics 要按账号查，工具侧没有别的途径知道「当前登录人」
+            [OWNER_ID_KEY]: ownerId,
+          };
           const eventStream = engine.run({
             sessionId: chatId,
             message: userMessage,

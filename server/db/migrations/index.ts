@@ -4,6 +4,7 @@ import { MULTI_AI_SQL } from './0003-multi-ai';
 import { COST_CONTROL_SQL } from './0004-cost-control';
 import { BATCH_PERMISSION_SQL } from './0005-batch-permission';
 import { SYSTEM_CONFIG_SQL } from './0006-system-config';
+import { HOST_METRICS_SQL } from './0007-host-metrics';
 
 /**
  * 迁移清单。
@@ -32,6 +33,7 @@ export const MIGRATIONS: Migration[] = [
   { version: '0004', name: 'ai-cost-control', sql: COST_CONTROL_SQL },
   { version: '0005', name: 'batch-permission', sql: BATCH_PERMISSION_SQL },
   { version: '0006', name: 'system-config', sql: SYSTEM_CONFIG_SQL },
+  { version: '0007', name: 'host-metrics', sql: HOST_METRICS_SQL },
 ];
 
 /** 供 CLI 导出 .sql 文本 */

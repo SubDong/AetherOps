@@ -7,6 +7,7 @@ import { MonitorService } from './service/monitor.service';
 import { BatchService } from './service/batch.service';
 import { SnippetService } from './service/snippet.service';
 import { SystemStatusService } from './service/system-status.service';
+import { HostMetricsService } from './service/host-metrics.service';
 import { kickUser } from './service/auth.service';
 import {
   clearServerShellPassword,
@@ -24,9 +25,11 @@ const skillService = new SkillService();
 const auditService = new AuditService();
 const monitorService = new MonitorService(connectionService);
 const batchService = new BatchService(sshService, connectionService);
-const aiService = new AIService(sshService, skillService, auditService);
-const snippetService = new SnippetService();
+// 顺序有依赖：采集器复用面板的状态采集（同一套口径），AI 又要拿采集器查历史
 const systemStatusService = new SystemStatusService(sshService);
+const hostMetricsService = new HostMetricsService(sshService, systemStatusService);
+const aiService = new AIService(sshService, skillService, auditService, hostMetricsService);
+const snippetService = new SnippetService();
 
 // 传输审计：SSHService 不认识 AuditService，两个实例在这里接起来。
 // 写成注入而不是让 ssh.service 直接 import 审计实例：后者会把 index.ts 拽进一条
@@ -63,6 +66,9 @@ export async function initServices(): Promise<void> {
   await aiService.init();
   // 账号引导：users 表为空时创建 admin（密码只打启动日志一次）
   await initAccounts();
+  // 指标留存：必须在库就绪之后（写 host_metrics_minute），且放最后——
+  // 首轮采集本身延后 15s，不会和上面这些启动动作抢 SSH 通道
+  hostMetricsService.start();
 }
 
 /**

@@ -64,6 +64,9 @@ backend, plus **multi-account access control** so a team can share one deploymen
 - **Terminal-bound, not invented.** Tools are bound to the terminal session you picked, so a
   command really runs there. If no session is available the agent says so instead of making up
   output.
+- **History, not just a snapshot.** On top of the two terminal tools the agent has `query_metrics`,
+  which reads the recorded per-minute history instead of the current instant — see
+  [Host metrics history](#host-metrics-history--query_metrics) for what it can and cannot answer.
 
 ### Server status & OS self-detection
 
@@ -80,6 +83,39 @@ backend, plus **multi-account access control** so a team can share one deploymen
 - **Honest gaps.** Each metric carries a `supported` flag; anything the platform cannot report
   (e.g. CPU busy% on some BSDs, swap on HarmonyOS) shows as *unavailable* instead of a flattering
   `0`, and the history chart stops drawing rather than plotting a fake flat line.
+- **The panel is not the archive.** A page refresh does not erase what the agent can see; the same
+  collector also writes a per-minute aggregate to MySQL — see
+  [Host metrics history](#host-metrics-history--query_metrics).
+
+### Host metrics history & `query_metrics`
+
+- **Sampled every 60 seconds.** A server-side timer takes one sample per host per minute — 15 s after
+  boot, then every 60 s — and merges it into the minute bucket it falls into in `host_metrics_minute`.
+  It calls the very same `SystemStatusService.collect()` the panel uses, so the table and the panel
+  cannot disagree about what CPU was doing. Up to 4 hosts are sampled in parallel, and a host with
+  several open terminals is sampled **once**, not once per terminal.
+- **One row per host per minute, kept 7 days.** Each row holds the average, the peak and the sample
+  count for CPU %, memory %, disk % and load 1/5/15, plus disk capacity. Rows older than 7 days are
+  deleted every 6 hours; at one row per host per minute the whole window is ~10,000 rows per host,
+  small enough to just leave on.
+- **What the agent can actually ask.** Anything about the past: *"what did CPU and memory look like
+  over the last 6 hours?"*, *"was memory already climbing at 3am, and how many minutes was it above
+  90 %?"*, *"which of my hosts have history at all, and how fast is that disk filling up?"*. Every
+  answer carries the weighted average, the maximum with its timestamp, the minimum, a trend and the
+  number of minutes above 80 % CPU / 90 % memory / 85 % disk. The trend is *second-half average minus
+  first-half average*, deliberately not first-vs-last point, so one noisy sample cannot fake a slope.
+  Windows run from 1 minute to 24 hours; anything over 120 points is merged into coarser rows so a
+  full-day query does not flood the context.
+- **Boundary: no terminal, no sample.** The collector walks the list of live sessions and never dials
+  a host on its own. So a host nobody is connected to has no history for that period, and a host you
+  were connected to for three minutes has exactly three minutes of history. This is stated rather
+  than papered over: an empty window returns *"no metrics recorded for connection ... in the last N
+  min"* plus the list of hosts that do have data, so the agent says "I have no data for that window"
+  instead of inventing a trend.
+- **Missing is not zero.** Anything the platform cannot report (load average on Windows, CPU busy % on
+  some BSDs) stays `NULL` and prints as `-`. So does the first CPU sample of a session: utilization
+  comes from diffing two samples, and the first one has nothing to diff against — storing it as `0 %`
+  would quietly drag that minute's average and minimum down forever.
 
 ### Multi-account access control
 
@@ -430,6 +466,10 @@ Honest status, so nobody files the same issue twice:
   probe output.
 - **CPU utilization on BSD-family systems** may be unavailable; the panel degrades instead of
   guessing.
+- **Host metrics are only sampled while a terminal is open.** The collector reaches a host through a
+  live session and never starts a connection by itself, so an idle or never-connected machine has
+  gaps — or nothing — in `host_metrics_minute`. Sampling on a fixed schedule would need a
+  connection-driven scheduler, which does not exist yet.
 - **Jump-host sessions**: the AI environment context describes the *target* machine, but the status
   panel and file manager use the direct SSH channel, so on a bastion-only connection they describe
   the bastion. Use a real `-J`/ProxyJump style connection when you need end-to-end tooling.

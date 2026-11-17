@@ -12,6 +12,22 @@ supported build, and record the commit you run.
 
 ### Added
 
+- **Per-minute host metrics retention + a `query_metrics` tool.** A server-side timer samples every
+  60 s (first round 15 s after boot), reusing the panel's `SystemStatusService` so both report the same
+  numbers, and merges each sample into a new `host_metrics_minute` table — one row per owner /
+  connection / minute holding the average, peak and sample count for CPU %, memory %, disk % and load
+  1/5/15, plus disk capacity, with a 7-day retention. The agent gets a third built-in tool beside
+  `execute_command` / `read_terminal`: `query_metrics` answers questions about the past — average,
+  maximum with its timestamp, minimum, trend, and how many minutes sat above 80 % CPU / 90 % memory /
+  85 % disk — over a window of 1 minute to 24 hours, which no single `top` snapshot can do. Rows are
+  scoped by `owner_id`, and a metric the platform cannot report is stored as `NULL` rather than `0` —
+  so is the first CPU sample of a session, which has no previous sample to diff against.
+  **Boundary:** the collector walks the list of live sessions and never opens a connection by itself,
+  so a host nobody is connected to has no history for that period, and a three-minute session leaves
+  three minutes of history; an empty window says so explicitly instead of returning zeros. Sampling
+  idle hosts would need a connection-driven scheduler, which is not part of this change. See
+  [README.md](README.md#host-metrics-history--query_metrics) and
+  [README.zh.md](README.zh.md#主机指标留存与-query_metrics).
 - **Open-source community files**: [LICENSE](LICENSE) (MIT, with the upstream attribution kept in
   `packages/vscode/LICENSE`), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), this
   changelog, and issue / pull request templates under `.github/`.

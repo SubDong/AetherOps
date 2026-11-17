@@ -34,6 +34,12 @@ export interface ServerStatusSnapshot {
   cpuCores: number;
   /** CPU 占用率 0-100 */
   cpuPercent: number;
+  /**
+   * 本次占用率是不是「算出来的」：差值口径要有上一采样点才有意义。
+   * 首次采样时 cpuPercent 是 0，但那表示「还不知道」而不是「空闲」——
+   * 面板刷新一次就会修正，留存却会把这个 0 永久记进这一分钟的均值和最小值。
+   */
+  cpuPrimed: boolean;
   /** 1 / 5 / 15 分钟平均负载；Windows 没有这个概念，是空数组 */
   loadAvg: number[];
   uptimeSec: number;
@@ -583,6 +589,10 @@ export class SystemStatusService {
     const now = Date.now();
     const prev = this.samples.get(sessionId);
 
+    // 瞬时口径（Windows / macOS）一次采样就够；累计口径必须与上一采样点配对
+    const cpuPrimed = parsed.cpuInstant !== undefined
+      || (!!parsed.cpuStat && !!prev && parsed.cpuStat.total > prev.cpuTotal);
+
     let cpuPercent = parsed.cpuInstant ?? 0;
     if (parsed.cpuStat && prev && parsed.cpuStat.total > prev.cpuTotal) {
       const dTotal = parsed.cpuStat.total - prev.cpuTotal;
@@ -610,6 +620,7 @@ export class SystemStatusService {
       cpuModel: parsed.cpuModel,
       cpuCores: parsed.cpuCores,
       cpuPercent,
+      cpuPrimed,
       loadAvg: parsed.loadAvg,
       uptimeSec: parsed.uptimeSec,
       memTotal: parsed.memTotal,
@@ -667,7 +678,8 @@ export class SystemStatusService {
       cpuIdle += times.idle;
     }
     let cpuPercent = 0;
-    if (prev && cpuTotal > prev.cpuTotal) {
+    const cpuPrimed = !!prev && cpuTotal > prev.cpuTotal;
+    if (cpuPrimed) {
       const dTotal = cpuTotal - prev.cpuTotal;
       const dIdle = Math.min(cpuIdle - prev.cpuIdle, dTotal);
       cpuPercent = ((dTotal - dIdle) / dTotal) * 100;
@@ -698,6 +710,7 @@ export class SystemStatusService {
       cpuModel: cpus[0]?.model || '',
       cpuCores: cpus.length,
       cpuPercent,
+      cpuPrimed,
       // Windows 上 os.loadavg() 恒为 [0,0,0]：这个平台没有 Unix 的平均负载概念，别当真值显示
       loadAvg: process.platform === 'win32' ? [] : loadAvg,
       uptimeSec: os.uptime(),
