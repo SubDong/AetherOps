@@ -140,6 +140,12 @@ export default {
     keepaliveCountMaxHint: '连续多少次心跳失败后断开连接（默认 3 次）',
     keepaliveEnabled: '启用保活',
     keepaliveEnabledHint: '定期发送心跳包保持 SSH 连接活跃，防止因长时间无操作而断开',
+    samplingTitle: '离线采集',
+    samplingMode: '本连接的采集策略',
+    samplingFollowGlobal: '跟随全局设置',
+    samplingSkip: '跳过（不主动采集这台）',
+    samplingHint: '仅在全局 config.json 打开 metrics.offlineSampling 后才有意义；选「跳过」则这台主机不会被主动拨号采集。跳板机连接采的是本连接登录上的那台机器（通常是跳板机），启动脚本里那一跳不会重现。',
+    samplingSkipBadge: '跳过采集',
   },
   fileTransfer: {
     title: '文件传输',

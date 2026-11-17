@@ -147,19 +147,26 @@ the feature, not the exception), it does not delete rows already stored, and it 
 opening a terminal, testing the connection, or the status panel. It is a statement about unattended
 logins only.
 
-There is no UI for it yet — the connection form does not know the field. Two supported ways to set
-it:
+Three ways to set it, in order of preference: the connection form, the API, then direct SQL.
+
+**1. The connection editor.** Expand *Offline sampling* in the form and pick *Skip (never dial this
+host)*. Connections marked that way carry a `no sampling` tag in the connection list, so the
+exception stays visible instead of hiding in a database column. Choosing *Follow the global
+setting* clears the mark again.
+
+**2. The API** (what the editor itself posts to); only the fields you send are changed:
 
 ```bash
-# 1. same API the UI uses; only the fields you send are changed
 curl -sS -X POST http://127.0.0.1:9802/api/connection/updateConnection \
   -H 'Authorization: Bearer <token>' \
   -H 'Content-Type: application/json' \
   -d '{"id": "<connection id>", "sampling": "skip"}'
 ```
 
+**3. Direct SQL**, when the account cannot use the UI or the API:
+
 ```sql
--- 2. direct SQL; connections are owner-scoped, so keep owner_id in the WHERE
+-- connections are owner-scoped, so keep owner_id in the WHERE
 UPDATE connections SET sampling = 'skip'
  WHERE owner_id = '<owner id>' AND id = '<connection id>';
 
@@ -176,10 +183,12 @@ the audit trail covers commands, AI calls and file transfers.)
 It takes effect on the **next round**, no restart: the candidate list is read from MySQL every
 minute. Setting it is therefore safe on a live server, and un-setting it is just as cheap.
 
-Clearing it: send `"sampling": ""` (or `null`) once. Sending nothing leaves it alone — saving the
-connection form in the UI will not silently drop a `skip` you set through the API or SQL, because
-the form never sends the field. That asymmetry (`''` clears, absent preserves) is deliberate; the
-converse would make the mark disappear the first time someone renamed a connection.
+Clearing it: choose *Follow the global setting* in the form, or send `"sampling": ""` (or `null`)
+once through the API. The form now always submits the field — `skip` or `""` — so saving a
+connection with the drop-down on *Follow the global setting* does clear a mark that came from the
+API or SQL. That is the one case where the form overwrites the column; clients that omit the field
+leave it untouched, which is what stops a `skip` from vanishing when some other tool patches a
+connection.
 
 Two things worth knowing about the surrounding behaviour:
 

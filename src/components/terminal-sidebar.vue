@@ -51,7 +51,15 @@
         >
           <i :class="conn.type === 'local' ? 'bi bi-terminal' : 'bi bi-hdd-network'" style="color: var(--accent);"></i>
           <div class="flex-grow-1 overflow-hidden">
-            <div class="text-truncate" style="font-size: 13px;">{{ conn.name }}</div>
+            <div class="d-flex align-items-center gap-1">
+              <span class="text-truncate" style="font-size: 13px;">{{ conn.name }}</span>
+              <!-- 只给「跳过」挂标签：跟随全局是常态，每行都挂一个反而看不见例外 -->
+              <span
+                v-if="conn.sampling === 'skip'"
+                class="tag-sampling-skip"
+                :title="t('connection.samplingHint')"
+              >{{ t('connection.samplingSkipBadge') }}</span>
+            </div>
             <div class="text-truncate" style="font-size: 11px; color: var(--text-secondary);">
               {{ conn.type === 'local' ? t('app.localShell') : `${conn.username}@${conn.host}:${conn.port}` }}
             </div>
@@ -211,6 +219,18 @@ function showContextMenu(_event: MouseEvent, _conn: ConnectionEntity) {
 }
 .btn-conn-danger:hover {
   color: var(--danger);
+}
+
+/* 跳过采集是例外状态，只在列表上挂一枚小标签，不抢名字的位置 */
+.tag-sampling-skip {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .btn-lang-switch {

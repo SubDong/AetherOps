@@ -140,6 +140,12 @@ export default {
     keepaliveCountMaxHint: 'Disconnect after this many consecutive keepalive failures (default: 3)',
     keepaliveEnabled: 'Enable Keepalive',
     keepaliveEnabledHint: 'Send periodic keepalive packets to maintain SSH connection and prevent timeout',
+    samplingTitle: 'Offline sampling',
+    samplingMode: 'Sampling for this connection',
+    samplingFollowGlobal: 'Follow the global setting',
+    samplingSkip: 'Skip (never dial this host)',
+    samplingHint: 'Only matters once metrics.offlineSampling is enabled in config.json; Skip keeps this host out of unattended sampling. A jump-host connection is sampled on the machine it logs in to (usually the bastion) — the startup-script hop cannot be reproduced.',
+    samplingSkipBadge: 'no sampling',
   },
   fileTransfer: {
     title: 'File Transfer',

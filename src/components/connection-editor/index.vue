@@ -123,6 +123,24 @@
         </div>
       </div>
 
+      <!-- 离线采集：只在全局开关打开后才生效，所以单独一组，不和连接本身的参数混在一起 -->
+      <div class="card mb-3">
+        <div class="card-header" @click="showSamplingConfig = !showSamplingConfig" style="cursor: pointer;">
+          <i class="bi bi-broadcast me-1"></i>{{ t('connection.samplingTitle') }}
+          <i :class="showSamplingConfig ? 'bi bi-chevron-up float-end' : 'bi bi-chevron-down float-end'"></i>
+        </div>
+        <div class="card-body" v-show="showSamplingConfig">
+          <label class="form-label">{{ t('connection.samplingMode') }}</label>
+          <select class="form-select form-select-sm" v-model="samplingMode">
+            <option value="follow">{{ t('connection.samplingFollowGlobal') }}</option>
+            <option value="skip">{{ t('connection.samplingSkip') }}</option>
+          </select>
+          <small class="form-text text-muted d-block mt-1">
+            <i class="bi bi-info-circle me-1"></i>{{ t('connection.samplingHint') }}
+          </small>
+        </div>
+      </div>
+
       <!-- 终端配置 -->
       <div class="card mb-3">
         <div class="card-header" @click="showTerminalConfig = !showTerminalConfig" style="cursor: pointer;">
@@ -184,6 +202,7 @@ import { ref, reactive } from 'vue';
 import { useI18n } from 'vue-i18n';
 import Modal from '@/components/modal/index.vue';
 import { ConnectionService } from '@/service/connection';
+import type { ConnectionEntity } from '@/typings/connection';
 import { toast } from '@/utils/toast';
 
 const { t } = useI18n();
@@ -197,6 +216,10 @@ const editingConnection = ref<string | null>(null);
 const showTerminalConfig = ref(false);
 const showStartupScript = ref(false);
 const showKeepaliveConfig = ref(false);
+const showSamplingConfig = ref(false);
+// 采集策略：'follow' 跟随全局，'skip' 永不主动拨号。
+// 表单只认这两种值，回传时转成后端的 'skip' / ''（'' 为清除，缺字段则保留原值）
+const samplingMode = ref<'follow' | 'skip'>('follow');
 const testing = ref(false);
 const saving = ref(false);
 
@@ -250,6 +273,9 @@ function open(connection?: any) {
     // 保活启用状态：如果 options 中有保活配置，则认为已启用
     keepaliveEnabled.value = connection.options?.keepaliveInterval !== undefined || connection.options?.keepaliveCountMax !== undefined;
     showKeepaliveConfig.value = keepaliveEnabled.value;
+    // 标记了跳过的连接直接展开这一组：用户打开编辑器往往就是想确认/取消它
+    samplingMode.value = connection.sampling === 'skip' ? 'skip' : 'follow';
+    showSamplingConfig.value = samplingMode.value === 'skip';
   } else {
     editingConnection.value = null;
     Object.assign(form, defaultForm());
@@ -258,6 +284,8 @@ function open(connection?: any) {
     keepaliveEnabled.value = true;
     keepaliveInterval.value = 10000;
     keepaliveCountMax.value = 3;
+    samplingMode.value = 'follow';
+    showSamplingConfig.value = false;
   }
   if (!props.embedded) connectionModal.value?.show();
 }
@@ -305,10 +333,16 @@ async function saveConnection() {
         keepaliveCountMax: 0,
       };
     }
+    // 采集策略必须随表单一起回传：后端只认显式 '' 为「清除」、缺字段则保留原值，
+    // 所以这里总是带上 —— 否则用户改成「跟随全局」后保存，skip 标记会一直在
+    const payload: ConnectionEntity = {
+      ...form,
+      sampling: samplingMode.value === 'skip' ? 'skip' : '',
+    };
     if (editingConnection.value) {
-      await connectionService.updateConnection(editingConnection.value, { ...form });
+      await connectionService.updateConnection(editingConnection.value, payload);
     } else {
-      await connectionService.addConnection({ ...form } as any);
+      await connectionService.addConnection(payload as any);
     }
     toast.success(t('connection.saveSuccess'));
     close();

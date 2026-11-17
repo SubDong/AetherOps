@@ -28,6 +28,12 @@ export interface ConnectionEntity {
   };
   options?: Record<string, any>;
   enabled?: boolean;
+  /**
+   * 无会话采集标记：'skip' = 定时采集器不要主动拨号这台机器。
+   * '' 或缺省 = 跟随全局 metrics.offlineSampling。
+   * 写入时只有显式 '' 才会清除，缺字段表示保留原值（见 connection.service.updateConnection）。
+   */
+  sampling?: 'skip' | '';
   createdAt?: Date;
   updatedAt?: Date;
 }

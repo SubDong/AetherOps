@@ -48,6 +48,15 @@ supported build, and record the commit you run.
   with the four questions that come up before enabling it — default-off rationale, jump-host target,
   failure backoff, per-connection `skip` — in [docs/offline-sampling-faq.md](docs/offline-sampling-faq.md) /
   [docs/offline-sampling-faq.zh.md](docs/offline-sampling-faq.zh.md).
+- **A per-connection sampling drop-down in the connection editor.** The connection form now carries
+  its own collapsible *Offline sampling* card — *Follow the global setting* (the default) or *Skip
+  (never dial this host)* — which writes `sampling: 'skip'`, until now reachable only through the
+  API or a direct `UPDATE` even though the README and the FAQ described it as a form setting.
+  Connections marked `skip` carry a `no sampling` badge in the connection list, so the exceptions
+  are visible where the connections are listed instead of having to open each one. The form submits
+  the field on every save, empty string included, because that is the only way a user can undo a
+  `skip` set elsewhere; an absent field still means "keep the current value", so other clients are
+  unaffected. See [docs/offline-sampling-faq.md](docs/offline-sampling-faq.md).
 - **Open-source community files**: [LICENSE](LICENSE) (MIT, with the upstream attribution kept in
   `packages/vscode/LICENSE`), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), this
   changelog, and issue / pull request templates under `.github/`.
