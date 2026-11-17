@@ -64,9 +64,17 @@ backend, plus **multi-account access control** so a team can share one deploymen
 - **Terminal-bound, not invented.** Tools are bound to the terminal session you picked, so a
   command really runs there. If no session is available the agent says so instead of making up
   output.
-- **History, not just a snapshot.** On top of the two terminal tools the agent has `query_metrics`,
-  which reads the recorded per-minute history instead of the current instant — see
-  [Host metrics history](#host-metrics-history--query_metrics) for what it can and cannot answer.
+- **History, not just a snapshot.** On top of the two terminal tools the agent has `query_metrics`
+  for recorded host metrics (per-minute history, not the current instant) and `search_audit` for its
+  own command trail (per host, keyword, status and time window). See
+  [Host metrics history](#host-metrics-history--query_metrics) and
+  [Command audit & replay](#command-audit--replay) for what each can and cannot answer.
+- **Wider reach, open sessions only.** `list_connections` lists the account's saved hosts and
+  which of them currently have a live terminal; `read_file` reads the head of a config or log
+  file on such a host without pulling a 2 GB file into the conversation; `run_on_hosts` runs
+  one command across up to 10 open hosts, 2 at a time with a 45 s budget. None of them dials a
+  new connection, credential files are refused, and each needs its own permission bit
+  (`connections` / `files` / `batch`).
 
 ### Server status & OS self-detection
 
@@ -194,6 +202,11 @@ backend, plus **multi-account access control** so a team can share one deploymen
   category.
 - Timeline view with keyword/status filters, statistics overview, JSON/CSV export, real-time panel
   updates over the same WebSocket, and automatic retention cleanup.
+- **The agent can read its own trail.** `search_audit` queries the same table scoped to the account
+  (per host, keyword, status, tool and a time window of up to 30 days) and returns a compact
+  summary, so *"this exact failure happened before — here is what we ran next"* is answered from
+  data instead of a fresh guess. Coverage stops at what this app ran: commands typed by hand into a
+  terminal are not recorded, and the tool says so when a search comes back empty.
 
 ### Real-time log monitoring + AI anomaly detection
 

@@ -57,3 +57,59 @@ export function safeJoinInside(baseDir: string, ...segments: string[]): string {
   }
   return target;
 }
+
+/**
+ * 读文件（SFTP）时拒掉的路径。
+ *
+ * 与 monitor.service 的 isSensitiveLogPath 刻意不同：那个拦的是「会被拼进 shell 命令的日志路径」，
+ * 所以连整个 /etc 都禁掉；read_file 走 SFTP，不经过 shell，而 /etc/nginx/nginx.conf 这类配置
+ * 恰恰是最常要看的东西。所以这里只拦「本身即凭据」的路径，不按目录一刀切。
+ *
+ * 这些规则只防「模型顺手把私钥读出来贴进对话」，不是权限边界 —— 能开终端的人本来就能 cat。
+ */
+const SENSITIVE_READ_PATTERNS = [
+  '/proc/', '/sys/', '/dev/',
+  '/etc/shadow', '/etc/gshadow', '/etc/sudoers', '/etc/ssl/private/',
+  '/.ssh/', '/.gnupg/', '/.docker/config.json', '/.kube/config',
+  '/.npmrc', '/.pgpass', '/.my.cnf', '/.netrc', '/.git-credentials',
+  'authorized_keys', 'known_hosts',
+  '.pem', '.p12', '.pfx', '.key', '.keystore', '.jks',
+  'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
+];
+
+export function isSensitiveReadPath(value: string): boolean {
+  const normalized = String(value || '').replace(/\\/g, '/').toLowerCase();
+  return SENSITIVE_READ_PATTERNS.some((entry) => normalized.includes(entry));
+}
+
+/**
+ * 校验并归一化一个待读取的远端路径。
+ *
+ * 只接受绝对路径：相对路径会让「读哪个文件」取决于远端 shell 的 cwd，
+ * 同一句话在不同会话里指向不同文件，事后连审计都复现不出来。
+ */
+export function assertReadablePath(value: string): string {
+  const raw = String(value || '').trim();
+  if (!raw) throw new Error('path is required');
+  if (raw.length > 1024) throw new Error('path is too long (max 1024 chars)');
+  if (/[\0\r\n]/.test(raw)) throw new Error('path contains control characters');
+
+  const windowsAbsolute = /^[a-zA-Z]:[\\/]/.test(raw);
+  const uncAbsolute = raw.startsWith('\\\\');
+  if (!windowsAbsolute && !uncAbsolute && !raw.startsWith('/')) {
+    throw new Error('path must be absolute (start with "/" or a drive letter)');
+  }
+  if (!windowsAbsolute && !uncAbsolute && /[*?\[\]{}<>|;&`$()]/.test(raw)) {
+    // SFTP 不经过 shell，这些字符本身不构成注入；拦下来是因为它们只可能来自「用户把 shell 通配符
+    // 或命令片段写进了路径」，放过去只会换来一个看不懂的 stat 失败。
+    throw new Error('path contains shell metacharacters; pass a literal file path');
+  }
+
+  const normalized = windowsAbsolute || uncAbsolute
+    ? raw.replace(/[\\/]+/g, path.sep)
+    : path.posix.normalize(raw);
+  if (isSensitiveReadPath(raw) || isSensitiveReadPath(normalized)) {
+    throw new Error('access to this path is not allowed (credentials / device files)');
+  }
+  return normalized;
+}

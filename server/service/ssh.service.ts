@@ -2571,6 +2571,70 @@ export class SSHService {
   }
 
   /**
+   * 读取文件开头若干字节（AI 的 read_file 走这条路）。
+   *
+   * 为什么不用 downloadFile：那个为了保存完整文件会把整个文件读进内存（上限 200MB），
+   * 而这里只需要「看一眼」，拿一个 2GB 的日志会把进程打爆。先用 stat 拿大小，
+   * 再按 byte range 只读前面一段，超出部分只回报 truncated。
+   */
+  async readFileHead(
+    sessionId: string,
+    remotePath: string,
+    maxBytes = 64 * 1024,
+  ): Promise<{ text: string; bytes: number; size: number; truncated: boolean }> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error('Session not found: ' + sessionId);
+    const limit = Math.max(1, Math.min(maxBytes, 1024 * 1024));
+
+    if (session.type === 'ssh' && session.client) {
+      const sftp = await this.getSftp(sessionId);
+      const stat = await new Promise<any>((resolve, reject) => {
+        sftp.stat(remotePath, (err: Error | undefined, attrs: any) => err ? reject(err) : resolve(attrs));
+      });
+      if (typeof stat?.isDirectory === 'function' && stat.isDirectory()) {
+        throw new Error('Not a regular file (it is a directory)');
+      }
+      const size = Number(stat?.size) || 0;
+      if (size === 0) return { text: '', bytes: 0, size: 0, truncated: false };
+      const buf = await new Promise<Buffer>((resolve, reject) => {
+        const chunks: Buffer[] = [];
+        const stream = sftp.createReadStream(remotePath, { start: 0, end: Math.min(size, limit) - 1 });
+        stream.on('data', (c: Buffer) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+        stream.on('end', () => resolve(Buffer.concat(chunks)));
+        stream.on('error', (e: Error) => reject(e));
+      });
+      return {
+        text: buf.toString('utf8'),
+        bytes: buf.length,
+        size,
+        truncated: size > buf.length,
+      };
+    }
+
+    if (session.type === 'local') {
+      const stat = await fs.promises.stat(remotePath);
+      if (!stat.isFile()) throw new Error('Not a regular file');
+      const size = stat.size;
+      const length = Math.min(size, limit);
+      const handle = await fs.promises.open(remotePath, 'r');
+      try {
+        const buf = Buffer.alloc(length);
+        const { bytesRead } = await handle.read(buf, 0, length, 0);
+        return {
+          text: buf.subarray(0, bytesRead).toString('utf8'),
+          bytes: bytesRead,
+          size,
+          truncated: size > bytesRead,
+        };
+      } finally {
+        await handle.close();
+      }
+    }
+
+    throw new Error('File reading is only supported for SSH / local sessions');
+  }
+
+  /**
    * 获取会话默认目录（SSH: SFTP 起始目录 / 本地: 用户家目录）
    */
   async getDefaultDirectory(sessionId: string): Promise<string> {

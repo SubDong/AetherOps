@@ -591,7 +591,9 @@ wss.on('connection', async (ws, req) => {
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event }));
             }
-          }, { skillId, locale, modelId }).catch((err) => {
+            // permissions 一并下发：list_connections / read_file / run_on_hosts 不是「能对话就能用」，
+            // 工具侧按同一份权限位自己判（不传就等于全拒，所以这里不能省）
+          }, { skillId, locale, modelId, permissions: wsUser.permissions || {} }).catch((err) => {
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event: { type: 'error', error: err.message } }));
             }

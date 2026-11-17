@@ -52,3 +52,6 @@ dist.rootbak/
 # 打包进扩展的后端运行时（由 scripts/prepare-vscode-runtime.mjs 生成，不入库）
 packages/vscode/runtime/
 temp/
+
+# 本地工作文档（路线图 / 执行台账），不随仓库分发
+local_docs/

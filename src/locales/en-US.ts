@@ -266,6 +266,18 @@ export default {
     copyCode: 'Copy code',
     retry: 'Retry',
     sessionTokens: 'Total tokens this session',
+    // ===== Stop and queue =====
+    stopping: 'Stopping...',
+    stopped: 'Stopped (answer incomplete)',
+    queueTitle: '{count} queued · continues automatically when this turn ends',
+    queueSendHint: 'Add to queue (does not interrupt this turn)',
+    queueEdit: 'Edit this queued message',
+    queueRemove: 'Remove this queued message',
+    queueEditing: 'Taken out of the queue. Enter puts it back',
+    queueEditingHint: 'Editing queued message #{index}',
+    queueCancel: 'Cancel',
+    queuedPlaceholder: 'Running: write the next instruction, Enter to queue it',
+    send: 'Send',
     // ===== Cost control =====
     tierAuto: 'auto',
     tierManual: 'manual',

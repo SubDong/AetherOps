@@ -3,7 +3,9 @@ import * as os from 'os';
 import * as crypto from 'crypto';
 import { getDataPath } from '../utils/data-dir';
 import { AuditService } from './audit.service';
+import type { AuditEntry } from './audit.service';
 import { assessDangerousCommand } from '../utils/shell';
+import { assertReadablePath } from '../utils/security';
 import {
   AgentEngine, ToolRegistry, ContextManager, SecurityGuard,
   createLLMProvider,
@@ -99,6 +101,14 @@ export interface AgentRunOptions {
   locale?: string;
   /** 'auto' 或 ai_config.id；不传按 auto 处理 */
   modelId?: string;
+  /**
+   * 调用者的权限位（即 server/index.ts 权限表的键）。
+   *
+   * 「能对话」不等于「能看连接清单 / 读文件 / 一条命令打到 N 台主机」——这几件事的影响面
+   * 都比 chat 本身大，所以由宿主把 wsUser.permissions 原样传进来，工具自己判。
+   * 不传 = 一个都没有（fail closed）：宁可少一个工具，也不默认放行。
+   */
+  permissions?: Record<string, boolean>;
 }
 
 function bySortOrder(a: AIProfile, b: AIProfile): number {
@@ -123,7 +133,9 @@ function countToolMessages(history: Message[]): number {
 /** Agent 事件类型 */
 export type AgentEventType =
   | 'thinking' | 'message' | 'tool_call' | 'tool_result' | 'audit_entry' | 'done' | 'error' | 'system_info'
-  | 'model_selected';
+  | 'model_selected'
+  // 用户主动中止：和 done 一样是「本轮结束」，但内容不完整，前端要单独标出来
+  | 'stopped';
 
 /** Agent 事件（应用层简化格式） */
 export interface AgentEvent {
@@ -184,10 +196,43 @@ interface ISSHService {
   getOutputBuffer(sessionId: string, maxLines?: number): string;
   getSession(sessionId: string): any;
   getSystemContext(sessionId: string): Promise<string>;
+  /** 按账号列会话：list_connections 要拿它标出「哪台有活终端」 */
+  getSessions(ownerId?: string): any[];
+  /** 会话归属：只认严格相等的，元数据里没有 owner 的遗留会话一律不算本账号的 */
+  getSessionOwner(sessionId: string): string | undefined;
+  /** 只读文件头：按 byte range 取，避免把 GB 级日志整个读进内存 */
+  readFileHead(
+    sessionId: string,
+    remotePath: string,
+    maxBytes?: number,
+  ): Promise<{ text: string; bytes: number; size: number; truncated: boolean }>;
 }
 
 interface ISkillService {
   getSkill(ownerId: string, id: string): Promise<{ name: string; content: string } | undefined>;
+}
+
+/** 连接清单：list_connections 只要元信息，所以这里只声明这一个方法 */
+interface IConnectionDirectory {
+  getAllConnections(ownerId: string): Promise<any[]>;
+}
+
+/** BatchService.executeBatch 的返回值里工具真正用到的部分 */
+interface BatchRunTask {
+  results: Array<{
+    sessionId: string;
+    connectionId: string;
+    sessionName: string;
+    success: boolean;
+    output: string;
+    duration: number;
+    error?: string;
+  }>;
+}
+
+/** 批量执行：并发与总预算由工具侧控制，这里只要「一次跑一批并拿回结果」 */
+interface IBatchRunner {
+  executeBatch(ownerId: string, sessionIds: string[], command: string, timeout?: number): Promise<BatchRunTask>;
 }
 
 // ========== 工具与终端会话的绑定 ==========
@@ -234,6 +279,56 @@ function unknownTerminalMsg(sessionId: string): string {
     + 'Ask the user to open or reconnect a terminal, then stop calling tools. Never invent command output.';
 }
 
+/**
+ * 把 MEDIUMTEXT 压成一行再截断。审计的 command / result 原样回给模型，
+ * 三五条就能把上下文吃满，而模型真正需要的只是「那次跑的是什么、出来的什么」。
+ */
+function oneLine(value: string, max: number): string {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  return text.length > max ? `${text.slice(0, max)}...` : text;
+}
+
+// ========== 工具侧的权限判定 ==========
+
+/** agentRun 每轮通过 context.custom 带进来的权限位 key */
+const PERMISSIONS_KEY = 'permissions';
+
+/**
+ * 取本轮调用者的权限位。
+ *
+ * 必须从 custom 取而不是从 args 取：args 是模型生成的，让它自己声明权限等于没有权限。
+ * 取不到就返回空对象，配合 allows() 一起构成 fail closed。
+ */
+function permissionsOf(ctx: ToolContext): Record<string, boolean> {
+  const value = ctx.custom?.[PERMISSIONS_KEY];
+  return value && typeof value === 'object' ? value as Record<string, boolean> : {};
+}
+
+/** 任一权限位为真即可：files 与 terminal 的关系沿用 /api/file/ 的登记口径 */
+function allows(permissions: Record<string, boolean>, ...keys: string[]): boolean {
+  return keys.some((key) => permissions?.[key] === true);
+}
+
+/**
+ * 缺权限的固定文案。
+ *
+ * 必须写死「不要换个参数重试」：模型见到失败模板句的第一反应是换种问法再试一遍，
+ * 而权限位不会因为参数变化而变，重试只会把一次拒绝变成三次。
+ */
+function permissionDeniedMsg(tool: string, needed: string): string {
+  return `PERMISSION_DENIED: this account is not allowed to use ${tool} (needs the "${needed}" permission). `
+    + 'Do NOT retry with different arguments and do not try to emulate it with other tools; '
+    + 'tell the user an administrator has to grant that permission.';
+}
+
+/** 需要活终端的工具在没绑终端时的说明：这些工具不拨号，只能请用户先开终端 */
+function liveSessionRequiredMsg(tool: string): string {
+  return `NO_LIVE_SESSION: ${tool} only works on a host that already has an open terminal session; `
+    + 'it never dials a connection by itself. '
+    + 'Ask the user to open a terminal to that host (or pass a connection_id whose session is open), then retry. '
+    + 'Do NOT report this as the host being down or unreachable.';
+}
+
 // ========== Agent System Prompt ==========
 
 const AGENT_SYSTEM_PROMPT = `You are a powerful AI terminal Agent that can directly operate the user's terminal Shell.
@@ -242,9 +337,13 @@ Your capabilities:
 1. Execute commands directly in the terminal via the execute_command tool
 2. Read the terminal's current output via the read_terminal tool
 3. Query the recorded per-minute history of CPU / memory / disk / load via the query_metrics tool
-4. Understand command execution results and make decisions accordingly
-5. Automatically complete multi-step tasks
-6. Generate script files to execute complex or multi-step operations
+4. Search this account's recorded command history via the search_audit tool
+5. List this account's connections and which of them have an open terminal via the list_connections tool
+6. Read the beginning of a file on a host that already has an open terminal via the read_file tool
+7. Run one command on several already-open hosts at once via the run_on_hosts tool
+8. Understand command execution results and make decisions accordingly
+9. Automatically complete multi-step tasks
+10. Generate script files to execute complex or multi-step operations
 
 Working principles:
 1. **Take action**: When the user asks you to do something, use tools to execute directly, don't just suggest commands
@@ -253,6 +352,10 @@ Working principles:
 4. **Step-by-step**: Complete complex tasks step by step, checking results after each step
 5. **Error handling**: If a command fails, analyze the cause and try to fix it or use an alternative
 6. **Past vs now**: top / df / free only show this instant. For anything about trends, peaks, or "what happened earlier" (e.g. "why was it slow at 3am"), call query_metrics instead of extrapolating from a single snapshot
+7. **Memory**: before guessing at a fix, or telling the user you don't know what changed, check whether this exact failure happened before - search_audit finds earlier failures on the same connection and the commands that followed them
+8. **Reach**: apart from query_metrics and search_audit (which read stored history), every tool works only on hosts that already have an open terminal session - nothing dials a new connection. If the target host has no open terminal, say so and ask the user to open one; never describe it as the host being unreachable
+9. **Wide reach needs intent**: run_on_hosts runs the same command on every targeted host, so use it when the user actually asked for a sweep (inventory, health check, "all web servers"). Changing something on many hosts at once is not a decision you make on your own
+10. **Permission denials are final**: if a tool answers PERMISSION_DENIED, this account was never granted it. Report that to the user; do not retry with other arguments and do not try to reproduce the tool with execute_command
 
 Script strategy (important):
 Generate a script file instead of executing commands one by one when the task meets any of the following conditions:
@@ -339,6 +442,10 @@ export class AIService {
   private skillService?: ISkillService;
   private auditService?: AuditService;
   private hostMetrics?: HostMetricsService;
+  /** 连接清单（list_connections）：只读、已解密，返回前必须按字段白名单重组 */
+  private connections?: IConnectionDirectory;
+  /** 批量执行（run_on_hosts）：并发与总预算由工具侧控制 */
+  private batch?: IBatchRunner;
   private readonly MAX_MESSAGES = 50;
   private readonly MAX_AGENT_ITERATIONS = 15;
 
@@ -347,11 +454,15 @@ export class AIService {
     skillService?: ISkillService,
     auditService?: AuditService,
     hostMetrics?: HostMetricsService,
+    connections?: IConnectionDirectory,
+    batch?: IBatchRunner,
   ) {
     this.sshService = sshService;
     this.skillService = skillService;
     this.auditService = auditService;
     this.hostMetrics = hostMetrics;
+    this.connections = connections;
+    this.batch = batch;
 
     // 初始化 agent-core 组件
     this.toolRegistry = new ToolRegistry();
@@ -903,6 +1014,155 @@ export class AIService {
       },
       category: 'builtin',
     });
+
+    // search_audit —— 同样是只读、不碰终端。审计行只来自两条写入路径：agent 的工具调用
+    // 与文件传输，手敲进终端的命令不在里面。这个边界必须写进 description，
+    // 否则模型会把「查不到」讲成「没发生过」。
+    this.toolRegistry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'search_audit',
+          description: 'Search this account\'s recorded command history (audit log): which command ran, on which '
+            + 'connection, whether it succeeded, and an excerpt of its output. Use it when the user asks "did we hit '
+            + 'this before" or "what was that command last time", and before proposing a fix for a failure that '
+            + 'looks familiar - the earlier attempt and what it produced is in here. Coverage: commands run through '
+            + 'this app (agent tool calls and file transfers). Commands typed by hand into a terminal are NOT '
+            + 'recorded, and nothing on the host itself is searched.',
+          parameters: {
+            type: 'object',
+            properties: {
+              keyword: {
+                type: 'string',
+                description: 'Free text, matched against the user message, the command and its output',
+              },
+              connection_id: {
+                type: 'string',
+                description: 'Only this connection\'s history (connections.id)',
+              },
+              status: {
+                type: 'string',
+                enum: ['success', 'error', 'blocked', 'rewritten'],
+                description: 'Filter by outcome; omit to see every outcome',
+              },
+              tool: {
+                type: 'string',
+                description: 'Only one tool\'s rows, e.g. execute_command',
+              },
+              hours: {
+                type: 'number',
+                description: 'Look-back window in hours. Default 24, max 720 (30 days)',
+              },
+              limit: {
+                type: 'number',
+                description: 'How many entries to return. Default 10, max 50',
+              },
+            },
+          },
+        },
+      },
+      executor: async (args: Record<string, unknown>, ctx: ToolContext) => {
+        return this.searchAudit(ownerIdOf(ctx), args);
+      },
+      category: 'builtin',
+    });
+
+    // list_connections —— 只读清单：不碰终端、不拨号、不返回任何凭据。
+    // getAllConnections 拿到的是已解密实体（带 password / privateKey / passphrase），
+    // 所以返回值必须按字段白名单重组，不能把实体直接 JSON 出去。
+    this.toolRegistry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'list_connections',
+          description: 'List this account\'s saved connections (id, name, type, host, user, enabled) and mark which of '
+            + 'them currently have an open terminal session. Use it to get the connection_id that query_metrics / '
+            + 'read_file / run_on_hosts need. It does not connect to anything and never returns passwords, keys or '
+            + 'passphrases.',
+          parameters: { type: 'object', properties: {} },
+        },
+      },
+      executor: async (_args: Record<string, unknown>, ctx: ToolContext) => {
+        return this.listConnections(ownerIdOf(ctx), permissionsOf(ctx));
+      },
+      category: 'builtin',
+    });
+
+    // read_file —— 只读、只打活会话。刻意不支持「为此拨号」：没有审批门禁之前，
+    // 「模型自己选一个主机连上去读文件」不是可以放开的权限。
+    this.toolRegistry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'read_file',
+          description: 'Read the beginning of a text file on a host that already has an open terminal session '
+            + '(config files, unit files, the head of a log). Returns at most max_bytes and reports the real file '
+            + 'size, so a large file is not pulled into the conversation. Credential files (private keys, '
+            + '/etc/shadow, cloud/registry configs) are refused. It never dials a new connection. For "the last N '
+            + 'lines" or a pattern search use execute_command / run_on_hosts with tail / grep instead.',
+          parameters: {
+            type: 'object',
+            properties: {
+              path: { type: 'string', description: 'Absolute path on the target host' },
+              connection_id: {
+                type: 'string',
+                description: 'Read on this connection instead of the current terminal (it must already have an open session)',
+              },
+              max_bytes: {
+                type: 'number',
+                description: 'How many bytes to read from the start. Default 16384, max 131072',
+              },
+            },
+            required: ['path'],
+          },
+        },
+      },
+      executor: async (args: Record<string, unknown>, ctx: ToolContext) => {
+        return this.readFile(ownerIdOf(ctx), terminalSessionOf(ctx), permissionsOf(ctx), args);
+      },
+      category: 'builtin',
+    });
+
+    // run_on_hosts —— 一条命令打多台。并发与总预算都在工具侧控，因为
+    // BatchService.executeBatch 是 sessionIds.map 全并发（UI 批量在用，改它会影响面板）。
+    this.toolRegistry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'run_on_hosts',
+          description: 'Run ONE command on several hosts at once and return each host\'s result. Targets must '
+            + 'already have an open terminal session (nothing is dialed): pass up to 10 connection_ids, or '
+            + 'scope="all_open" to sweep every open host. At most 2 hosts run at a time with a 45s total budget; '
+            + 'hosts not reached are reported, not retried. Use it for read-only sweeps (disk usage, service status, '
+            + 'config diff); changing many hosts at once needs the user\'s explicit request.',
+          parameters: {
+            type: 'object',
+            properties: {
+              command: { type: 'string', description: 'The command to run on every target host' },
+              connection_ids: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Up to 10 connection ids to target (ids come from list_connections)',
+              },
+              scope: {
+                type: 'string',
+                enum: ['all_open'],
+                description: 'all_open = every connection with an open terminal session; omit when connection_ids is given',
+              },
+              timeout_ms: {
+                type: 'number',
+                description: 'Per-host timeout in milliseconds. Default 10000, max 60000',
+              },
+            },
+            required: ['command'],
+          },
+        },
+      },
+      executor: async (args: Record<string, unknown>, ctx: ToolContext) => {
+        return this.runOnHosts(ownerIdOf(ctx), terminalSessionOf(ctx), permissionsOf(ctx), args);
+      },
+      category: 'builtin',
+    });
   }
 
   // ========== 命令安全检查 ==========
@@ -1079,6 +1339,372 @@ export class AIService {
   }
 
   /**
+   * search_audit 的实现。
+   *
+   * 与 queryMetrics 同一类：只读已经落库的东西，不需要活终端。
+   * 刻意把每条压成两行：模型要的是「上次跑的是什么、结果是什么」，
+   * 而不是流水本身；完整 result 回给它，几条就把上下文吃满。
+   */
+  private async searchAudit(ownerId: string, args: Record<string, any>): Promise<string> {
+    if (!this.auditService) {
+      return 'AUDIT_UNAVAILABLE: command history is not available in this deployment.';
+    }
+    if (!ownerId) {
+      return 'AUDIT_UNAVAILABLE: this run has no account binding, so no history can be searched.';
+    }
+
+    const allowedStatus = ['success', 'error', 'blocked', 'rewritten'];
+    const status = typeof args?.status === 'string' ? args.status.trim().toLowerCase() : '';
+    if (status && !allowedStatus.includes(status)) {
+      return `Invalid status "${status}"; use one of: ${allowedStatus.join(', ')}.`;
+    }
+
+    const keyword = typeof args?.keyword === 'string' ? args.keyword.trim() : '';
+    const connectionId = typeof args?.connection_id === 'string' ? args.connection_id.trim() : '';
+    const tool = typeof args?.tool === 'string' ? args.tool.trim() : '';
+    const hours = Math.min(Math.max(Math.round(Number(args?.hours) || 24), 1), 24 * 30);
+    const limit = Math.min(Math.max(Math.round(Number(args?.limit) || 10), 1), 50);
+
+    let result: { entries: AuditEntry[]; total: number; hours: number };
+    try {
+      result = await this.auditService.search(ownerId, { keyword, connectionId, status, tool, hours, limit });
+    } catch (error: any) {
+      return `AUDIT_SEARCH_FAILED: ${error?.message || error}`;
+    }
+
+    // 回显实际生效的条件：模型得能判断「是不是我把范围收窄到查不到了」
+    const filters = [
+      keyword ? `keyword="${keyword}"` : '',
+      connectionId ? `connection=${connectionId}` : '',
+      status ? `status=${status}` : '',
+      tool ? `tool=${tool}` : '',
+    ].filter(Boolean).join(', ');
+    const scope = filters ? ` matching ${filters}` : '';
+
+    if (!result.entries.length) {
+      return `No audit entries within the last ${result.hours}h${scope}. `
+        + 'The audit log only covers commands run through this app (agent tool calls and file transfers); '
+        + 'commands typed by hand into a terminal are not recorded. Try a larger hours value or a shorter keyword.';
+    }
+
+    const lines = [
+      `Matched ${result.entries.length} of ${result.total} entries within the last ${result.hours}h${scope}`
+        + ' (newest first, times in UTC):',
+    ];
+    result.entries.forEach((entry, index) => {
+      const when = new Date(entry.timestamp).toISOString().replace('T', ' ').slice(0, 19);
+      const host = entry.connectionId ? `conn=${entry.connectionId}` : 'conn=-';
+      const label = entry.sessionName ? ` (${entry.sessionName})` : '';
+      lines.push(`${index + 1}. ${when} | ${host}${label} | ${entry.tool || '-'} | ${entry.status} | ${entry.duration}ms`);
+      if (entry.command) lines.push(`   cmd: ${oneLine(entry.command, 300)}`);
+      if (entry.result) lines.push(`   out: ${oneLine(entry.result, 300)}`);
+    });
+    if (result.total > result.entries.length) {
+      lines.push('', `(${result.total - result.entries.length} more not shown; raise limit or narrow the filters.)`);
+    }
+
+    const output = lines.join('\n');
+    return output.length > 8000 ? `${output.slice(0, 8000)}\n... (truncated)` : output;
+  }
+
+  /**
+   * 本账号当前真正活着的会话。
+   *
+   * getSessions 读的是 sessionMetadata（含从库里恢复的历史会话），服务重启后 metadata 还在、
+   * 终端进程却没了，所以必须再用 getSession 确认一次；归属用严格相等，
+   * 元数据里没有 owner 的遗留会话一律不算——宁可少一台，也不要打到别人的机器上。
+   */
+  private liveSessionsOf(ownerId: string): Array<{ sessionId: string; connectionId: string; name: string }> {
+    const ssh = this.sshService;
+    if (!ssh) return [];
+    const alive: Array<{ sessionId: string; connectionId: string; name: string }> = [];
+    for (const meta of ssh.getSessions(ownerId) || []) {
+      const sessionId = String(meta?.sessionId || '');
+      if (!sessionId || !ssh.getSession(sessionId)) continue;
+      if (ssh.getSessionOwner(sessionId) !== ownerId) continue;
+      alive.push({
+        sessionId,
+        connectionId: String(meta?.connectionId || ''),
+        name: String(meta?.name || sessionId.substring(0, 8)),
+      });
+    }
+    return alive;
+  }
+
+  /**
+   * list_connections 的实现。
+   *
+   * 返回文本必须按字段白名单拼：getAllConnections 给的是已解密实体，
+   * 把实体 JSON 出去等于当面把口令/私钥交给模型（它们会一字不差地进对话历史）。
+   */
+  private async listConnections(ownerId: string, permissions: Record<string, boolean>): Promise<string> {
+    if (!allows(permissions, 'connections', 'terminal')) return permissionDeniedMsg('list_connections', 'connections or terminal');
+    if (!this.connections) return 'CONNECTIONS_UNAVAILABLE: connection storage is not available in this deployment.';
+    if (!ownerId) return 'CONNECTIONS_UNAVAILABLE: this run has no account binding, so no connection can be listed.';
+
+    let saved: any[];
+    try {
+      saved = await this.connections.getAllConnections(ownerId);
+    } catch (error: any) {
+      return `CONNECTIONS_QUERY_FAILED: ${error?.message || error}`;
+    }
+
+    const sessions = this.liveSessionsOf(ownerId);
+    const openByConnection = new Map<string, string[]>();
+    for (const session of sessions) {
+      if (!session.connectionId) continue;
+      const list = openByConnection.get(session.connectionId) || [];
+      list.push(session.sessionId);
+      openByConnection.set(session.connectionId, list);
+    }
+
+    const lines: string[] = [];
+    if (!saved.length) {
+      lines.push('No saved connections for this account yet.');
+    } else {
+      lines.push(`Saved connections for this account (${saved.length}):`);
+      for (const conn of saved) {
+        const kind = conn?.type === 'local'
+          ? 'local shell'
+          : `ssh ${conn?.username || '-'}@${conn?.host || '-'}:${Number(conn?.port) || 22}`;
+        const open = openByConnection.get(String(conn?.id || '')) || [];
+        const flags = [
+          conn?.enabled === false ? 'DISABLED' : 'enabled',
+          conn?.sampling === 'skip' ? 'offline-sampling=skip' : '',
+          open.length ? `open sessions=${open.length}` : 'no open session',
+        ].filter(Boolean).join(' | ');
+        lines.push(`- connection_id=${conn?.id || '-'} | "${conn?.name || '-'}" | ${kind} | ${flags}`);
+      }
+    }
+
+    const localSessions = openByConnection.get('__local__') || [];
+    lines.push('', 'Default Server Shell (connection_id=__local__): '
+      + (localSessions.length ? `${localSessions.length} open session(s)` : 'no open session'));
+    lines.push('', `Open terminal sessions right now: ${sessions.length}. `
+      + 'read_file and run_on_hosts only reach hosts that already have one of these sessions.');
+    return lines.join('\n');
+  }
+
+  /**
+   * read_file 的实现：活会话 + 凭据黑名单 + 只读文件头。
+   *
+   * 刻意不接受「为此拨号」：审批门禁还没建，模型自己选一台主机连上去读文件不是可以放开的权限。
+   * 路径策略用 assertReadablePath（不经过 shell，所以 /etc/nginx/nginx.conf 这类配置必须能读），
+   * 与 monitor 的 isSensitiveLogPath 是两件事。
+   */
+  private async readFile(
+    ownerId: string,
+    currentSessionId: string,
+    permissions: Record<string, boolean>,
+    args: Record<string, unknown>,
+  ): Promise<string> {
+    if (!allows(permissions, 'files', 'terminal')) return permissionDeniedMsg('read_file', 'files or terminal');
+    if (!this.sshService) return 'FILE_UNAVAILABLE: SSH service not available.';
+    if (!ownerId) return 'FILE_UNAVAILABLE: this run has no account binding, so no file can be read.';
+
+    let targetPath: string;
+    try {
+      targetPath = assertReadablePath(String(args?.path ?? ''));
+    } catch (error: any) {
+      return `Invalid path: ${error?.message || error}`;
+    }
+
+    const maxBytes = Math.min(Math.max(Math.round(Number(args?.max_bytes) || 16 * 1024), 1024), 128 * 1024);
+
+    let sessionId = currentSessionId;
+    const wantedConnection = typeof args?.connection_id === 'string' ? args.connection_id.trim() : '';
+    if (wantedConnection) {
+      const target = this.liveSessionsOf(ownerId).find((session) => session.connectionId === wantedConnection);
+      if (!target) {
+        return `NO_LIVE_SESSION: connection "${wantedConnection}" has no open terminal session right now. `
+          + 'Ask the user to open a terminal to it, or call list_connections to see which hosts do have one. '
+          + 'Do NOT open a connection by yourself.';
+      }
+      sessionId = target.sessionId;
+    } else if (!sessionId || !this.sshService.getSession(sessionId)) {
+      return liveSessionRequiredMsg('read_file');
+    } else if (this.sshService.getSessionOwner(sessionId) !== ownerId) {
+      return 'FILE_FORBIDDEN: the terminal session bound to this chat belongs to another account.';
+    }
+
+    try {
+      const info = await this.sshService.readFileHead(sessionId, targetPath, maxBytes);
+      const header = `File: ${targetPath} | session=${sessionId} | size=${info.size} bytes`
+        + (info.truncated
+          // 截断时必须把「怎么继续看」一并给出来：只说 truncated，模型下一轮往往直接把 max_bytes 开大
+          ? ` | showing the first ${info.bytes} bytes; for more use execute_command with sed / grep / tail`
+          : ' | full content');
+      if (info.bytes > 0 && info.text.includes('\u0000')) {
+        return `${header}\nFILE_LOOKS_BINARY: contains NUL bytes, no text preview was produced. `
+          + 'Use execute_command with file / strings if the bytes themselves matter.';
+      }
+      const text = info.text.length > 20000
+        ? `${info.text.slice(0, 20000)}\n... (text cut at 20000 chars; use execute_command with sed / grep for a precise slice)`
+        : info.text;
+      return `${header}\n---\n${text}`;
+    } catch (error: any) {
+      return `FILE_READ_FAILED: ${error?.message || error}`;
+    }
+  }
+
+  /**
+   * run_on_hosts 的实现。
+   *
+   * 限流口径照抄离线采集：并发 2、总预算 45s、sampling=skip 的连接不进 all_open 扫。
+   * 不改 BatchService 是因为它按 sessionIds.map 全并发（批量面板也在用），
+   * 而「AI 一句话打 10 台」同时开 10 个通道，危险面比在面板上点一次大得多。
+   */
+  private async runOnHosts(
+    ownerId: string,
+    currentSessionId: string,
+    permissions: Record<string, boolean>,
+    args: Record<string, unknown>,
+  ): Promise<string> {
+    if (!allows(permissions, 'batch')) return permissionDeniedMsg('run_on_hosts', 'batch');
+    if (!this.batch || !this.sshService) return 'BATCH_UNAVAILABLE: batch execution is not enabled in this deployment.';
+    if (!ownerId) return 'BATCH_UNAVAILABLE: this run has no account binding, so no host can be targeted.';
+
+    const command = typeof args?.command === 'string' ? args.command.trim() : '';
+    if (!command) return 'Invalid arguments: command is required (one command, run as-is on every target host).';
+
+    // 先在高危判定上失败：批量放大器不放行单终端可能还得解释风险的命令
+    const risk = assessDangerousCommand(command);
+    if (!risk.safe) {
+      return `BLOCKED: ${risk.reason || 'high-risk command'}. run_on_hosts would repeat it on every targeted host, `
+        + 'so it is refused here even when the same command is allowed in a single terminal.';
+    }
+
+    const live = this.liveSessionsOf(ownerId);
+    if (!live.length) {
+      return 'NO_LIVE_SESSION: no host has an open terminal session right now, and run_on_hosts never dials one. '
+        + 'Ask the user to open terminals to the hosts they mean.';
+    }
+
+    // 同一连接上开了多个终端只取一个：同一条命令没必要在一台主机上跑两遍
+    const byConnection = new Map<string, { sessionId: string; connectionId: string; name: string }>();
+    for (const session of live) {
+      const key = session.connectionId || session.sessionId;
+      if (!key) continue;
+      const existing = byConnection.get(key);
+      // 优先用当前终端所在的那个会话：用户正看着它，回显最直观
+      if (!existing || (session.sessionId === currentSessionId && existing.sessionId !== currentSessionId)) {
+        byConnection.set(key, session);
+      }
+    }
+
+    const explicitIds = Array.isArray(args?.connection_ids)
+      ? (args.connection_ids as unknown[]).map((value) => String(value ?? '').trim()).filter(Boolean)
+      : [];
+    const scope = String(args?.scope || '').toLowerCase();
+
+    const targets: Array<{ sessionId: string; connectionId: string; name: string }> = [];
+    const unreachable: string[] = [];
+    const skippedByFlag: string[] = [];
+
+    if (explicitIds.length) {
+      if (explicitIds.length > 10) {
+        return `Invalid arguments: at most 10 connection_ids per call (got ${explicitIds.length}). Split it into several calls.`;
+      }
+      for (const id of explicitIds) {
+        const target = byConnection.get(id);
+        if (target) targets.push(target);
+        else unreachable.push(id);
+      }
+    } else if (scope === 'all_open') {
+      const skipIds = await this.samplingSkipIds(ownerId);
+      for (const [key, target] of byConnection) {
+        if (skipIds.has(key)) { skippedByFlag.push(target.name); continue; }
+        targets.push(target);
+      }
+    } else {
+      const openHosts = Array.from(byConnection.values())
+        .map((session) => `${session.connectionId} ("${session.name}")`)
+        .join(', ');
+      return 'Invalid arguments: pass connection_ids (up to 10) or scope="all_open". '
+        + `Hosts with an open session right now: ${openHosts || 'none'}.`;
+    }
+
+    if (!targets.length) {
+      return `No target has an open session: ${unreachable.join(', ') || '(none matched)'}. `
+        + 'run_on_hosts never opens a connection; call list_connections to see which hosts have one.';
+    }
+
+    const CHUNK_SIZE = 2;
+    const BUDGET_MS = 45 * 1000;
+    const timeout = Math.min(Math.max(Math.round(Number(args?.timeout_ms) || 10_000), 1_000), 60_000);
+    const startedAt = Date.now();
+    const results: BatchRunTask['results'] = [];
+    const notAttempted: string[] = [];
+
+    for (let index = 0; index < targets.length; index += CHUNK_SIZE) {
+      if (Date.now() - startedAt > BUDGET_MS) {
+        notAttempted.push(...targets.slice(index).map((target) => `${target.connectionId} ("${target.name}")`));
+        break;
+      }
+      const chunk = targets.slice(index, index + CHUNK_SIZE);
+      try {
+        const task = await this.batch.executeBatch(ownerId, chunk.map((target) => target.sessionId), command, timeout);
+        results.push(...(task?.results || []));
+      } catch (error: any) {
+        // 整块失败（归属校验、会话刚断掉等）不能当成「都跑完了」：逐台补一条失败记录
+        for (const target of chunk) {
+          results.push({
+            sessionId: target.sessionId,
+            connectionId: target.connectionId,
+            sessionName: target.name,
+            success: false,
+            output: '',
+            duration: 0,
+            error: error?.message || 'batch failed',
+          });
+        }
+      }
+    }
+
+    const labelOf = new Map(targets.map((target) => [target.sessionId, target]));
+    const okCount = results.filter((result) => result.success).length;
+    const lines = [
+      `Ran on ${results.length}/${targets.length} host(s): ${oneLine(command, 200)}`,
+      `ok=${okCount}, failed=${results.length - okCount}`,
+    ];
+    for (const result of results) {
+      const target = labelOf.get(result.sessionId);
+      const label = target
+        ? `${target.name} (connection_id=${target.connectionId})`
+        : (result.sessionName || result.sessionId);
+      lines.push(`- ${result.success ? '[ok]' : '[failed]'} ${label} ${result.duration}ms`);
+      lines.push(result.success
+        ? `  out: ${oneLine(result.output || '(no output)', 400)}`
+        : `  err: ${oneLine(result.error || 'unknown error', 300)}`);
+    }
+    if (unreachable.length) lines.push('', `No open session, not attempted: ${unreachable.join(', ')}`);
+    if (skippedByFlag.length) {
+      lines.push('', `Excluded (connection marked offline-sampling=skip): ${skippedByFlag.join(', ')}. `
+        + 'Target them explicitly with connection_ids only if the user really means them.');
+    }
+    if (notAttempted.length) {
+      lines.push('', `Stopped at the ${BUDGET_MS / 1000}s budget, not attempted: ${notAttempted.join(', ')}. `
+        + 'Call run_on_hosts again with those connection_ids.');
+    }
+
+    const output = lines.join('\n');
+    return output.length > 8000 ? `${output.slice(0, 8000)}\n... (truncated)` : output;
+  }
+
+  /** 标记了 sampling=skip 的连接：all_open 的兜底扫描不碰它们（显式点名时不受影响） */
+  private async samplingSkipIds(ownerId: string): Promise<Set<string>> {
+    const skip = new Set<string>();
+    if (!this.connections) return skip;
+    try {
+      const saved = await this.connections.getAllConnections(ownerId);
+      for (const conn of saved || []) {
+        if (conn?.sampling === 'skip' && conn?.id) skip.add(String(conn.id));
+      }
+    } catch { /* 拿不到清单就不筛：目标依然限制在活会话内 */ }
+    return skip;
+  }
+
+  /**
    * 构建注入到 agent-core ToolContext.shell 的执行器。
    * 新版 agent-core 内置的 execute_command / read_terminal 走 ctx.shell.exec/read，
    * 若不注入则落到 noop shell（不报错但捕不到任何输出）。这里接到本服务的 sshService，
@@ -1245,6 +1871,9 @@ export class AIService {
             [TERMINAL_SESSION_KEY]: terminalSessionId,
             // ownerId 一并带进去：query_metrics 要按账号查，工具侧没有别的途径知道「当前登录人」
             [OWNER_ID_KEY]: ownerId,
+            // 权限位也走 custom：list_connections / read_file / run_on_hosts 不是「能对话就能用」，
+            // 由宿主把 wsUser.permissions 原样传进来，工具侧自己判（不传即全部拒绝）
+            [PERMISSIONS_KEY]: opts?.permissions || {},
           };
           const eventStream = engine.run({
             sessionId: chatId,
@@ -1258,6 +1887,9 @@ export class AIService {
           });
 
           for await (const coreEvent of eventStream) {
+            // 用户点了停止：provider 未必立刻结束流，这里兜底跳出，
+            // 下面统一补一个 stopped 事件，否则前端永远停在「生成中」
+            if (ctrl.signal.aborted) break;
             const mapped = this.mapCoreEvent(coreEvent);
             if (!mapped) continue;
             if (mapped.type === 'message' || mapped.type === 'tool_call') produced = true;
@@ -1276,9 +1908,14 @@ export class AIService {
             eventCallback(mapped);
           }
         } catch (error: any) {
-          lastError = error.message || 'Agent runtime error';
-          // 失败也留一条（tokens 为 0）：没有失败记录就无法按实测成功率做路由自适应
-          void this.recordUsage(ownerId, profile, chatId, terminalSessionId, undefined, false, !!decision);
+          if (ctrl.signal.aborted) {
+            // 主动中止不是故障：不记 lastError，也不当成失败算进模型健康度
+            lastError = '';
+          } else {
+            lastError = error.message || 'Agent runtime error';
+            // 失败也留一条（tokens 为 0）：没有失败记录就无法按实测成功率做路由自适应
+            void this.recordUsage(ownerId, profile, chatId, terminalSessionId, undefined, false, !!decision);
+          }
         }
 
         // 每轮结束都存上下文：降级重试时下一档能接着用刚才的历史
@@ -1287,14 +1924,23 @@ export class AIService {
           if (snapshot && snapshot.length > 0) await this.saveChatMessages(ownerId, chatId, snapshot);
         } catch { /* ignore */ }
 
+        // 中止优先于「已产生输出就返回」：abort 发生在流中途时 produced 已经是 true，
+        // 如果不先收尾，前端拿不到任何结束事件，停止按钮看起来「没反应」。
+        if (ctrl.signal.aborted) {
+          eventCallback({ type: 'stopped', modelId: profile.id, modelLabel, route });
+          return;
+        }
         // 已经产生输出就不换模型重试：重跑会让用户看到两套答案
         if (produced) return;
-        if (ctrl.signal.aborted) return;
       }
 
       eventCallback({ type: 'error', error: lastError || 'All models are unavailable, please check AI settings.' });
     } finally {
-      this.abortControllers.delete(this.abortKey(ownerId, chatId));
+      // 只清自己那一份：中止后 provider 可能晚很久才真正结束，
+      // 那时代替它跑的下一轮已经注册了新 controller，按 key 无脑删会把新一轮的停用能力删掉
+      if (this.abortControllers.get(this.abortKey(ownerId, chatId)) === ctrl) {
+        this.abortControllers.delete(this.abortKey(ownerId, chatId));
+      }
     }
   }
 

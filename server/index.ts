@@ -26,10 +26,11 @@ const auditService = new AuditService();
 const monitorService = new MonitorService(connectionService);
 const batchService = new BatchService(sshService, connectionService);
 // 顺序有依赖：采集器复用面板的状态采集（同一套口径）与连接配置（无会话采样要自己拨号），
-// AI 又要拿采集器查历史
+// AI 又要拿采集器查历史；后两个参数供 list_connections / run_on_hosts 用
+// （一个只读清单、一个复用批量执行），都只声明工具真正用到的那几个方法。
 const systemStatusService = new SystemStatusService(sshService);
 const hostMetricsService = new HostMetricsService(sshService, systemStatusService, connectionService);
-const aiService = new AIService(sshService, skillService, auditService, hostMetricsService);
+const aiService = new AIService(sshService, skillService, auditService, hostMetricsService, connectionService, batchService);
 const snippetService = new SnippetService();
 
 // 传输审计：SSHService 不认识 AuditService，两个实例在这里接起来。

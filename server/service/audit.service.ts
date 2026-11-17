@@ -37,6 +37,26 @@ export interface AuditQuery {
   status?: string;
   /** 只看某一类工具（如 file-transfer）；管理员开成员传输记录时用 */
   tool?: string;
+  /** 只看某一台主机的流水（connections.id） */
+  connectionId?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/**
+ * 跨天时间窗的搜索参数（search_audit 工具用）。
+ *
+ * 与 AuditQuery 的区别：那个是「某一天的页面查询」，这个是「最近 N 小时」，
+ * 不能互相代替 —— 排查「上周这个错怎么解的」时用户心里没有日期，只有「最近」
+ * 和「那个错」。
+ */
+export interface AuditSearch {
+  connectionId?: string;
+  keyword?: string;
+  status?: string;
+  tool?: string;
+  /** 回溯多少小时，默认 24，上限 30 天（与保留期对齐，再长必然查不到） */
+  hours?: number;
   limit?: number;
   offset?: number;
 }
@@ -119,10 +139,38 @@ export class AuditService {
       keyword: query.keyword,
       status: query.status,
       tool: query.tool,
+      connectionId: query.connectionId,
       limit: query.limit || 100,
       offset: query.offset || 0,
     });
     return { entries, total };
+  }
+
+  /**
+   * 跨天时间窗搜索（AI 的 search_audit 工具走这条路）。
+   *
+   * toTs 多给 1 分钟：命令刚跑完就让它自己查自己，否则「刚刚那次失败」会卡在
+   * 窗口边界外，模型拿到的永远是「没有记录」，很容易被解读成「没发生过」。
+   */
+  async search(ownerId: string, params: AuditSearch = {}): Promise<{
+    entries: AuditEntry[];
+    total: number;
+    hours: number;
+  }> {
+    const hours = Math.min(Math.max(Math.round(Number(params.hours) || 24), 1), 24 * 30);
+    const now = Date.now();
+    const { entries, total } = await queryAuditEvents({
+      ownerId,
+      connectionId: params.connectionId || undefined,
+      keyword: params.keyword || undefined,
+      status: params.status || undefined,
+      tool: params.tool || undefined,
+      fromTs: now - hours * 3600_000,
+      toTs: now + 60_000,
+      limit: Math.min(Math.max(Math.trunc(Number(params.limit) || 10), 1), 100),
+      offset: Math.max(Math.trunc(Number(params.offset) || 0), 0),
+    });
+    return { entries, total, hours };
   }
 
   /**

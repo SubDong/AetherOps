@@ -502,7 +502,8 @@ function setupTerminalIPC() {
           console.log(`[IPC] AI Agent run: chat=${conversationId}, terminal=${terminalSid || 'none'}, model=${modelId || 'auto'}, skill=${skillId || 'none'}`);
           aiService.agentRun(user.userId, conversationId, terminalSid, message, context, (agentEvent) => {
             send({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event: agentEvent });
-          }, { skillId, locale, modelId }).catch((err) => {
+            // 与 server.js / vite.config.ts 一致：工具侧按权限位自己判，漏传等于全拒
+          }, { skillId, locale, modelId, permissions: user.permissions || {} }).catch((err) => {
             send({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event: { type: 'error', error: err.message } });
           });
           break;

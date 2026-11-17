@@ -496,7 +496,9 @@ const config = defineConfig({
                                     // 参数顺序与服务端一致：(ownerId, chatId, terminalSessionId, message, context, callback, opts)
                                     aiService.agentRun(ownerId, conversationId, terminalSid, message, context, (event) => {
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event }));
-                                    }, { skillId, locale, modelId }).catch((err: any) => {
+                                    // permissions 与生产端同规则：工具侧的 list_connections / read_file / run_on_hosts
+                                    // 按这份权限位自己判，dev 里漏传会让三个工具在开发环境永远 PERMISSION_DENIED
+                                    }, { skillId, locale, modelId, permissions: wsUser.permissions || {} }).catch((err: any) => {
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event: { type: 'error', error: err.message } }));
                                     });
                                     break;

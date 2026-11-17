@@ -12,6 +12,20 @@ supported build, and record the commit you run.
 
 ### Added
 
+- **Queued messages in the AI chat, so a follow-up no longer has to wait for the turn to end.** The
+  input box used to be disabled while a turn ran. It now stays editable: Enter — or the send button,
+  which turns into a queue button — appends the message to a queue drawn above the input. Each row
+  carries the message, its skill badge, an edit action and a delete action. The head of the queue
+  is sent as soon as the turn ends (`done`, `error` or a stop): that is what makes a series of
+  instructions possible without babysitting the panel. Editing pulls a row out of the queue and puts
+  its text in the input box; sending or cancelling returns it *at its original position*, so editing
+  does not silently reorder the queue. Queued items enter the transcript only when they are actually
+  sent, so a question never lands in front of the answer it was queued behind. A stopped answer
+  carries a *Stopped (answer incomplete)* badge, and the client finalises the turn after 8 s if
+  the provider never closes the stream. **Boundary:** the queue belongs to one chat and is cleared
+  when another chat is opened or a new one is started; it lives in the tab's memory rather than the
+  database, so reloading the page drops it; if creating the chat row fails, the queue stays parked
+  and resumes on the next send instead of replaying the same failure once per item.
 - **Per-minute host metrics retention + a `query_metrics` tool.** A server-side timer samples every
   60 s (first round 15 s after boot), reusing the panel's `SystemStatusService` so both report the same
   numbers, and merges each sample into a new `host_metrics_minute` table — one row per owner /
@@ -57,6 +71,39 @@ supported build, and record the commit you run.
   the field on every save, empty string included, because that is the only way a user can undo a
   `skip` set elsewhere; an absent field still means "keep the current value", so other clients are
   unaffected. See [docs/offline-sampling-faq.md](docs/offline-sampling-faq.md).
+- **`search_audit`: the agent can search its own command history.** `audit_events` has carried
+  `connection_id` since the first migration, but only in the `SELECT` list — never in the `WHERE`
+  clause — so "what did we run on this host before, and what did we do about it" could not be asked.
+  The repository now filters on `connection_id` and on an `occurred_at` range (served by the existing
+  `idx_audit_occurred`, so no migration), `/api/audit/getLogs` accepts the same field, and a fourth
+  built-in tool exposes the table to the agent: keyword, host, status, tool and a window of 1 hour to
+  30 days, capped at 50 rows per call and rendered as two lines per entry so a long tail cannot flood
+  the context. The system prompt lists it beside `query_metrics` and adds a working principle to check
+  history before guessing. Owner scoping is unchanged — the account comes from the run context, never
+  from tool arguments — and an empty result names the coverage gap instead of implying the command
+  never ran. **Boundary:** only what this app ran is recorded (agent tool calls and file transfers);
+  commands typed by hand into a terminal are not in the table. The tool's own calls land in
+  `audit_events` through the same `after_tool` hook as every other tool.
+- **Three reach tools: `list_connections`, `read_file`, `run_on_hosts`.** The agent could run one
+  command in the terminal it was bound to and search stored history; it could not see the rest of the
+  account's estate. `list_connections` returns id / name / type / host / user / enabled plus which of
+  them currently hold an open terminal session — never a password, key or passphrase, because the
+  entity it reads is already decrypted and the output is rebuilt from a field whitelist. `read_file`
+  returns the head of a config or log file on such a host over the existing SFTP channel, reading a
+  byte range instead of the whole file: the file-transfer path buffers up to 200 MB and a 2 GB log
+  would take the process with it, so it stats first and reports `truncated` instead. Credential-shaped
+  paths (`/etc/shadow`, `~/.ssh`, cloud/registry configs, `*.pem` / `*.key` / `id_*`) are refused, and
+  that policy is deliberately *not* the monitor's `isSensitiveLogPath` — the latter bans all of `/etc`
+  because its path is concatenated into `tail -f`, which would make `/etc/nginx/nginx.conf` unreadable
+  here. `run_on_hosts` runs one command across up to 10 connections, or across every connection with
+  an open session, reusing `BatchService` in chunks of 2 with a 45 s total budget and a per-host
+  timeout (the batch panel keeps its own concurrency, untouched), and refuses high-risk commands before
+  the fan-out instead of once per host. **Boundary:** none of the three dials a connection — they reach
+  only hosts that already have an open terminal session and say so rather than reporting the host as
+  unreachable; `scope=all_open` skips connections marked `sampling: 'skip'`; each tool is gated by its
+  own permission bit (`connections` / `files` / `batch`) passed down from the WebSocket user, and a
+  missing bit denies instead of defaulting to allow; all three are audited through the same
+  `after_tool` hook.
 - **Open-source community files**: [LICENSE](LICENSE) (MIT, with the upstream attribution kept in
   `packages/vscode/LICENSE`), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), this
   changelog, and issue / pull request templates under `.github/`.
@@ -85,6 +132,14 @@ supported build, and record the commit you run.
 
 ### Fixed
 
+- **The AI chat's stop button did not stop anything the UI could see.** Clicking it aborted the run on
+  the server, but the abort path returned without emitting a terminal event — and the "already produced
+  output → give up" check ran first, while an abort mid-stream always has produced output — so the
+  client received nothing and stayed on "Generating…" with the input box disabled for good. The run now
+  emits a `stopped` event before either return, the abort is no longer recorded as a provider failure
+  (a user pressing stop must not lower a model's measured health), and the abort controller is deleted
+  only if it is still the current one, so a provider that closes late cannot remove the next turn's
+  stop handle.
 - **`pnpm build` stopped after Vite finished, so the server bundle was never compiled.**
   `vite.config.ts` imports `server/index` at module scope, because the dev server must reuse the same
   service singletons; importing it constructs `MonitorService`, whose 5 s analysis `setInterval` was

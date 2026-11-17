@@ -266,6 +266,18 @@ export default {
     copyCode: '复制代码',
     retry: '重试',
     sessionTokens: '本次会话累计 Token 消耗',
+    // ===== 停止与排队 =====
+    stopping: '停止中...',
+    stopped: '已停止（回答不完整）',
+    queueTitle: '待发送 {count} 条 · 当前这轮结束后自动继续',
+    queueSendHint: '加入队列（不打断当前这轮）',
+    queueEdit: '编辑这条排队指令',
+    queueRemove: '删除这条排队指令',
+    queueEditing: '已从队列取出，回车把修改放回原处',
+    queueEditingHint: '正在编辑队列第 {index} 条',
+    queueCancel: '取消编辑',
+    queuedPlaceholder: '运行中：可以先写下一条指令，回车加入队列',
+    send: '发送',
     // ===== 成本管控 =====
     tierAuto: '自动识别',
     tierManual: '手填',

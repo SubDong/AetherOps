@@ -41,6 +41,20 @@ export interface AuditQueryRow {
   status?: string;
   /** 工具名精确过滤：管理员看「只含文件传输」的流水时用 */
   tool?: string;
+  /**
+   * 只看某一台主机的流水（connections.id）。
+   * 「这台机器上次这个报错怎么解的」缺的就是这一维：connection_id 一直在 SELECT 里，
+   * 但不在 WHERE 里，等于每条记录都带着主机却查不了主机。
+   */
+  connectionId?: string;
+  /**
+   * 时间窗（毫秒时间戳，左闭右开）。与 date 互不冲突但也不要同时传：
+   * date 是「某一天」的快路径，fromTs/toTs 是跨天的「最近 N 小时」。
+   * 传的是 Date 对象而非字符串，转成 DATETIME 的口径与 insertAuditEvent 完全一致，
+   * 否则驱动按不同时区格式化，窗口会整体偏掉。
+   */
+  fromTs?: number;
+  toTs?: number;
   limit?: number;
   offset?: number;
 }
@@ -108,6 +122,18 @@ function buildWhere(q: AuditQueryRow): { sql: string; params: any[] } {
   if (q.tool) {
     clauses.push('tool = ?');
     params.push(q.tool);
+  }
+  if (q.connectionId) {
+    clauses.push('connection_id = ?');
+    params.push(q.connectionId);
+  }
+  if (q.fromTs) {
+    clauses.push('occurred_at >= ?');
+    params.push(new Date(q.fromTs));
+  }
+  if (q.toTs) {
+    clauses.push('occurred_at < ?');
+    params.push(new Date(q.toTs));
   }
   if (q.keyword) {
     const like = `%${q.keyword}%`;

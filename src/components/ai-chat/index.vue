@@ -31,13 +31,19 @@
             <i class="bi bi-cpu"></i>
             <span>{{ formatTokens(sessionTokens) }}</span>
           </span>
-          <span v-if="isAgentRunning" class="ai-run-status" :class="{ long: isRunningLong }">
-            <span class="ai-run-dot"></span>
-            <span class="ai-run-text">{{ t('ai.generating') }}</span>
+          <span v-if="isAgentRunning" class="ai-run-status" :class="{ long: isRunningLong && !isStopping, stopping: isStopping }">
+            <span v-if="!isStopping" class="ai-run-dot"></span>
+            <span class="ai-run-text">{{ isStopping ? t('ai.stopping') : t('ai.generating') }}</span>
             <span class="ai-run-time">{{ elapsedText }}</span>
           </span>
-          <button v-if="isAgentRunning" class="btn-ai-action btn-stop" @click="handleStop" :title="t('ai.stopAgent')">
-            <i class="bi bi-stop-circle"></i>
+          <button
+            v-if="isAgentRunning"
+            class="btn-ai-action btn-stop"
+            :disabled="isStopping"
+            @click="handleStop"
+            :title="isStopping ? t('ai.stopping') : t('ai.stopAgent')"
+          >
+            <i :class="isStopping ? 'bi bi-hourglass-split' : 'bi bi-stop-circle'"></i>
           </button>
           <button class="btn-ai-action" @click="handleClear" :title="t('ai.clearHistory')">
             <i class="bi bi-trash"></i>
@@ -148,6 +154,11 @@
             <button class="msg-retry-btn" @click="retryMessage(index)">
               <i class="bi bi-arrow-clockwise"></i>{{ t('ai.retry') }}
             </button>
+          </div>
+
+          <!-- 本轮被用户中止：内容是不完整的，必须标出来，不能让半截回答看起来像完整答案 -->
+          <div v-if="msg.role === 'assistant' && msg.isStopped && !msg.isRunning" class="ai-msg-stopped">
+            <i class="bi bi-stop-circle"></i>{{ t('ai.stopped') }}
           </div>
 
           <!-- AI 消息底部信息：复制 / 耗时 / token 消耗 -->
@@ -313,6 +324,41 @@
       </div>
     </div>
 
+    <!-- 排队指令：运行中发的消息不打断当前这一轮，等它结束后自动依次发出 -->
+    <div v-if="activeTab === 'chat' && messageQueue.length > 0" class="ai-queue-bar">
+      <div class="ai-queue-header">
+        <i class="bi bi-list-ol"></i>
+        <span>{{ t('ai.queueTitle', { count: messageQueue.length }) }}</span>
+      </div>
+      <div class="ai-queue-list">
+        <div
+          v-for="(item, qi) in messageQueue"
+          :key="item.id"
+          class="ai-queue-item"
+          :title="item.text"
+        >
+          <span class="ai-queue-index">{{ qi + 1 }}</span>
+          <span v-if="item.skillName" class="ai-queue-skill">
+            <i class="bi bi-lightning-charge-fill"></i>{{ item.skillName }}
+          </span>
+          <span class="ai-queue-text">{{ item.text }}</span>
+          <button class="ai-queue-btn" @click="editQueued(item)" :title="t('ai.queueEdit')">
+            <i class="bi bi-pencil"></i>
+          </button>
+          <button class="ai-queue-btn danger" @click="removeQueued(item)" :title="t('ai.queueRemove')">
+            <i class="bi bi-x-lg"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 正在改排队指令：这一条已从队列里取出，取消后按原位置放回 -->
+    <div v-if="activeTab === 'chat' && queueEditing" class="ai-queue-editing">
+      <i class="bi bi-pencil-square"></i>
+      <span>{{ t('ai.queueEditingHint', { index: queueEditing.index + 1 }) }}</span>
+      <button class="ai-queue-cancel" @click="cancelQueueEdit">{{ t('ai.queueCancel') }}</button>
+    </div>
+
     <!-- 输入区域 -->
     <div v-show="activeTab === 'chat'" class="ai-chat-input">
       <!-- 上边缘的拖拽手柄：textarea 原生的 resize 角既看不出来、又被 max-height 卡住，
@@ -332,19 +378,32 @@
       <textarea
         ref="inputRef"
         v-model="inputText"
-        :placeholder="t('ai.inputPlaceholder')"
+        :class="{ 'queue-editing': !!queueEditing }"
+        :placeholder="inputPlaceholderText"
         @keydown.enter.exact="onEnterKey"
         @keydown.shift.enter="handleNewLine"
         @input="handleInput"
         rows="1"
-        :disabled="isAgentRunning"
       ></textarea>
-      <button 
-        class="btn-send" 
-        @click="handleSend"
-        :disabled="!inputText.trim() || isAgentRunning"
+      <!-- 停止按钮放在发送按钮旁边：头部的图标在窄面板下会被挤出可视区，这里一定看得到 -->
+      <button
+        v-if="isAgentRunning"
+        class="btn-stop-input"
+        :class="{ stopping: isStopping }"
+        :disabled="isStopping"
+        @click="handleStop"
+        :title="isStopping ? t('ai.stopping') : t('ai.stopAgent')"
       >
-        <i class="bi bi-send-fill"></i>
+        <i :class="isStopping ? 'bi bi-hourglass-split' : 'bi bi-stop-fill'"></i>
+      </button>
+      <button
+        class="btn-send"
+        :class="{ queued: isAgentRunning && !!inputText.trim() }"
+        @click="handleSend"
+        :disabled="!inputText.trim()"
+        :title="isAgentRunning ? t('ai.queueSendHint') : t('ai.send')"
+      >
+        <i :class="isAgentRunning ? 'bi bi-plus-lg' : 'bi bi-send-fill'"></i>
       </button>
     </div>
 
@@ -438,6 +497,17 @@ interface ChatMessage {
   modelLabel?: string;
   /** 本轮是否由 Auto 自动选型 */
   autoRouted?: boolean;
+  /** 本轮被用户中止：内容不完整，界面要标「已停止」 */
+  isStopped?: boolean;
+}
+
+/** 排队中的指令：运行中发出去的消息先进这里，上一轮结束后自动取队首继续 */
+interface QueuedMessage {
+  id: string;
+  /** 真正发给模型的内容（斜杠命令已解析成 skill + 指令） */
+  text: string;
+  skillId?: string;
+  skillName?: string;
 }
 
 const activeTab = ref<'chat' | 'audit' | 'monitor'>('chat');
@@ -448,6 +518,25 @@ const logMonitorRef = ref<InstanceType<typeof LogMonitor>>();
 const inputText = ref('');
 const isAgentRunning = ref(false);
 const messages = ref<ChatMessage[]>([]);
+
+const messageQueue = ref<QueuedMessage[]>([]);
+/** 正在输入框里编辑的排队指令：index 记住原位置，取消 / 放回时插回原处 */
+const queueEditing = ref<{ index: number; item: QueuedMessage } | null>(null);
+/** 已发出停止请求、正在等后端确认 */
+const isStopping = ref(false);
+/** 停止后等后端回 stopped 的兜底时长：provider 不响应 abort 时不能一直卡在「生成中」 */
+const STOP_FALLBACK_MS = 8000;
+let stopFallbackTimer: ReturnType<typeof setTimeout> | null = null;
+/** 每轮 Agent 自增，用来分辨迟到的结束事件属于哪一轮 */
+let runToken = 0;
+/** 本轮发出停止请求时的 runToken；-1 表示本轮没点过停止 */
+let stoppingToken = -1;
+
+const inputPlaceholderText = computed(() => {
+  if (queueEditing.value) return t('ai.queueEditing');
+  if (isAgentRunning.value) return t('ai.queuedPlaceholder');
+  return t('ai.inputPlaceholder');
+});
 
 // 执行耗时统计：用于显示「生成中 / 执行较慢」状态
 const agentStartTime = ref(0);
@@ -565,6 +654,12 @@ function handleAgentEvent(event: any) {
     return;
   }
 
+  // 停止确认：兜底定时器可能已经收尾并开始了下一轮，迟到的 stopped 不能再动当前消息
+  if (event.type === 'stopped') {
+    if (runToken === stoppingToken) finalizeStoppedMessage();
+    return;
+  }
+
   const idx = ensureAssistantMessage();
   const msg = messages.value[idx];
   if (!msg.agentSteps) msg.agentSteps = [];
@@ -629,11 +724,14 @@ function handleAgentEvent(event: any) {
         }
       }
       isAgentRunning.value = false;
+      isStopping.value = false;
+      clearStopFallback();
       stopElapsedTimer();
       currentAssistantIdx = -1;
       saveDisplayHistory();
       // 本轮的 token/金额刚记完账，面板开着就地刷新，用户不用自己点
       if (showCostPanel.value) void refreshInsights();
+      drainQueue();
       break;
 
     case 'audit_entry':
@@ -652,9 +750,13 @@ function handleAgentEvent(event: any) {
       msg.content += `\n\n**${t('ai.errorLabel')}**: ${budgetErrorMessage(event.code) || event.error || t('ai.unknownError')}`;
       if (showCostPanel.value) void refreshInsights();
       isAgentRunning.value = false;
+      isStopping.value = false;
+      clearStopFallback();
       stopElapsedTimer();
       currentAssistantIdx = -1;
       saveDisplayHistory();
+      // 失败也要接着跑队列：否则队列永远停在这里没有第二个触发点
+      drainQueue();
       break;
   }
 
@@ -799,47 +901,140 @@ watch(inputText, () => nextTick(autoGrowInput));
 // 从其他标签页切回来时元素才可见，隐藏时量不出真实高度
 watch(activeTab, (tab) => { if (tab === 'chat') nextTick(autoGrowInput); });
 
-// 发送消息
-function handleSend() {
-  const text = inputText.value.trim();
-  if (!text || isAgentRunning.value) return;
+/** 排队指令的唯一 id：列表 key 与「编辑后放回原位置」都靠它 */
+let queueSeq = 0;
+function newQueueId(): string {
+  queueSeq += 1;
+  return `q${Date.now()}_${queueSeq}`;
+}
 
-  // 检查斜杠命令（带后续文本的情况：/skill-id 补充说明）
-  let actualMessage = text;
-  let activeSkill = selectedSkill.value;
-  
-  if (text.startsWith('/')) {
-    const spaceIdx = text.indexOf(' ');
-    const cmd = (spaceIdx > 0 ? text.substring(1, spaceIdx) : text.substring(1)).toLowerCase();
-    const match = skills.value.find(s => s.id.toLowerCase() === cmd);
-    if (match) {
-      activeSkill = match;
-      actualMessage = spaceIdx > 0 ? text.substring(spaceIdx + 1).trim() : match.description || match.name;
-      if (!actualMessage) actualMessage = match.name;
-    }
-  }
+function resolveSkillById(id?: string): SkillItem | null {
+  if (!id) return null;
+  return skills.value.find(s => s.id === id) || null;
+}
 
-  // 添加用户消息
+/** 斜杠命令解析：/skill-id 补充说明 → skill + 真正发给模型的内容 */
+function parseInput(text: string, fallback: SkillItem | null): { message: string; skill: SkillItem | null } {
+  if (!text.startsWith('/')) return { message: text, skill: fallback };
+  const spaceIdx = text.indexOf(' ');
+  const cmd = (spaceIdx > 0 ? text.substring(1, spaceIdx) : text.substring(1)).toLowerCase();
+  const match = skills.value.find(s => s.id.toLowerCase() === cmd);
+  if (!match) return { message: text, skill: fallback };
+  const rest = spaceIdx > 0 ? text.substring(spaceIdx + 1).trim() : match.description || match.name;
+  return { message: rest || match.name, skill: match };
+}
+
+/** 真正发一轮：直接发送与队列取队首都走这里，保证顺序与消息落地方式一致 */
+function sendNow(message: string, skill: SkillItem | null) {
   messages.value.push({
     role: 'user',
-    content: actualMessage,
-    skillName: activeSkill?.name,
-    skillId: activeSkill?.id,
+    content: message,
+    skillName: skill?.name,
+    skillId: skill?.id,
   });
-  inputText.value = '';
   scrollToBottom();
+  void runAgent(message, skill);
+}
 
-  runAgent(actualMessage, activeSkill);
+/** 上一轮结束后取队首继续：这就是「排队等前一条跑完自动接着干」 */
+function drainQueue() {
+  if (isAgentRunning.value || messageQueue.value.length === 0) return;
+  const next = messageQueue.value.shift();
+  if (!next) return;
+  sendNow(next.text, resolveSkillById(next.skillId));
+}
 
-  // 发送后清除选中的 Skill
+/** 把一条排队指令提到输入框里改；发送时按原位置放回队列，取消时也一样 */
+function editQueued(item: QueuedMessage) {
+  // 已经在改另一条：先把那条放回去，不然它的内容会没
+  if (queueEditing.value) cancelQueueEdit();
+  const index = messageQueue.value.findIndex(q => q.id === item.id);
+  if (index < 0) return;
+  messageQueue.value.splice(index, 1);
+  queueEditing.value = { index, item };
+  inputText.value = item.text;
+  nextTick(() => inputRef.value?.focus());
+}
+
+function cancelQueueEdit() {
+  const editing = queueEditing.value;
+  if (!editing) return;
+  queueEditing.value = null;
+  // 前面的项可能已被自动取走，原位置越界就放到队尾
+  messageQueue.value.splice(Math.min(editing.index, messageQueue.value.length), 0, editing.item);
+  inputText.value = '';
+}
+
+function removeQueued(item: QueuedMessage) {
+  const index = messageQueue.value.findIndex(q => q.id === item.id);
+  if (index < 0) return;
+  messageQueue.value.splice(index, 1);
+  if (queueEditing.value?.item.id === item.id) {
+    queueEditing.value = null;
+    inputText.value = '';
+  }
+}
+
+/** 排队指令只属于发它的那个对话：切对话 / 新建对话时清掉 */
+function clearQueue() {
+  messageQueue.value = [];
+  queueEditing.value = null;
+  clearStopFallback();
+  isStopping.value = false;
+}
+
+// 发送消息：空闲就直接发，运行中就排队（不打断当前这一轮）
+function handleSend() {
+  const text = inputText.value.trim();
+  if (!text) return;
+
+  const editing = queueEditing.value;
+  const parsed = parseInput(text, editing ? resolveSkillById(editing.item.skillId) : selectedSkill.value);
+  const item: QueuedMessage = {
+    id: editing?.item.id || newQueueId(),
+    text: parsed.message,
+    skillId: parsed.skill?.id,
+    skillName: parsed.skill?.name,
+  };
+
+  inputText.value = '';
   selectedSkill.value = null;
+
+  // 改的是排队指令：运行中就按原位置放回队列，空闲就直接发出
+  if (editing) {
+    queueEditing.value = null;
+    if (isAgentRunning.value) {
+      messageQueue.value.splice(Math.min(editing.index, messageQueue.value.length), 0, item);
+    } else {
+      sendNow(item.text, parsed.skill);
+    }
+    return;
+  }
+
+  if (isAgentRunning.value) {
+    messageQueue.value.push(item);
+    return;
+  }
+
+  // 空闲但队列还有积压（比如上一轮建对话失败）：先排队再从队首发，不插队
+  if (messageQueue.value.length > 0) {
+    messageQueue.value.push(item);
+    drainQueue();
+    return;
+  }
+
+  sendNow(item.text, parsed.skill);
 }
 
 /** 启动 Agent 执行（handleSend 与失败重试共用） */
 async function runAgent(message: string, skill?: SkillItem | null) {
   const context = props.getTerminalContext?.() || '';
 
+  // 每轮换一个 token：迟到的 stopped / 停止兜底定时器靠它判断「还是不是这一轮」
+  runToken += 1;
+  stoppingToken = -1;
   isAgentRunning.value = true;
+  isStopping.value = false;
   agentStartTime.value = Date.now();
   startElapsedTimer();
   currentAssistantIdx = -1;
@@ -891,11 +1086,44 @@ function retryMessage(index: number) {
   }
 }
 
+/** 停止当前一轮：先让后端 abort，再等 stopped；provider 不响应时前端自己收尾 */
 function handleStop() {
+  if (isStopping.value) return;
+  isStopping.value = true;
+  stoppingToken = runToken;
   emit('ws-send', {
     type: 'ai-agent-stop',
     data: { aiSessionId: props.sessionId, chatId: currentChatId.value || undefined },
   });
+  clearStopFallback();
+  stopFallbackTimer = setTimeout(() => {
+    stopFallbackTimer = null;
+    if (runToken !== stoppingToken) return;
+    finalizeStoppedMessage();
+  }, STOP_FALLBACK_MS);
+}
+
+/** 就地收尾成「已停止」：保留已生成内容，把界面从生成中放出来，然后接着跑队列 */
+function finalizeStoppedMessage() {
+  const idx = currentAssistantIdx;
+  if (idx >= 0 && idx < messages.value.length) {
+    const msg = messages.value[idx];
+    msg.isRunning = false;
+    msg.isStopped = true;
+    msg.durationMs = agentStartTime.value ? Date.now() - agentStartTime.value : undefined;
+    if (msg.agentSteps) msg.agentSteps = msg.agentSteps.filter(s => s.type !== 'thinking');
+  }
+  clearStopFallback();
+  isStopping.value = false;
+  isAgentRunning.value = false;
+  stopElapsedTimer();
+  currentAssistantIdx = -1;
+  saveDisplayHistory();
+  drainQueue();
+}
+
+function clearStopFallback() {
+  if (stopFallbackTimer) { clearTimeout(stopFallbackTimer); stopFallbackTimer = null; }
 }
 
 function handleNewLine() {
@@ -927,6 +1155,7 @@ function saveDisplayHistory() {
     skillId: m.skillId,
     isSystemInfo: m.isSystemInfo,
     isError: m.isError,
+    isStopped: m.isStopped,
     durationMs: m.durationMs,
     tokens: m.tokens,
     agentSteps: m.agentSteps?.filter(s => s.type === 'tool_call').map(s => ({
@@ -968,6 +1197,7 @@ async function loadDisplayHistory(chatId: string) {
         skillId: m.skillId,
         isSystemInfo: m.isSystemInfo,
         isError: m.isError,
+        isStopped: m.isStopped,
         durationMs: m.durationMs,
         tokens: m.tokens,
         modelLabel: m.modelLabel,
@@ -1049,6 +1279,7 @@ function resetChatState() {
   currentChatId.value = '';
   chatList.value = [];
   messages.value = [];
+  clearQueue();
   currentAssistantIdx = -1;
   showChatPanel.value = false;
   selectedModelId.value = readStoredModel();
@@ -1099,12 +1330,14 @@ async function switchChat(chatId: string) {
     showChatPanel.value = false;
     return;
   }
+  clearQueue();
   await openChat(target);
 }
 
 /** 新建对话：先不落库，首次发送时才建行，避免列表里堆一堆空对话 */
 function newChat() {
   if (isAgentRunning.value) return;
+  clearQueue();
   currentChatId.value = '';
   messages.value = [];
   currentAssistantIdx = -1;
@@ -1584,6 +1817,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   stopElapsedTimer();
+  clearStopFallback();
   window.removeEventListener('resize', autoGrowInput);
   if (copiedTimer) { clearTimeout(copiedTimer); copiedTimer = null; }
   if (profilesEventId) unsubscribe(profilesEventId);
@@ -1611,6 +1845,10 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
   display: flex;
   align-items: center;
   justify-content: space-between;
+  /* 窄面板（默认 380px）里 tab + 一串图标本来就超宽：
+     不换行时右边的停止/清空/关闭会被直接推到面板外看不见 */
+  flex-wrap: wrap;
+  gap: 6px;
   padding: 12px 16px;
   border-bottom: 1px solid var(--border-color);
   background: rgb(var(--bg-input-rgb) / 50%);
@@ -1632,6 +1870,7 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
 }
 .btn-ai-action.btn-stop { color: var(--danger); }
 .btn-ai-action.btn-stop:hover { color: var(--danger); background: rgb(var(--danger-rgb) / 10%); }
+.btn-ai-action.btn-stop:disabled { opacity: 0.5; cursor: default; background: none; }
 
 .ai-chat-messages {
   flex: 1;
@@ -1920,10 +2159,16 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
   font-size: 11px;
   color: var(--warning-strong);
   background: rgb(var(--warning-strong-rgb) / 8%);
+  white-space: nowrap;
 }
 .ai-run-status.long {
   color: var(--danger);
   background: rgb(var(--danger-rgb) / 12%);
+}
+/* 已发出停止请求：不再脉冲，换成一个安静的等待态 */
+.ai-run-status.stopping {
+  color: var(--text-secondary);
+  background: rgb(var(--overlay-rgb) / 8%);
 }
 .ai-run-dot {
   width: 6px;
@@ -1970,6 +2215,20 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
   0%, 50% { opacity: 1; }
   50.01%, 100% { opacity: 0; }
 }
+
+/* 被用户中止的消息：必须明确告知回答不完整 */
+.ai-msg-stopped {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  color: var(--warning);
+  background: rgb(var(--warning-rgb) / 12%);
+}
+.ai-msg-stopped i { font-size: 11px; }
 
 /* 消息底部信息行：复制 / 耗时 / token 消耗 */
 .ai-msg-meta {
@@ -2018,6 +2277,111 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
   to { transform: rotate(360deg); }
 }
 
+/* 待发队列：贴着输入区上方，最多占 96px，再多就自己滚 */
+.ai-queue-bar {
+  border-top: 1px solid var(--border-color);
+  background: rgb(var(--bg-input-rgb) / 30%);
+  padding: 6px 16px 4px;
+}
+.ai-queue-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 4px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.ai-queue-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 96px;
+  overflow-y: auto;
+}
+.ai-queue-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-radius: 6px;
+  background: rgb(var(--overlay-rgb) / 4%);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.ai-queue-index {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: rgb(var(--overlay-rgb) / 10%);
+  color: var(--text-secondary);
+  font-size: 10px;
+  line-height: 16px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.ai-queue-skill {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  padding: 0 6px;
+  border-radius: 9px;
+  font-size: 10px;
+  color: var(--warning);
+  background: rgb(var(--warning-rgb) / 12%);
+}
+.ai-queue-text {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ai-queue-btn {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1;
+  opacity: 0.7;
+  cursor: pointer;
+}
+.ai-queue-btn:hover { color: var(--accent); opacity: 1; }
+.ai-queue-btn.danger:hover { color: var(--danger); }
+
+/* 正在编辑排队指令的提示条 */
+.ai-queue-editing {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 16px;
+  border-top: 1px solid var(--border-color);
+  background: rgb(var(--accent-rgb) / 8%);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.ai-queue-editing i { flex-shrink: 0; color: var(--accent); }
+.ai-queue-editing span {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ai-queue-cancel {
+  flex-shrink: 0;
+  background: none;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  padding: 1px 8px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+}
+.ai-queue-cancel:hover { color: var(--text-primary); border-color: var(--accent); }
+
 .ai-chat-input {
   position: relative;
   display: flex;
@@ -2027,6 +2391,29 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
   border-top: 1px solid var(--border-color);
   background: rgb(var(--bg-input-rgb) / 30%);
 }
+
+/* 输入区里的停止按钮：运行中才出现，比头部的图标更显眼，也不会被窄宽度挤掉 */
+.btn-stop-input {
+  width: 40px;
+  height: 40px;
+  flex-shrink: 0;
+  border: 1px solid rgb(var(--danger-rgb) / 35%);
+  border-radius: 8px;
+  background: rgb(var(--danger-rgb) / 12%);
+  color: var(--danger);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  transition: all 0.15s;
+}
+.btn-stop-input:hover:not(:disabled) {
+  background: rgb(var(--danger-rgb) / 20%);
+  border-color: var(--danger);
+}
+.btn-stop-input:disabled { opacity: 0.5; cursor: default; }
+.btn-stop-input.stopping { color: var(--text-secondary); border-color: var(--border-color); background: none; }
 
 /* 拖拽手柄：贴在输入区上边缘，平时只显示一条细线，hover / 拖动时高亮 */
 .ai-input-resizer {
@@ -2076,6 +2463,11 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
 }
 .ai-chat-input textarea:focus { border-color: var(--accent); }
 .ai-chat-input textarea:disabled { opacity: 0.6; }
+/* 正在改排队指令：边框高亮，和普通草稿区分开 */
+.ai-chat-input textarea.queue-editing {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px rgb(var(--accent-rgb) / 25%);
+}
 
 .btn-send {
   width: 40px;
@@ -2094,6 +2486,8 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
 }
 .btn-send:hover:not(:disabled) { background: var(--accent-hover); }
 .btn-send:disabled { opacity: 0.5; cursor: not-allowed; }
+/* 运行中发送 = 入队，用警告色区分，不会让人以为打断当前任务 */
+.btn-send.queued { background: var(--warning); color: var(--bg-dark); }
 
 /* Skills 按钮 */
 .btn-skill-toggle {
