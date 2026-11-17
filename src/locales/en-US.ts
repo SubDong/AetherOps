@@ -278,6 +278,18 @@ export default {
     queueCancel: 'Cancel',
     queuedPlaceholder: 'Running: write the next instruction, Enter to queue it',
     send: 'Send',
+    // ===== Medium-risk confirmation =====
+    confirmTitle: 'Needs your confirmation',
+    confirmHint: 'Medium-risk command: it will not run until you confirm here. Valid for 5 minutes.',
+    confirmHostsHint: 'Medium-risk command: confirming runs it on every targeted host, not just this terminal. Valid for 5 minutes.',
+    confirmRun: 'Run it',
+    confirmDismiss: 'Do not run',
+    confirmApproving: 'Confirming...',
+    confirmApproved: 'Confirmed, re-running the command',
+    confirmDenied: 'Cancelled, the command did not run',
+    confirmExpired: 'Confirmation expired, the agent has to propose the command again',
+    confirmResume: 'I confirmed this command: {command}\nRun it again with execute_command using exactly this text (no rewrites, no extra pipes), then continue the original task.',
+    confirmResumeHosts: 'I confirmed this command: {command}\nRun it again with run_on_hosts on the same hosts using exactly this text, then continue the original task.',
     // ===== Cost control =====
     tierAuto: 'auto',
     tierManual: 'manual',

@@ -474,7 +474,7 @@ const config = defineConfig({
                                 case 'ai-agent-run': {
                                     // aiSessionId 是命令要跑在哪个终端；chatId 是这一轮属于哪个对话（存储 key）。
                                     // 老前端只传 aiSessionId 时退化为「对话 = 终端会话」，不影响可用性。
-                                    const { aiSessionId, chatId, message, context, skillId, locale, modelId } = data || {};
+                                    const { aiSessionId, chatId, message, context, skillId, locale, modelId, approvalTokens } = data || {};
                                     if (!wsUser.permissions || !wsUser.permissions.ai) {
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Forbidden: missing permission' } }));
                                         break;
@@ -498,7 +498,12 @@ const config = defineConfig({
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event }));
                                     // permissions 与生产端同规则：工具侧的 list_connections / read_file / run_on_hosts
                                     // 按这份权限位自己判，dev 里漏传会让三个工具在开发环境永远 PERMISSION_DENIED
-                                    }, { skillId, locale, modelId, permissions: wsUser.permissions || {} }).catch((err: any) => {
+                                    }, { skillId, locale, modelId, permissions: wsUser.permissions || {},
+                                        // 用户刚确认的中风险命令：一次性 token，只在紧接着的这一轮生效
+                                        approvalTokens: Array.isArray(approvalTokens)
+                                            ? approvalTokens.filter((token: unknown) => typeof token === 'string')
+                                            : [],
+                                    }).catch((err: any) => {
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event: { type: 'error', error: err.message } }));
                                     });
                                     break;
@@ -511,6 +516,31 @@ const config = defineConfig({
                                         aiService.stopAgent(ownerId, stopTarget);
                                         console.log(`[dev][WS] AI Agent stop requested: ${stopTarget}`);
                                     }
+                                    break;
+                                }
+                                case 'ai-agent-confirm': {
+                                    // 中风险命令的人类确认：待确认请求换成一次性 token，
+                                    // 下一轮工具带着它才能放行（归属与对话由 ai.service 按 ownerId 校验）
+                                    const { approvalId, chatId: confirmChatId, aiSessionId: confirmSid } = data || {};
+                                    const confirmTarget = confirmChatId || confirmSid;
+                                    if (!wsUser.permissions || !wsUser.permissions.ai) {
+                                        safeSend(JSON.stringify({ type: 'ai-agent-event', event: { type: 'confirm_denied', error: 'Forbidden: missing permission', code: 'forbidden' } }));
+                                        break;
+                                    }
+                                    if (!approvalId || !confirmTarget) {
+                                        safeSend(JSON.stringify({ type: 'ai-agent-event', event: { type: 'confirm_denied', error: 'Missing params: approvalId / chatId', code: 'bad_request' } }));
+                                        break;
+                                    }
+                                    const result = aiService.approveCommand(ownerId, confirmTarget, approvalId);
+                                    console.log(`[dev][WS] AI Agent confirm: id=${approvalId} ok=${result.ok}${result.code ? ` code=${result.code}` : ''}`);
+                                    safeSend(JSON.stringify({
+                                        type: 'ai-agent-event',
+                                        sessionId: confirmSid || '',
+                                        chatId: confirmTarget,
+                                        event: result.ok
+                                            ? { type: 'confirm_approved', approval: { ...result.approval, token: result.token } }
+                                            : { type: 'confirm_denied', approval: result.approval, error: result.error, code: result.code },
+                                    }));
                                     break;
                                 }
                             }

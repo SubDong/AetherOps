@@ -278,6 +278,18 @@ export default {
     queueCancel: '取消编辑',
     queuedPlaceholder: '运行中：可以先写下一条指令，回车加入队列',
     send: '发送',
+    // ===== 中风险命令确认 =====
+    confirmTitle: '需要你确认才能执行',
+    confirmHint: '中风险命令：在这里点确认之前它不会执行。5 分钟内有效。',
+    confirmHostsHint: '中风险命令：确认后会在所有目标主机上执行，而不只是当前终端。5 分钟内有效。',
+    confirmRun: '确认执行',
+    confirmDismiss: '不执行',
+    confirmApproving: '正在确认…',
+    confirmApproved: '已确认，正在重跑这条命令',
+    confirmDenied: '已取消，命令没有执行',
+    confirmExpired: '确认已过期，需要让 AI 重新提出这条命令',
+    confirmResume: '我已经确认执行这条命令：{command}\n请用 execute_command 原样重跑它（不要改写、不要额外加管道），然后继续完成刚才的任务。',
+    confirmResumeHosts: '我已经确认执行这条命令：{command}\n请用 run_on_hosts 对刚才那批主机原样重跑它（不要改写），然后继续完成刚才的任务。',
     // ===== 成本管控 =====
     tierAuto: '自动识别',
     tierManual: '手填',

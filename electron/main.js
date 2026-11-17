@@ -334,7 +334,7 @@ function setupTerminalIPC() {
         send({ type: 'error', sessionId: sid, data: 'Unauthorized' });
         return;
       }
-      if (type !== 'ai-agent-run' && type !== 'ai-agent-stop' && !user.permissions?.terminal) {
+      if (type !== 'ai-agent-run' && type !== 'ai-agent-stop' && type !== 'ai-agent-confirm' && !user.permissions?.terminal) {
         send({ type: 'error', sessionId: sid, data: 'Forbidden: missing permission' });
         return;
       }
@@ -482,7 +482,7 @@ function setupTerminalIPC() {
         case 'ai-agent-run': {
           // 与 server.js / vite.config.ts 的 WS 处理保持同一套参数：
           // chatId 是对话存储 key，aiSessionId 是命令要跑在哪个终端，两者不是一回事。
-          const { aiSessionId, chatId, message, context, skillId, locale, modelId } = data || {};
+          const { aiSessionId, chatId, message, context, skillId, locale, modelId, approvalTokens } = data || {};
           if (!user.permissions?.ai) {
             send({ type: 'ai-agent-event', event: { type: 'error', error: 'Forbidden: missing permission' } });
             return;
@@ -503,7 +503,12 @@ function setupTerminalIPC() {
           aiService.agentRun(user.userId, conversationId, terminalSid, message, context, (agentEvent) => {
             send({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event: agentEvent });
             // 与 server.js / vite.config.ts 一致：工具侧按权限位自己判，漏传等于全拒
-          }, { skillId, locale, modelId, permissions: user.permissions || {} }).catch((err) => {
+          }, { skillId, locale, modelId, permissions: user.permissions || {},
+            // 用户刚确认的中风险命令：一次性 token，只在紧接着的这一轮生效
+            approvalTokens: Array.isArray(approvalTokens)
+              ? approvalTokens.filter((token) => typeof token === 'string')
+              : [],
+          }).catch((err) => {
             send({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event: { type: 'error', error: err.message } });
           });
           break;
@@ -514,6 +519,31 @@ function setupTerminalIPC() {
           // 中止的粒度是对话而不是终端；带 ownerId 才不会拿别人的 id 中止对方的 Agent
           const stopTarget = stopChatId || stopSid;
           if (stopTarget) aiService.stopAgent(user.userId, stopTarget);
+          break;
+        }
+
+        case 'ai-agent-confirm': {
+          // 中风险命令的人类确认：待确认请求换成一次性 token（归属与对话由 ai.service 按 userId 校验）
+          const { approvalId, chatId: confirmChatId, aiSessionId: confirmSid } = data || {};
+          const confirmTarget = confirmChatId || confirmSid;
+          if (!user.permissions?.ai) {
+            send({ type: 'ai-agent-event', event: { type: 'confirm_denied', error: 'Forbidden: missing permission', code: 'forbidden' } });
+            break;
+          }
+          if (!approvalId || !confirmTarget) {
+            send({ type: 'ai-agent-event', event: { type: 'confirm_denied', error: 'Missing params: approvalId / chatId', code: 'bad_request' } });
+            break;
+          }
+          const result = aiService.approveCommand(user.userId, confirmTarget, approvalId);
+          console.log(`[IPC] AI Agent confirm: id=${approvalId} ok=${result.ok}${result.code ? ` code=${result.code}` : ''}`);
+          send({
+            type: 'ai-agent-event',
+            sessionId: confirmSid || '',
+            chatId: confirmTarget,
+            event: result.ok
+              ? { type: 'confirm_approved', approval: { ...result.approval, token: result.token } }
+              : { type: 'confirm_denied', approval: result.approval, error: result.error, code: result.code },
+          });
           break;
         }
 

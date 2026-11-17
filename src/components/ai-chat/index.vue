@@ -138,6 +138,37 @@
                   <pre>{{ step.result }}</pre>
                 </div>
               </div>
+
+              <!-- 中风险命令：AI 不会自己执行，必须有人在这里点过确认 -->
+              <div
+                v-if="step.type === 'confirm' && step.approval"
+                class="agent-step confirm-step"
+                :class="step.approval.status"
+              >
+                <div class="confirm-head">
+                  <i class="bi bi-shield-exclamation"></i>
+                  <span class="confirm-title">{{ t('ai.confirmTitle') }}</span>
+                  <span class="confirm-code">{{ step.approval.code }}</span>
+                </div>
+                <code class="confirm-cmd">{{ step.approval.command }}</code>
+                <div class="confirm-hint">
+                  <template v-if="step.approval.status === 'pending'">
+                    {{ step.approval.scope === 'hosts' ? t('ai.confirmHostsHint') : t('ai.confirmHint') }}
+                  </template>
+                  <template v-else-if="step.approval.status === 'approving'">{{ t('ai.confirmApproving') }}</template>
+                  <template v-else-if="step.approval.status === 'approved'">{{ t('ai.confirmApproved') }}</template>
+                  <template v-else-if="step.approval.status === 'expired'">{{ t('ai.confirmExpired') }}</template>
+                  <template v-else>{{ t('ai.confirmDenied') }}</template>
+                </div>
+                <div v-if="step.approval.status === 'pending'" class="confirm-actions">
+                  <button class="confirm-btn run" @click="approveStep(step)">
+                    <i class="bi bi-shield-check"></i>{{ t('ai.confirmRun') }}
+                  </button>
+                  <button class="confirm-btn dismiss" @click="dismissStep(step)">
+                    <i class="bi bi-x-lg"></i>{{ t('ai.confirmDismiss') }}
+                  </button>
+                </div>
+              </div>
             </template>
           </div>
 
@@ -468,14 +499,43 @@ interface SkillItem {
   source: 'system' | 'user';
 }
 
+// 中风险命令确认卡片的状态机
+// pending（等人点）→ approving（已发请求，等后端）→ approved（已拿到 token）/ denied / expired
+type ApprovalStatus = 'pending' | 'approving' | 'approved' | 'denied' | 'expired';
+
+/**
+ * 确认卡片的数据。
+ *
+ * 完全由后端的 confirm_required / confirm_approved / confirm_denied 驱动：
+ * 前端不判断命令危险不危险，也不自己生成 token —— 只负责把「有人点了确认」
+ * 这个事实告诉后端，再把拿到的一次性 token 随下一轮带回去。
+ */
+interface ApprovalState {
+  id: string;
+  command: string;
+  /** 命中的规则代号（rm-recursive / service-stop…） */
+  code: string;
+  /** terminal = 就在当前终端跑；hosts = 会在多台目标机上跑 */
+  scope: 'terminal' | 'hosts';
+  /** 过期时间（毫秒时间戳） */
+  expiresAt: number;
+  status: ApprovalStatus;
+  /** 批准后下发的一次性 token，只在本轮续跑时随请求带走 */
+  token?: string;
+  /** 后端拒绝的原因（已过期 / 不属于本对话） */
+  error?: string;
+}
+
 // Agent 步骤接口
 interface AgentStep {
-  type: 'thinking' | 'tool_call' | 'tool_result' | 'message';
+  type: 'thinking' | 'tool_call' | 'tool_result' | 'message' | 'confirm';
   tool?: string;
   args?: any;
   result?: string;
   content?: string;
   collapsed?: boolean;
+  /** type=confirm 时的卡片数据 */
+  approval?: ApprovalState;
 }
 
 interface ChatMessage {
@@ -508,6 +568,8 @@ interface QueuedMessage {
   text: string;
   skillId?: string;
   skillName?: string;
+  /** 用户点过确认后的一次性凭据：只传给紧接着的那一轮 */
+  approvalToken?: string;
 }
 
 const activeTab = ref<'chat' | 'audit' | 'monitor'>('chat');
@@ -640,6 +702,71 @@ function ensureAssistantMessage(): number {
   return currentAssistantIdx;
 }
 
+/** 在所有消息里找一张确认卡片：批准 / 拒绝事件回来时按 id 定位它 */
+function findApprovalStep(id?: string): { step: AgentStep; msg: ChatMessage } | null {
+  if (!id) return null;
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    const msg = messages.value[i];
+    const step = msg.agentSteps?.find(s => s.type === 'confirm' && s.approval?.id === id);
+    if (step) return { step, msg };
+  }
+  return null;
+}
+
+/**
+ * 卡片该挂在哪条消息上：优先当前这轮；本轮已收尾就挂到最后一条助手消息。
+ * 不能直接用 ensureAssistantMessage() 了事 —— 那样每张卡片都会另起一条空消息。
+ */
+function stepHostIndex(): number {
+  if (currentAssistantIdx >= 0 && currentAssistantIdx < messages.value.length) return currentAssistantIdx;
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    if (messages.value[i].role === 'assistant') return i;
+  }
+  return ensureAssistantMessage();
+}
+
+/**
+ * 批准后的续跑：token 只在紧接着的一轮有效，所以必须由前端再发一轮。
+ * 指令里把命令原文带上 —— 工具侧按「原文归一化后全等」校验 token，
+ * 模型自己改写一个字都换不回来。
+ */
+function queueApprovedResume(approval: ApprovalState) {
+  const item: QueuedMessage = {
+    id: newQueueId(),
+    text: t(approval.scope === 'hosts' ? 'ai.confirmResumeHosts' : 'ai.confirmResume', { command: approval.command }),
+    approvalToken: approval.token,
+  };
+  // 走队列而不是直接跑：用户可能刚发了一条排队指令，续跑不能插到它前面
+  messageQueue.value.push(item);
+  drainQueue();
+}
+
+/** 用户点了确认：请后端把这张卡片换成一次性 token（真正放行在下一轮的工具调用里） */
+function approveStep(step: AgentStep) {
+  const approval = step.approval;
+  if (!approval || approval.status !== 'pending') return;
+  if (approval.expiresAt <= Date.now()) {
+    approval.status = 'expired';
+    return;
+  }
+  approval.status = 'approving';
+  emit('ws-send', {
+    type: 'ai-agent-confirm',
+    data: {
+      aiSessionId: props.sessionId,
+      chatId: currentChatId.value || undefined,
+      approvalId: approval.id,
+    },
+  });
+}
+
+/** 不执行：只是把卡片收起来，后端那条待确认 5 分钟后自己过期 */
+function dismissStep(step: AgentStep) {
+  const approval = step.approval;
+  if (!approval || approval.status !== 'pending') return;
+  approval.status = 'denied';
+}
+
 // 处理 Agent 事件（由父组件调用）
 function handleAgentEvent(event: any) {
   // system_info 作为独立消息展示，不进入 assistant 消息流
@@ -657,6 +784,62 @@ function handleAgentEvent(event: any) {
   // 停止确认：兜底定时器可能已经收尾并开始了下一轮，迟到的 stopped 不能再动当前消息
   if (event.type === 'stopped') {
     if (runToken === stoppingToken) finalizeStoppedMessage();
+    return;
+  }
+
+  // 中风险命令的确认：卡片挂在「发起它的那条消息」上，不属于当前这轮，
+  // 所以这三类事件都在 ensureAssistantMessage 之前处理 —— 否则用户点确认时
+  // 本轮往往已经结束（currentAssistantIdx = -1），卡片会被挂到一条新建的空消息上
+  if (event.type === 'confirm_required' && event.approval) {
+    const incoming = event.approval as { id: string; command: string; code: string; scope?: string; expiresAt: number };
+    // 同一请求复用同一个 id（后端就是这么做的）：模型重发同一条命令不该冒出第二张卡片
+    if (!findApprovalStep(incoming.id)) {
+      const host = messages.value[stepHostIndex()];
+      if (!host.agentSteps) host.agentSteps = [];
+      host.agentSteps.push({
+        type: 'confirm',
+        approval: {
+          id: incoming.id,
+          command: incoming.command,
+          code: incoming.code,
+          scope: incoming.scope === 'hosts' ? 'hosts' : 'terminal',
+          expiresAt: incoming.expiresAt,
+          status: 'pending',
+        },
+      });
+    }
+    scrollToBottom();
+    return;
+  }
+
+  if (event.type === 'confirm_approved') {
+    const found = findApprovalStep(event.approval?.id);
+    if (!found) { scrollToBottom(); return; }
+    const approval = found.step.approval!;
+    // 重复投递不能续跑两轮：一条待确认只会换出一个 token
+    if (approval.status === 'approved' || approval.status === 'approving' || approval.status === 'denied') return;
+    if (event.approval?.token) {
+      approval.status = 'approved';
+      approval.token = event.approval.token;
+      queueApprovedResume(approval);
+    } else {
+      approval.status = 'denied';
+      approval.error = event.error;
+    }
+    scrollToBottom();
+    return;
+  }
+
+  if (event.type === 'confirm_denied') {
+    const found = findApprovalStep(event.approval?.id);
+    if (!found) { scrollToBottom(); return; }
+    const approval = found.step.approval!;
+    // 已经点过「不执行」的卡片不用再被后端消息改写
+    if (approval.status === 'denied') return;
+    approval.status = event.code === 'expired' ? 'expired' : 'denied';
+    approval.error = event.error;
+    approval.token = undefined;
+    scrollToBottom();
     return;
   }
 
@@ -925,7 +1108,7 @@ function parseInput(text: string, fallback: SkillItem | null): { message: string
 }
 
 /** 真正发一轮：直接发送与队列取队首都走这里，保证顺序与消息落地方式一致 */
-function sendNow(message: string, skill: SkillItem | null) {
+function sendNow(message: string, skill: SkillItem | null, approvalToken?: string) {
   messages.value.push({
     role: 'user',
     content: message,
@@ -933,7 +1116,7 @@ function sendNow(message: string, skill: SkillItem | null) {
     skillId: skill?.id,
   });
   scrollToBottom();
-  void runAgent(message, skill);
+  void runAgent(message, skill, approvalToken);
 }
 
 /** 上一轮结束后取队首继续：这就是「排队等前一条跑完自动接着干」 */
@@ -941,7 +1124,7 @@ function drainQueue() {
   if (isAgentRunning.value || messageQueue.value.length === 0) return;
   const next = messageQueue.value.shift();
   if (!next) return;
-  sendNow(next.text, resolveSkillById(next.skillId));
+  sendNow(next.text, resolveSkillById(next.skillId), next.approvalToken);
 }
 
 /** 把一条排队指令提到输入框里改；发送时按原位置放回队列，取消时也一样 */
@@ -1026,8 +1209,8 @@ function handleSend() {
   sendNow(item.text, parsed.skill);
 }
 
-/** 启动 Agent 执行（handleSend 与失败重试共用） */
-async function runAgent(message: string, skill?: SkillItem | null) {
+/** 启动 Agent 执行（handleSend、失败重试与确认后继续共用） */
+async function runAgent(message: string, skill?: SkillItem | null, approvalToken?: string) {
   const context = props.getTerminalContext?.() || '';
 
   // 每轮换一个 token：迟到的 stopped / 停止兜底定时器靠它判断「还是不是这一轮」
@@ -1060,6 +1243,8 @@ async function runAgent(message: string, skill?: SkillItem | null) {
       context: context.substring(-3000),
       skillId: skill?.id,
       locale: locale.value,
+      // 用户刚点过确认的一次性凭据：只在这一轮有效，工具侧按命令原文比对后作废
+      approvalTokens: approvalToken ? [approvalToken] : undefined,
     },
   });
 }
@@ -2111,6 +2296,88 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
   white-space: pre-wrap;
   word-break: break-all;
 }
+
+/* 中风险命令确认卡片：它挡住的是一次真正的破坏性操作，不能长得像普通步骤 */
+.confirm-step {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid rgb(var(--warning-rgb) / 35%);
+  background: rgb(var(--warning-rgb) / 8%);
+}
+.confirm-step.approved {
+  border-color: rgb(var(--success-rgb) / 35%);
+  background: rgb(var(--success-rgb) / 8%);
+}
+.confirm-step.denied,
+.confirm-step.expired {
+  border-color: rgb(var(--overlay-rgb) / 12%);
+  background: var(--bg-recess-soft);
+}
+
+.confirm-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--warning);
+}
+.confirm-step.approved .confirm-head { color: var(--success); }
+.confirm-step.denied .confirm-head,
+.confirm-step.expired .confirm-head { color: var(--text-secondary); }
+.confirm-head .bi { font-size: 12px; }
+.confirm-title { font-weight: 600; }
+.confirm-code {
+  margin-left: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
+.confirm-cmd {
+  display: block;
+  padding: 5px 7px;
+  border-radius: 3px;
+  background: rgb(var(--bg-input-rgb) / 60%);
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 96px;
+  overflow-y: auto;
+}
+
+.confirm-hint {
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.confirm-actions { display: flex; gap: 6px; }
+.confirm-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.confirm-btn.run {
+  background: var(--warning);
+  color: #1a1a1a;
+}
+.confirm-btn.run:hover { filter: brightness(1.08); }
+.confirm-btn.dismiss {
+  background: none;
+  border-color: rgb(var(--overlay-rgb) / 18%);
+  color: var(--text-secondary);
+}
+.confirm-btn.dismiss:hover { color: var(--text-primary); }
 
 .ai-loading {
   display: flex;

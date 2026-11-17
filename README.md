@@ -465,6 +465,13 @@ The agent has real shell access, so the command layer intercepts before executio
   collides, and recovery is a plain file move back.
 - **Hard blocks.** Irreversible operations are refused: `rm -rf /`, `mkfs.*`, `dd of=/dev/sd*`,
   fork bombs; on Windows `format C:`, `Clear-Disk`, `Remove-Item C:\`, `rd /s C:\`.
+- **Human confirmation for medium-risk commands.** Recursive deletes, service stops, config edits,
+  reboots, package removal and the like sit in a middle tier: the agent's tools do not run them, they
+  return `NEEDS_CONFIRM` and push a card into the chat with the exact command — *Run it* / *Do not
+  run*. Approving exchanges the card for a single-use, five-minute token bound to that account, that
+  chat, that command text and that execution scope, so an approval given for one terminal never
+  covers the same command fanned out by `run_on_hosts`. Requests are held in memory only: restarting
+  the server invalidates every outstanding card, deliberately.
 - **Platform-aware rules.** Which rule set applies comes from the detected OS family of the *target*
   session, not from where the server happens to run.
 - **Audit everything.** Blocked and rewritten commands are recorded too — the trail shows what the

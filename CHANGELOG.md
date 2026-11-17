@@ -122,6 +122,24 @@ supported build, and record the commit you run.
   a daemon, and unrecognized flags are passed through. Documented in
   [docs/deployment.md](docs/deployment.md#one-command) /
   [docs/deployment.zh.md](docs/deployment.zh.md#一条命令).
+- **Medium-risk commands are held for a human decision instead of being only allowed or refused.** The
+  command gate used to answer yes/no — `rm -rf /var/log/nginx` ran straight away while `rm -rf /` was
+  rejected. It now classifies every command as `safe`, `confirm` or `blocked` and reports which rule
+  matched. `confirm` is the new middle tier: the tool executes nothing, returns `NEEDS_CONFIRM` to the
+  model and pushes a card into the chat carrying the rule code and the exact command, with *Run it* /
+  *Do not run*. Clicking *Run it* trades the request for a single-use token (`ai-agent-confirm`) that
+  the next turn carries back; the tool compares owner, chat, command text and execution scope before
+  writing a byte, then burns the token. `blocked` (`rm -rf /`, `mkfs`, `dd of=/dev/sda`, writes to a
+  raw device, `curl | bash`, fork bombs) never offers a card — those still have to be typed in a
+  terminal by hand. **Boundary:** requests live in memory with a 5-minute TTL and die with the process,
+  so a restart invalidates every outstanding card — intended, not a defect; the token is per command,
+  per chat *and* per scope, so approving on one terminal never authorises the same command across
+  `run_on_hosts` targets, and a token approved for two hosts is refused once the target list grows;
+  cards are display state and are not restored after a page reload (the request still expires on its
+  own); `sudo` prefixes are stripped before matching so `sudo rm -rf ...` cannot slip past; the gate reads
+  command text and is not a sandbox (`bash -c "$(cat script)"` is outside what it can see); the legacy
+  `safe` field keeps its old meaning for the batch panel (`confirm` counts as `safe` there, because a
+  human clicking Execute *is* the confirmation), so `batch.service` needed no change.
 
 ### Changed
 

@@ -5,6 +5,7 @@ import { getDataPath } from '../utils/data-dir';
 import { AuditService } from './audit.service';
 import type { AuditEntry } from './audit.service';
 import { assessDangerousCommand } from '../utils/shell';
+import type { CommandRiskLevel } from '../utils/shell';
 import { assertReadablePath } from '../utils/security';
 import {
   AgentEngine, ToolRegistry, ContextManager, SecurityGuard,
@@ -109,6 +110,14 @@ export interface AgentRunOptions {
    * 不传 = 一个都没有（fail closed）：宁可少一个工具，也不默认放行。
    */
   permissions?: Record<string, boolean>;
+  /**
+   * 用户刚批准的审批 token（来自 ai-agent-confirm）。
+   *
+   * 单向、一次性：只在「点确认之后的那一轮」有效，工具侧按 ownerId + chatId + 命令原文
+   * 比对后立即作废。token 由服务端下发、由服务端校验，模型既看不到也用不上 ——
+   * 它只是重发同一条命令，闸门在服务端。
+   */
+  approvalTokens?: string[];
 }
 
 function bySortOrder(a: AIProfile, b: AIProfile): number {
@@ -135,7 +144,55 @@ export type AgentEventType =
   | 'thinking' | 'message' | 'tool_call' | 'tool_result' | 'audit_entry' | 'done' | 'error' | 'system_info'
   | 'model_selected'
   // 用户主动中止：和 done 一样是「本轮结束」，但内容不完整，前端要单独标出来
-  | 'stopped';
+  | 'stopped'
+  // 中风险命令停下来等人：前端据此渲染确认卡片（不是错误，也不是结束）
+  | 'confirm_required';
+
+/**
+ * 命令将在哪里执行。
+ *
+ * 必须与 token 一起绑定：用户批准「在这个终端跑一条 rm -rf」不等于批准
+ * 「在十台机器上跑同一条」，两条路径共用同一个命令文本，只有 scope 能区分。
+ */
+export type ApprovalScope = 'terminal' | 'hosts';
+
+/**
+ * 中风险命令的确认请求。
+ *
+ * id 是给前端的一次性凭据：只能让「这一条命令」在「这个账号的这一个对话」里放行，
+ * 5 分钟不用就作废。不落库 —— 重启即失效是安全特性，不是缺陷。
+ */
+export interface ApprovalRequest {
+  id: string;
+  command: string;
+  /** 命中的规则代号（rm-recursive 等）：前端按它显示说明，不解析英文 reason */
+  code: string;
+  /** 批准后命令会在哪里跑：前端据此选续跑指令文案 */
+  scope: ApprovalScope;
+  /** 过期时间（毫秒时间戳） */
+  expiresAt: number;
+}
+
+/** 待确认的命令：只放内存，进程重启即失效 */
+interface PendingApproval extends ApprovalRequest {
+  ownerId: string;
+  chatId: string;
+  sessionId: string;
+  /** 目标范围指纹（终端会话 id / 目标连接清单）：换了目标就要重新确认 */
+  targetKey: string;
+  createdAt: number;
+}
+
+/** 已批准的一次性令牌 */
+interface ApprovalTokenRecord {
+  ownerId: string;
+  chatId: string;
+  command: string;
+  scope: ApprovalScope;
+  targetKey: string;
+  expiresAt: number;
+  used: boolean;
+}
 
 /** Agent 事件（应用层简化格式） */
 export interface AgentEvent {
@@ -155,6 +212,8 @@ export interface AgentEvent {
   route?: { target: string; tier: number; score: number; reasons: string[] };
   /** 错误码：前端按它本地化提示（如预算超限具体是哪一项） */
   code?: string;
+  /** 确认请求（confirm_required 事件携带） */
+  approval?: ApprovalRequest;
 }
 
 export type AgentEventCallback = (event: AgentEvent) => void;
@@ -329,6 +388,76 @@ function liveSessionRequiredMsg(tool: string): string {
     + 'Do NOT report this as the host being down or unreachable.';
 }
 
+// ========== 中风险命令的确认通道 ==========
+
+/** agentRun 每轮通过 context.custom 带进来的「已批准 token」 */
+const APPROVAL_TOKENS_KEY = 'approvalTokens';
+
+/** agentRun 每轮通过 context.custom 带进来的「需要确认时通知前端」的回调 */
+const CONFIRM_SINK_KEY = 'confirmSink';
+
+function approvalTokensOf(ctx: ToolContext): string[] {
+  const value = ctx.custom?.[APPROVAL_TOKENS_KEY];
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function confirmSinkOf(ctx: ToolContext): ((request: ApprovalRequest) => void) | undefined {
+  const value = ctx.custom?.[CONFIRM_SINK_KEY];
+  return typeof value === 'function' ? value as (request: ApprovalRequest) => void : undefined;
+}
+
+/**
+ * 工具执行时关于「这一条命令批没批」的全部上下文。
+ *
+ * ownerId / chatId 决定 token 能不能用（不然拿别人的 token 就能给任意命令开绿灯），
+ * onConfirmRequired 把「需要确认」这件事实时告诉前端，不等这一轮结束。
+ */
+interface ApprovalContext {
+  ownerId: string;
+  chatId: string;
+  tokens: string[];
+  onConfirmRequired?: (request: ApprovalRequest) => void;
+}
+
+function approvalContextOf(ctx: ToolContext): ApprovalContext {
+  return {
+    ownerId: ownerIdOf(ctx),
+    chatId: ctx.sessionId || '',
+    tokens: approvalTokensOf(ctx),
+    onConfirmRequired: confirmSinkOf(ctx),
+  };
+}
+
+/** 命令检查结果：`safe` 保留是为了与旧调用点兼容，判断放不放行必须看 `level` */
+interface CommandCheck {
+  safe: boolean;
+  level: CommandRiskLevel;
+  code?: string;
+  rewritten?: string;
+  reason?: string;
+}
+
+/** 命令比较的归一化：空白差异不应该让已经批准的命令重新弹卡片 */
+function normalizeCommand(command: string): string {
+  return String(command || '').trim().replace(/\s+/g, ' ');
+}
+
+/**
+ * Need-confirmation 回给模型的文案。
+ *
+ * 必须写死「不要再调一次」：模型把 NEEDS_CONFIRM 当成可重试的错误时，
+ * 会在同一轮里反复重发同一条命令，而每次都只会再出一张卡片 ——
+ * 用户看到的是满屏卡片，模型看到的是「怎么都不成功」。
+ */
+function needsConfirmMsg(command: string, code: string, request: ApprovalRequest, note = ''): string {
+  return `NEEDS_CONFIRM: "${oneLine(command, 120)}" matched the medium-risk rule "${code}" and needs the `
+    + `user's confirmation before it can run. A confirmation card is now shown in the chat (id=${request.id}, `
+    + 'valid for 5 minutes). Do NOT call execute_command / run_on_hosts again with this command in this turn: '
+    + 'retrying produces the same card and wastes a round. Tell the user in one sentence that the command is '
+    + 'waiting for confirmation, then stop.'
+    + (note ? ` ${note}` : '');
+}
+
 // ========== Agent System Prompt ==========
 
 const AGENT_SYSTEM_PROMPT = `You are a powerful AI terminal Agent that can directly operate the user's terminal Shell.
@@ -348,7 +477,7 @@ Your capabilities:
 Working principles:
 1. **Take action**: When the user asks you to do something, use tools to execute directly, don't just suggest commands
 2. **Verify results**: After executing a command, check the output to confirm success
-3. **Safety first**: rm commands automatically move files to a recycle bin (~/.aetherops/.trash/) instead of permanent deletion; extremely destructive operations will be blocked. For other dangerous operations (format, overwrite disk, etc.), explain the risk in content first and let the user confirm before executing
+3. **Safety first**: rm commands automatically move files to a recycle bin (~/.aetherops/.trash/) instead of permanent deletion; extremely destructive operations will be blocked. Medium-risk commands (recursive delete, service stop, config edits, reboot...) are gated: the tool returns NEEDS_CONFIRM and a card appears for the user. When that happens, say one sentence that you are waiting for confirmation and stop - do NOT retry the same command in that turn, retrying only produces another card. After the user confirms, the command may be re-proposed once.
 4. **Step-by-step**: Complete complex tasks step by step, checking results after each step
 5. **Error handling**: If a command fails, analyze the cause and try to fix it or use an alternative
 6. **Past vs now**: top / df / free only show this instant. For anything about trends, peaks, or "what happened earlier" (e.g. "why was it slow at 3am"), call query_metrics instead of extrapolating from a single snapshot
@@ -435,6 +564,15 @@ export class AIService {
   /** key 是 `ownerId:chatId`：chatId 由前端传，不能假定跨账号唯一，
    *  否则拿到别人的 chatId 就能中止对方的 Agent。 */
   private abortControllers = new Map<string, AbortController>();
+  /**
+   * 等人类确认的中风险命令（id -> 请求）。
+   * 只放内存：进程重启就意味着「上一次那些请求早该失效了」。
+   */
+  private pendingApprovals = new Map<string, PendingApproval>();
+  /** 已批准的一次性令牌（token -> 记录），用过即废 */
+  private issuedApprovalTokens = new Map<string, ApprovalTokenRecord>();
+  /** 确认请求的有效期：超过它，卡片点了也不认 */
+  private readonly APPROVAL_TTL_MS = 5 * 60 * 1000;
 
   // ---- 状态 ----
   private loadedSessions = new Set<string>();
@@ -953,7 +1091,12 @@ export class AIService {
       },
       executor: async (args: Record<string, unknown>, ctx: ToolContext) => {
         // 会话在不在由 executeCommand 开头的 terminalGuard 统一判，两条工具路不用各写一份
-        return this.executeCommand(args.command as string, terminalSessionOf(ctx), (args.timeout as number) || 2000);
+        return this.executeCommand(
+          args.command as string,
+          terminalSessionOf(ctx),
+          (args.timeout as number) || 2000,
+          approvalContextOf(ctx),
+        );
       },
       category: 'builtin',
     });
@@ -1159,7 +1302,13 @@ export class AIService {
         },
       },
       executor: async (args: Record<string, unknown>, ctx: ToolContext) => {
-        return this.runOnHosts(ownerIdOf(ctx), terminalSessionOf(ctx), permissionsOf(ctx), args);
+        return this.runOnHosts(
+          ownerIdOf(ctx),
+          terminalSessionOf(ctx),
+          permissionsOf(ctx),
+          args,
+          approvalContextOf(ctx),
+        );
       },
       category: 'builtin',
     });
@@ -1175,22 +1324,26 @@ export class AIService {
     } catch { return false; }
   }
 
-  private async sanitizeCommand(command: string, sessionId: string): Promise<{ safe: boolean; rewritten?: string; reason?: string }> {
+  private async sanitizeCommand(command: string, sessionId: string): Promise<CommandCheck> {
     const trimmed = command.trim();
     const risk = assessDangerousCommand(trimmed);
-    if (!risk.safe) return risk;
+    if (risk.level !== 'safe') {
+      return { safe: risk.safe, level: risk.level, code: risk.code, reason: risk.reason };
+    }
     const isWin = await this.isWindowsSession(sessionId);
-    return isWin ? this.sanitizeWindowsCommand(trimmed) : { safe: true };
+    return isWin ? this.sanitizeWindowsCommand(trimmed) : { safe: true, level: 'safe' };
   }
 
-  private sanitizeWindowsCommand(trimmed: string): { safe: boolean; rewritten?: string; reason?: string } {
+  private sanitizeWindowsCommand(trimmed: string): CommandCheck {
     const blocked = [
       /format\s+[a-z]:/i, /clear-disk/i,
       /remove-item\s+.*[a-z]:\s*$/i, /remove-item\s+.*-recurse.*[a-z]:\s*$/i,
       /rd\s+\/s\s+[a-z]:\s*$/i,
     ];
     for (const pattern of blocked) {
-      if (pattern.test(trimmed)) return { safe: false, reason: 'BLOCKED: Extremely dangerous destructive operation' };
+      if (pattern.test(trimmed)) {
+        return { safe: false, level: 'blocked', code: 'windows-destructive', reason: 'BLOCKED: Extremely dangerous destructive operation' };
+      }
     }
     const removePatterns = [/^(Remove-Item|ri|del|rd)\s+(.+)$/i];
     for (const pattern of removePatterns) {
@@ -1205,11 +1358,153 @@ export class AIService {
         const ts = Date.now();
         return {
           safe: true,
+          level: 'safe',
           rewritten: `New-Item -ItemType Directory -Force -Path "${trashDir}" | Out-Null; Move-Item -Path ${targets} -Destination "${trashDir}\\_del_${ts}" -Force`,
         };
       }
     }
-    return { safe: true };
+    return { safe: true, level: 'safe' };
+  }
+
+  // ========== 中风险命令的人类确认 ==========
+
+  /** 过期的待确认与令牌自己收敛：不靠定时器，也就不会忘了关 */
+  private pruneApprovals(now = Date.now()): void {
+    for (const [id, pending] of this.pendingApprovals) {
+      if (pending.expiresAt <= now) this.pendingApprovals.delete(id);
+    }
+    for (const [token, record] of this.issuedApprovalTokens) {
+      if (record.used || record.expiresAt <= now) this.issuedApprovalTokens.delete(token);
+    }
+  }
+
+  /**
+   * 登记一条待确认命令。
+   *
+   * 同账号、同对话、同命令且未过期时复用旧 id：模型在同一轮里重发同一条命令、
+   * 或者用户没看到卡片就又问了一句，不应该在界面上堆出第二张、第三张同样的卡片。
+   * scope / targetKey 也参与比对：同一个命令换个执行范围是另一件事，必须重新确认。
+   */
+  requestApproval(
+    ownerId: string,
+    chatId: string,
+    sessionId: string,
+    command: string,
+    code: string,
+    scope: ApprovalScope = 'terminal',
+    targetKey = '',
+  ): ApprovalRequest {
+    const now = Date.now();
+    this.pruneApprovals(now);
+    const normalized = normalizeCommand(command);
+    for (const pending of this.pendingApprovals.values()) {
+      if (pending.ownerId === ownerId && pending.chatId === chatId
+        && pending.scope === scope && pending.targetKey === targetKey
+        && normalizeCommand(pending.command) === normalized) {
+        return this.publicApproval(pending);
+      }
+    }
+    const request: PendingApproval = {
+      id: crypto.randomBytes(9).toString('hex'),
+      command,
+      code,
+      scope,
+      targetKey,
+      ownerId,
+      chatId,
+      sessionId,
+      createdAt: now,
+      expiresAt: now + this.APPROVAL_TTL_MS,
+    };
+    this.pendingApprovals.set(request.id, request);
+    console.log(`[AIService] 命令待确认: id=${request.id} code=${code} scope=${scope} owner=${ownerId} chat=${chatId}`);
+    return this.publicApproval(request);
+  }
+
+  /**
+   * 用户点了确认：把待确认请求换成一次性令牌。
+   *
+   * 归属与对话都要对得上，否则知道 approvalId 就能让别人的命令放行；
+   * 这两项都不能从请求参数里信任，必须与登记时的记录比对。
+   */
+  approveCommand(ownerId: string, chatId: string, approvalId: string): {
+    ok: boolean;
+    token?: string;
+    approval?: ApprovalRequest;
+    error?: string;
+    code?: 'not_found' | 'forbidden' | 'expired';
+  } {
+    const now = Date.now();
+    this.pruneApprovals(now);
+    const pending = this.pendingApprovals.get(String(approvalId || ''));
+    if (!pending) {
+      return { ok: false, code: 'not_found', error: 'This confirmation is unknown, already used or expired.' };
+    }
+    if (pending.ownerId !== ownerId || pending.chatId !== chatId) {
+      return { ok: false, code: 'forbidden', error: 'This confirmation belongs to another account or conversation.' };
+    }
+    if (pending.expiresAt <= now) {
+      this.pendingApprovals.delete(pending.id);
+      return {
+        ok: false,
+        code: 'expired',
+        error: 'This confirmation has expired; ask the agent to propose the command again.',
+        approval: this.publicApproval(pending),
+      };
+    }
+    const token = crypto.randomBytes(16).toString('hex');
+    this.issuedApprovalTokens.set(token, {
+      ownerId,
+      chatId,
+      command: normalizeCommand(pending.command),
+      scope: pending.scope,
+      targetKey: pending.targetKey,
+      expiresAt: pending.expiresAt,
+      used: false,
+    });
+    this.pendingApprovals.delete(pending.id);
+    console.log(`[AIService] 命令已确认: id=${pending.id} code=${pending.code} owner=${ownerId}`);
+    return { ok: true, token, approval: this.publicApproval(pending) };
+  }
+
+  /**
+   * 校验并消耗令牌。
+   *
+   * 除了账号与对话，还必须比对命令原文与执行范围：「一次性」只防重复执行，
+   * 不防拿到一个批准过的 token 后改跑另一条命令，或者从「这个终端」搬去「十台主机」。
+   */
+  private consumeApprovalToken(
+    ownerId: string,
+    chatId: string,
+    command: string,
+    tokens: string[],
+    scope: ApprovalScope = 'terminal',
+    targetKey = '',
+  ): boolean {
+    if (!tokens.length) return false;
+    this.pruneApprovals();
+    const target = normalizeCommand(command);
+    for (const token of tokens) {
+      const record = this.issuedApprovalTokens.get(token);
+      if (!record || record.used) continue;
+      if (record.ownerId !== ownerId || record.chatId !== chatId) continue;
+      if (record.command !== target) continue;
+      if (record.scope !== scope || record.targetKey !== targetKey) continue;
+      record.used = true;
+      this.issuedApprovalTokens.delete(token);
+      return true;
+    }
+    return false;
+  }
+
+  private publicApproval(pending: PendingApproval): ApprovalRequest {
+    return {
+      id: pending.id,
+      command: pending.command,
+      code: pending.code,
+      scope: pending.scope,
+      expiresAt: pending.expiresAt,
+    };
   }
 
   // ========== 工具执行 ==========
@@ -1228,7 +1523,12 @@ export class AIService {
     return this.sshService.getSession(sessionId) ? null : unknownTerminalMsg(sessionId);
   }
 
-  private async executeCommand(command: string, sessionId: string, timeout: number): Promise<string> {
+  private async executeCommand(
+    command: string,
+    sessionId: string,
+    timeout: number,
+    approval?: ApprovalContext,
+  ): Promise<string> {
     const blocked = this.terminalGuard(sessionId);
     if (blocked) return blocked;
     // guard 已经确认过会话存在，这里的判空只是给 TS 看
@@ -1236,7 +1536,27 @@ export class AIService {
     if (!session) return unknownTerminalMsg(sessionId);
 
     const check = await this.sanitizeCommand(command, sessionId);
-    if (!check.safe) return check.reason!;
+    if (check.level === 'blocked') return check.reason!;
+    if (check.level === 'confirm') {
+      // 中风险：没人点过确认就不跑。这里是整个闸门唯一放行点 ——
+      // 不管模型怎么表述、换什么参数，只要没有对应的 token 就只能拿到一张卡片
+      const approved = !!approval
+        && this.consumeApprovalToken(approval.ownerId, approval.chatId, command, approval.tokens, 'terminal', sessionId);
+      if (!approved) {
+        const request = this.requestApproval(
+          approval?.ownerId || '',
+          approval?.chatId || '',
+          sessionId,
+          command,
+          check.code || 'confirm',
+          'terminal',
+          sessionId,
+        );
+        approval?.onConfirmRequired?.(request);
+        return needsConfirmMsg(command, check.code || 'confirm', request);
+      }
+      console.log(`[AIService] Safety: user confirmed "${oneLine(command, 120)}"`);
+    }
     const actualCommand = check.rewritten || command;
     if (check.rewritten) console.log(`[AIService] Safety: rewrote "${command}" -> "${actualCommand}"`);
 
@@ -1559,6 +1879,7 @@ export class AIService {
     currentSessionId: string,
     permissions: Record<string, boolean>,
     args: Record<string, unknown>,
+    approval?: ApprovalContext,
   ): Promise<string> {
     if (!allows(permissions, 'batch')) return permissionDeniedMsg('run_on_hosts', 'batch');
     if (!this.batch || !this.sshService) return 'BATCH_UNAVAILABLE: batch execution is not enabled in this deployment.';
@@ -1569,7 +1890,7 @@ export class AIService {
 
     // 先在高危判定上失败：批量放大器不放行单终端可能还得解释风险的命令
     const risk = assessDangerousCommand(command);
-    if (!risk.safe) {
+    if (risk.level === 'blocked') {
       return `BLOCKED: ${risk.reason || 'high-risk command'}. run_on_hosts would repeat it on every targeted host, `
         + 'so it is refused here even when the same command is allowed in a single terminal.';
     }
@@ -1627,6 +1948,34 @@ export class AIService {
     if (!targets.length) {
       return `No target has an open session: ${unreachable.join(', ') || '(none matched)'}. `
         + 'run_on_hosts never opens a connection; call list_connections to see which hosts have one.';
+    }
+
+    // 中风险走与 execute_command 同一道门：不在这里再拦一刀，否则模型会改去单终端绕开。
+    // 要在目标集合定下来之后才要确认：token 绑在这份清单上，
+    // 批准了这 2 台就不能拿去跑 all_open 的 50 台。
+    const targetKey = targets.map((target) => target.connectionId || target.sessionId).sort().join(',');
+    if (risk.level === 'confirm') {
+      const approved = !!approval
+        && this.consumeApprovalToken(approval.ownerId, approval.chatId, command, approval.tokens, 'hosts', targetKey);
+      if (!approved) {
+        const request = this.requestApproval(
+          approval?.ownerId || '',
+          approval?.chatId || '',
+          currentSessionId,
+          command,
+          risk.code || 'confirm',
+          'hosts',
+          targetKey,
+        );
+        approval?.onConfirmRequired?.(request);
+        return needsConfirmMsg(
+          command,
+          risk.code || 'confirm',
+          request,
+          'Approving it runs the command on EVERY targeted host, not just the current terminal.',
+        );
+      }
+      console.log(`[AIService] Safety: user confirmed batch "${oneLine(command, 120)}"`);
     }
 
     const CHUNK_SIZE = 2;
@@ -1710,10 +2059,10 @@ export class AIService {
    * 若不注入则落到 noop shell（不报错但捕不到任何输出）。这里接到本服务的 sshService，
    * 使无论引擎使用 AetherOps 自有工具还是 agent-core 内置工具，都能正确执行命令与读取终端。
    */
-  private buildShellExecutor(sessionId: string) {
+  private buildShellExecutor(sessionId: string, approval?: ApprovalContext) {
     return {
       exec: async (command: string, timeoutMs?: number) =>
-        this.executeCommand(command, sessionId, timeoutMs || 2000),
+        this.executeCommand(command, sessionId, timeoutMs || 2000, approval),
       // 没绑终端时直接丢弃而不是空转：writeData 找不到会话本来也是静默返回，
       // 但那样模型会以为「已经敲下去了」，接着编造一段并不存在的输出
       write: (data: string) => {
@@ -1865,7 +2214,15 @@ export class AIService {
           // 注入 shell 执行器：新版 agent-core 的内置 execute_command/read_terminal 走
           // ctx.shell.exec/read，不注入则落到 noop shell（捕不到任何输出）。
           // terminalSessionId 必须一起放进 custom：ctx.sessionId 是对话 key，不是终端会话。
-          const shellExecutor = this.buildShellExecutor(terminalSessionId);
+          // 中风险命令的闸门：tokens 是用户刚点确认带来的（只有这一轮有效），
+          // sink 把「需要确认」实时推给前端，不用等这一轮结束
+          const approvalCtx: ApprovalContext = {
+            ownerId,
+            chatId,
+            tokens: opts?.approvalTokens || [],
+            onConfirmRequired: (request) => eventCallback({ type: 'confirm_required', approval: request }),
+          };
+          const shellExecutor = this.buildShellExecutor(terminalSessionId, approvalCtx);
           const runCustom = {
             shell: shellExecutor,
             [TERMINAL_SESSION_KEY]: terminalSessionId,
@@ -1874,6 +2231,9 @@ export class AIService {
             // 权限位也走 custom：list_connections / read_file / run_on_hosts 不是「能对话就能用」，
             // 由宿主把 wsUser.permissions 原样传进来，工具侧自己判（不传即全部拒绝）
             [PERMISSIONS_KEY]: opts?.permissions || {},
+            // 已批准的一次性 token + 需要确认时的回调
+            [APPROVAL_TOKENS_KEY]: approvalCtx.tokens,
+            [CONFIRM_SINK_KEY]: approvalCtx.onConfirmRequired,
           };
           const eventStream = engine.run({
             sessionId: chatId,

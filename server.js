@@ -563,7 +563,7 @@ wss.on('connection', async (ws, req) => {
           // 一轮 Agent 执行。
           // aiSessionId 是命令要跑在哪个终端；chatId 是这一轮属于哪个对话（存储 key）。
           // 老前端只传 aiSessionId 时退化为「对话 = 终端会话」，不影响可用性。
-          const { aiSessionId, chatId, message, context, skillId, locale, modelId } = data || {};
+          const { aiSessionId, chatId, message, context, skillId, locale, modelId, approvalTokens } = data || {};
           if (!wsUser.permissions || !wsUser.permissions.ai) {
             ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'error', error: 'Forbidden: missing permission' } }));
             break;
@@ -593,7 +593,12 @@ wss.on('connection', async (ws, req) => {
             }
             // permissions 一并下发：list_connections / read_file / run_on_hosts 不是「能对话就能用」，
             // 工具侧按同一份权限位自己判（不传就等于全拒，所以这里不能省）
-          }, { skillId, locale, modelId, permissions: wsUser.permissions || {} }).catch((err) => {
+          }, { skillId, locale, modelId, permissions: wsUser.permissions || {},
+            // 用户刚确认的中风险命令：一次性 token，只在紧接着的这一轮生效
+            approvalTokens: Array.isArray(approvalTokens)
+              ? approvalTokens.filter((token) => typeof token === 'string')
+              : [],
+          }).catch((err) => {
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(JSON.stringify({ type: 'ai-agent-event', sessionId: terminalSid, chatId: conversationId, event: { type: 'error', error: err.message } }));
             }
@@ -747,6 +752,39 @@ wss.on('connection', async (ws, req) => {
               aiService.stopAgent(ownerId, stopTarget);
               console.log(`[WS] AI Agent stop requested: ${stopTarget}`);
             }
+          }
+          break;
+        }
+
+        case 'ai-agent-confirm': {
+          // 中风险命令的人类确认：把待确认请求换成一次性 token，
+          // 下一轮工具带着它才能放行。归属与对话由 ai.service 校验（带 ownerId），
+          // 这里拿到别人的 approvalId 也换不出 token。
+          const { approvalId, chatId: confirmChatId, aiSessionId: confirmSid } = data || {};
+          const confirmTarget = confirmChatId || confirmSid;
+          const { aiService } = serverModule;
+          if (!wsUser.permissions || !wsUser.permissions.ai) {
+            ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'confirm_denied', error: 'Forbidden: missing permission', code: 'forbidden' } }));
+            break;
+          }
+          if (!aiService || !approvalId || !confirmTarget) {
+            ws.send(JSON.stringify({
+              type: 'ai-agent-event',
+              event: { type: 'confirm_denied', error: 'Missing params: approvalId / chatId', code: 'bad_request' },
+            }));
+            break;
+          }
+          const result = aiService.approveCommand(ownerId, confirmTarget, approvalId);
+          console.log(`[WS] AI Agent confirm: id=${approvalId} ok=${result.ok}${result.code ? ` code=${result.code}` : ''}`);
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'ai-agent-event',
+              sessionId: confirmSid || '',
+              chatId: confirmTarget,
+              event: result.ok
+                ? { type: 'confirm_approved', approval: { ...result.approval, token: result.token } }
+                : { type: 'confirm_denied', approval: result.approval, error: result.error, code: result.code },
+            }));
           }
           break;
         }
