@@ -259,7 +259,14 @@ export AETHEROPS_DB_NAME=aetherops
 export AETHEROPS_REDIS_HOST=127.0.0.1
 export AETHEROPS_REDIS_PASSWORD='...'
 
-# 5. Start (tables are created automatically on first boot)
+# 5. Optional — let the collector sample hosts with no open terminal.
+#    metrics.offlineSampling is off by default: every sample is a real SSH
+#    login the target's auth log will show. Env wins over the config file,
+#    and a change needs a restart. See "Host metrics for hosts you are not
+#    connected to" below before you switch it on.
+export AETHEROPS_METRICS_OFFLINE_SAMPLING=true
+
+# 6. Start (tables are created automatically on first boot)
 node server.js
 ```
 
@@ -273,6 +280,27 @@ bootstrap administrator:
   (gear icon). Nothing is pre-seeded and no demo credentials exist.
 
 Full walkthrough with team setup: [docs/getting-started.md](./docs/getting-started.md).
+
+### Host metrics for hosts you are not connected to
+
+The collector writes one row per host per minute into `host_metrics_minute` and keeps 7 days of it.
+By default it reaches a host through a terminal that is already open, so an idle machine has gaps —
+or nothing. Step 5 above turns on `metrics.offlineSampling`, which adds a sampler for connections
+nobody is attached to: 2 at a time, a 45 s budget per round, exponential backoff on failure.
+
+It is **off by default** because every one of those samples is a real SSH login — turn it on only
+where one extra login per host per minute is acceptable in the target's auth log. Two things worth
+knowing first:
+
+- **A jump-host connection is sampled on the machine it actually logs in to — the bastion.** The
+  startup script's `ssh target.internal` hop is typed into an interactive shell, and the sampler
+  has no PTY, so that hop is not reproduced. Point a `-J`/ProxyJump connection at the target when
+  you want that machine's history.
+- **One connection can stay out of it** with `sampling: 'skip'` — in the connection editor, or via
+  `POST /api/connection/updateConnection`.
+
+Rationale, the backoff ladder and the rest:
+[docs/offline-sampling-faq.md](./docs/offline-sampling-faq.md).
 
 ## Installation options
 
@@ -327,11 +355,11 @@ variables.
 |------|-------|
 | Default path | `~/.aetherops/config.json` (auto-created, mode 0600) |
 | Override path | `AETHEROPS_DATA_DIR` (data dir) / `AETHEROPS_CONFIG` (explicit file) |
-| Sections | `server`, `database`, `redis`, `auth`, `debug` |
+| Sections | `server`, `database`, `redis`, `auth`, `debug`, `metrics` |
 | Port / bind | `PORT`, `HOST` (defaults: 9802 on 127.0.0.1) |
 | Database | `AETHEROPS_DB_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_NAME` / `_POOL_SIZE` / `_SSL` / `_TZ` / `_SSL_CA` / `_SSL_INSECURE` |
 | Redis | `AETHEROPS_REDIS_URL` or `_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DB` / `_PREFIX` / `_CONNECT_TIMEOUT_MS` |
-| Misc | `AETHEROPS_MAX_UPLOAD_MB` (default 100), `AETHEROPS_SSH_DEBUG`, `AETHEROPS_LAUNCH_TOKEN` |
+| Misc | `AETHEROPS_MAX_UPLOAD_MB` (default 100), `AETHEROPS_SSH_DEBUG`, `AETHEROPS_LAUNCH_TOKEN`, `AETHEROPS_METRICS_OFFLINE_SAMPLING` (default off) |
 
 A malformed file aborts startup rather than quietly falling back to defaults, and a completed
 `database` section prints a `user@host:port/db` summary (no password) so you can see which config
@@ -471,11 +499,16 @@ Honest status, so nobody files the same issue twice:
 - **CPU utilization on BSD-family systems** may be unavailable; the panel degrades instead of
   guessing.
 - **Host metrics come from a live terminal by default.** The collector reaches a host through an
-  open session and does not start a connection of its own, so an idle or never-connected machine has
-  gaps — or nothing — in `host_metrics_minute`. `metrics.offlineSampling: true` (off by default)
-  adds a scheduled sampler that dials session-less connections once a minute; a single connection
-  can be excluded with `sampling: 'skip'`. Even then a jump-host connection is sampled on the machine
-  it actually logs into — the bastion — because the startup script's hop is not reproduced.
+  open session and never dials on its own, so an idle or never-connected machine has gaps — or
+  nothing — in `host_metrics_minute`. `metrics.offlineSampling: true` (env
+  `AETHEROPS_METRICS_OFFLINE_SAMPLING`, **off by default**, needs a restart) adds a sampler that
+  dials session-less connections once a minute — 2 in parallel, a 45 s budget per round,
+  exponential backoff — and a single connection can be excluded with `sampling: 'skip'`. It stays
+  off because each sample is a real SSH login in the target's auth log.
+- **A jump-host connection is sampled on the bastion.** With the sampler on it logs in to
+  `connection.host`, the same machine the status panel describes; the startup script's hop is typed
+  into an interactive shell and the sampler has no PTY, so it cannot reproduce it. A `-J`/ProxyJump
+  connection pointed at the target is sampled on the target.
 - **Jump-host sessions**: the AI environment context describes the *target* machine, but the status
   panel and file manager use the direct SSH channel, so on a bastion-only connection they describe
   the bastion. Use a real `-J`/ProxyJump style connection when you need end-to-end tooling.

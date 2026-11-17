@@ -214,7 +214,13 @@ export AETHEROPS_DB_NAME=aetherops
 export AETHEROPS_REDIS_HOST=127.0.0.1
 export AETHEROPS_REDIS_PASSWORD='...'
 
-# 5. 启动（表结构在首次启动时自动创建）
+# 5.（可选）让采集器也去采没有开着终端的主机
+#    metrics.offlineSampling 默认是关的：每次采样都是一次真实 SSH 登录，目标机的
+#    认证日志里会多一条。环境变量优先于配置文件，改完需要重启。
+#    开启前先读下面「没有终端也能采指标」那一节。
+export AETHEROPS_METRICS_OFFLINE_SAMPLING=true
+
+# 6. 启动（表结构在首次启动时自动创建）
 node server.js
 ```
 
@@ -225,6 +231,24 @@ node server.js
 - 接着新建一个 SSH 连接，并在 AI 设置（齿轮图标）里至少配一套模型。**没有任何预置数据，也不存在演示账号。**
 
 完整的首次部署流程（含团队账号规划）：[docs/getting-started.zh.md](./docs/getting-started.zh.md)。
+
+### 没有终端也能采指标
+
+采集器每分钟给每台主机往 `host_metrics_minute` 写一行，保留 7 天。默认它只通过你已经开着的终端
+到达主机，所以闲置的机器就是空白。上面第 5 步打开的 `metrics.offlineSampling` 会给「没人连着的
+连接」补一条采集路径：并发 2、单轮预算 45 秒、失败按退避重试。
+
+它**默认是关的**，因为每一次采样都是一次真实 SSH 登录 —— 只在「目标机认证日志里每分钟多一条登录
+可以接受」的场景下打开。开启前先知道两件事：
+
+- **跳板机连接采的是它实际登录上的那台机器 —— 跳板机本身。** 启动脚本里的
+  `ssh target.internal` 那一跳是打进交互式 shell 的，采集器没有 PTY，不会重现它。想要目标机的
+  历史，请用 `-J`/ProxyJump 风格的连接直接指向目标机。
+- **单个连接可以退出采集**：`sampling: 'skip'` —— 在连接编辑器里设置，或调
+  `POST /api/connection/updateConnection`。
+
+为什么默认关、退避阶梯与其余细节：
+[docs/offline-sampling-faq.zh.md](./docs/offline-sampling-faq.zh.md)。
 
 ## 安装方式
 
@@ -276,11 +300,11 @@ aetherops stop | restart | -v
 |----|-----|
 | 默认路径 | `~/.aetherops/config.json`（自动生成，权限 0600） |
 | 路径覆盖 | `AETHEROPS_DATA_DIR`（数据目录）/ `AETHEROPS_CONFIG`（直接指定文件） |
-| 配置段 | `server`、`database`、`redis`、`auth`、`debug` |
+| 配置段 | `server`、`database`、`redis`、`auth`、`debug`、`metrics` |
 | 端口 / 绑定 | `PORT`、`HOST`（默认 9802 / 127.0.0.1） |
 | 数据库 | `AETHEROPS_DB_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_NAME` / `_POOL_SIZE` / `_SSL` / `_TZ` / `_SSL_CA` / `_SSL_INSECURE` |
 | Redis | `AETHEROPS_REDIS_URL`，或 `_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DB` / `_PREFIX` / `_CONNECT_TIMEOUT_MS` |
-| 其他 | `AETHEROPS_MAX_UPLOAD_MB`（默认 100）、`AETHEROPS_SSH_DEBUG`、`AETHEROPS_LAUNCH_TOKEN` |
+| 其他 | `AETHEROPS_MAX_UPLOAD_MB`（默认 100）、`AETHEROPS_SSH_DEBUG`、`AETHEROPS_LAUNCH_TOKEN`、`AETHEROPS_METRICS_OFFLINE_SAMPLING`（默认关） |
 
 配置文件写坏（不是合法 JSON）会直接报错退出，不会静默回到默认值；`database` 段填好后，启动日志会打印一行
 `user@host:port/db` 摘要（不含密码），用来确认到底读的是哪份配置。
@@ -405,8 +429,12 @@ Agent 拥有真实 shell，因此在执行前有一层拦截：
 - **BSD 系的 CPU 占用率**可能采不到，面板选择降级而不是猜。
 - **主机指标默认来自活着的终端**：采集器靠活动会话到达主机，不会自己发起连接 —— 所以闲置或从未
   连过的机器在 `host_metrics_minute` 里是空白（或根本没有行）。把 `metrics.offlineSampling` 打开
-  （默认关）会多一个定时采集器，对没有会话的连接每分钟拨号一次；单个连接可用 `sampling: 'skip'` 排除。
-  即便如此，跳板机连接采的仍是它实际登录上的那台机器（也就是跳板机），启动脚本里那一跳不会被重现。
+  （环境变量 `AETHEROPS_METRICS_OFFLINE_SAMPLING`，**默认关**，改完需重启）会多一个定时采集器，
+  对没有会话的连接每分钟拨号一次 —— 并发 2、单轮预算 45 秒、失败指数退避 —— 单个连接可用
+  `sampling: 'skip'` 排除。它默认关，是因为每次采样都是目标机认证日志里的一条真实登录。
+- **跳板机连接采的是跳板机。** 即使打开采集器，它登录的仍是 `connection.host` —— 和状态面板描述
+  的是同一台机器；启动脚本里那一跳是打进交互式 shell 的，采集器没有 PTY，重现不了。用
+  `-J`/ProxyJump 指向目标机的连接，采到的才是目标机。
 - **跳板机会话**：AI 的环境信息描述的是**目标机**，但状态面板与文件管理器走的是直连 SSH 通道，
   因此在「只连跳板机 + 脚本跳转」的会话上它们描述的是跳板机。需要端到端工具能力时，请改用
   `-J` / ProxyJump 风格的真实连接。
