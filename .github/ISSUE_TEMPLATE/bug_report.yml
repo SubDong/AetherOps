@@ -77,9 +77,9 @@ body:
       label: Version or commit
       description: >-
         `node -p "require('./package.json').version"`, or the release you installed, or
-        `git rev-parse --short HEAD`. There are **no release tags yet**, so a commit is the most
-        precise thing you can give.
-      placeholder: "1.0.26 / a1c3651"
+        `git rev-parse --short HEAD`. A tag is the most precise thing you can give; a commit works
+        for anything built from `master` between tags.
+      placeholder: "0.1.0-beta.1 / 2386c26"
     validations:
       required: true
   - type: textarea

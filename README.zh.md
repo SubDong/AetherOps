@@ -284,7 +284,7 @@ node server.js
 | Docker | `pnpm docker:build`（或 `docker build -t aetherops .`），配合带 MySQL/Redis 的 compose | 服务器部署、团队共用 |
 | Electron 桌面端 | `pnpm electron:build:win \| :mac \| :linux` | 想要原生窗口的个人用户 |
 | VSCode 插件 | `pnpm vscode:package` 出 `.vsix`，再「从 VSIX 安装」 | 在编辑器里干活 |
-| GitHub Releases | 推送版本标签后由 CI 产出（**目前还没有发过任何 tag**） | 不想本地装工具链 |
+| GitHub Releases | 推送版本标签后由 CI 产出（beta 版） | 不想本地装工具链 |
 
 ```bash
 # 桌面端 / 插件构建

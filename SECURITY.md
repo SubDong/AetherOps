@@ -110,12 +110,12 @@ why" answer is a perfectly good outcome, and we would rather read it.
 | Branch / version | Status |
 |------------------|--------|
 | `master` (current source) | Actively fixed; security patches land here first |
-| The most recent tagged release | Fixed, once releases exist |
+| The most recent tagged release | Fixed |
 | Everything older | Best effort, usually no |
 
-**No releases have been published yet** (this repository has no tags), so `master` is the only
-supported build. If you are running a checkout, record the commit — it is the only way we can tell
-whether you already have a fix.
+Tags mark what has been built and published: `v0.0.1-beta.1` and `v0.1.0-beta.1` so far, both beta. A build
+taken from `master` between tags is untagged — record the commit, so we can tell whether you already have
+a fix.
 
 ## Threat model, as implemented
 

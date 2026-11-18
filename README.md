@@ -353,7 +353,7 @@ Rationale, the backoff ladder and the rest:
 | Docker | `pnpm docker:build` (or `docker build -t aetherops .`) + compose with MySQL/Redis | Servers, shared team deployment |
 | Electron desktop | `pnpm electron:build:win \| :mac \| :linux` | Single operators who want a native window |
 | VSCode extension | `pnpm vscode:package` → `.vsix`, then *Install from VSIX* | Keeping terminals inside the editor |
-| GitHub Releases | Created by CI when a version tag is pushed (**none published yet**) | Installers without a local toolchain |
+| GitHub Releases | Created by CI when a version tag is pushed (beta builds) | Installers without a local toolchain |
 
 ```bash
 # Desktop / extension builds

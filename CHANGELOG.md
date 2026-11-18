@@ -4,9 +4,10 @@ All notable changes to AetherOps are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Unreleased items are what `master` contains beyond the last tagged version. **This repository has no
-release tags yet**, so there is no released baseline to compare against — treat `master` as the only
-supported build, and record the commit you run.
+Unreleased items are what `master` contains beyond the last tagged version. `v0.0.1-beta.1` (2026-11-10)
+was the first tag and `v0.1.0-beta.1` the second; the latter is also where the version number was reset to
+this project's own scheme, so the `1.0.26` section below is a snapshot of what the fork inherited, not a
+predecessor release. Record the tag — or the commit, for a build that predates one — that you run.
 
 ## [Unreleased]
 
@@ -305,6 +306,14 @@ supported build, and record the commit you run.
   changed too, and green proves the recorded behaviours still hold, nothing more; the docs check
   proves structure and links, never that two prose paragraphs say the same thing. See
   [CONTRIBUTING.md](CONTRIBUTING.md#test-scripts).
+- **The version line is this project's own from here on.** `package.json` read `1.0.26`, inherited with
+  the fork and never bumped, so installers, the `latest.yml` the updater compares against and the Docker
+  image tag all carried a number that no tag ever mentioned. It now reads `0.1.0-beta.1`, matching the
+  tag: release label, installer file names, update manifest and in-app version finally agree.
+  **Boundary:** the number goes *down* — semver puts `0.1.0-beta.1` below `1.0.26`, so the update check
+  will not offer this build to anyone running 1.0.26; they download it once by hand. `packages/vscode`
+  deliberately keeps its own line (`0.1.25`): the VSIX version has to equal whatever follows
+  `aetherops-v` in the tag, and it ships on a different cadence from the app.
 
 ### Fixed
 
@@ -360,10 +369,10 @@ that makes the change, not afterwards.
 
 ## 1.0.26 — 2026-11-02
 
-The state of the fork at the time it was prepared for open-source publication. Version 1.0.26 is what
-`package.json` carries; it has **not** been tagged, and no artifacts exist for it. Grouped by theme,
-because the underlying history was written as a handful of large feature commits rather than release
-increments.
+The state of the fork at the time it was prepared for open-source publication. `1.0.26` was the version
+inherited from upstream and never bumped; it was never tagged and no artifacts exist for it, and the
+number was replaced by this project's own line in `v0.1.0-beta.1`. Grouped by theme, because the
+underlying history was written as a handful of large feature commits rather than release increments.
 
 ### Added
 

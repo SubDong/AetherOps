@@ -14,5 +14,5 @@ contact_links:
   - name: Known limitations — please read before opening a "doesn't work" issue
     url: https://github.com/SubDong/AetherOps/blob/master/CHANGELOG.md#known-gaps-at-this-point
     about: >-
-      Some things are documented gaps rather than bugs (no skill-authoring UI, no HA mode, HarmonyOS
-      not fleet-tested, no release tags/artifacts yet, smoke script needs a login step).
+      Some things are documented gaps rather than bugs (no high-availability mode, HarmonyOS verified
+      against fixtures only, the smoke script needs a login step, and the release line is beta).

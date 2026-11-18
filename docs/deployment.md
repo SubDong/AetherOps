@@ -429,13 +429,14 @@ Details:
 - Release jobs need `contents: write`, which the workflows already declare; publishing needs the two
   marketplace tokens as repository secrets.
 
-**Current state of this repository:** no tags have been pushed yet, so **Releases is empty** — the
-pipelines above describe what happens when you tag, not artifacts you can download today. Until the
-first release exists, install from source or build the image.
+**Current state of this repository:** two beta tags exist (`v0.0.1-beta.1`, `v0.1.0-beta.1`). Since
+`v0.1.0-beta.1` the tag name and `package.json` version agree (`0.1.0-beta.1`), so installer file names
+and the update manifest no longer carry the inherited `1.0.26`; a build taken from `master` between tags
+is untagged.
 
 ```bash
-git tag aetherops-v0.1.26
-git push origin aetherops-v0.1.26
+git tag v0.1.0-beta.1
+git push origin v0.1.0-beta.1
 ```
 
 ## Notes for forks
