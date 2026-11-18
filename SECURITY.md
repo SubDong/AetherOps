@@ -113,9 +113,9 @@ why" answer is a perfectly good outcome, and we would rather read it.
 | The most recent tagged release | Fixed |
 | Everything older | Best effort, usually no |
 
-Tags mark what has been built and published: `v0.0.1-beta.1` and `v0.1.0-beta.1` so far, both beta. A build
-taken from `master` between tags is untagged — record the commit, so we can tell whether you already have
-a fix.
+Tags mark what has been built and published: `v0.0.1-beta.1` and `v0.1.0` so far, and the `0.x` line is
+beta. A build taken from `master` between tags is untagged — record the commit, so we can tell whether you
+already have a fix.
 
 ## Threat model, as implemented
 

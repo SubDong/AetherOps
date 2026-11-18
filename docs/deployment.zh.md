@@ -417,13 +417,14 @@ pnpm run vscode:package      # build-only → prepare-vscode-runtime → vsce pa
 - 名字里含 `-` 的 tag（例如 `aetherops-v0.1.26-beta1`）会被标记为 `prerelease`。
 - 发版任务需要 `contents: write`，workflow 里已经声明了；发布还需要把两个市场令牌配成仓库 secrets。
 
-**这个仓库当前的状态：**已经有两个 beta tag（`v0.0.1-beta.1`、`v0.1.0-beta.1`）。从 `v0.1.0-beta.1`
-起，tag 名与 `package.json` 的 version 一致（`0.1.0-beta.1`），安装包文件名和更新清单不再带着继承来的
-`1.0.26`；两个 tag 之间从 `master` 构建出来的是未打标签的版本。
+**这个仓库当前的状态：**已有 tag `v0.0.1-beta.1` 与 `v0.1.0`。从 `v0.1.0` 起，tag 名与 `package.json`
+的 version 一致（`0.1.0`），安装包文件名和更新清单不再带着继承来的 `1.0.26`；两个 tag 之间从 `master`
+构建出来的是未打标签的版本。版本号一律是三段纯数字 —— `electron/updater.js` 用 `Number()` 比较，带
+`-beta` 这样的后缀会解析成 `NaN`，更新检查就永远不会触发。
 
 ```bash
-git tag v0.1.0-beta.1
-git push origin v0.1.0-beta.1
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## 给 fork 的说明

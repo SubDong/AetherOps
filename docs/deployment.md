@@ -429,14 +429,15 @@ Details:
 - Release jobs need `contents: write`, which the workflows already declare; publishing needs the two
   marketplace tokens as repository secrets.
 
-**Current state of this repository:** two beta tags exist (`v0.0.1-beta.1`, `v0.1.0-beta.1`). Since
-`v0.1.0-beta.1` the tag name and `package.json` version agree (`0.1.0-beta.1`), so installer file names
-and the update manifest no longer carry the inherited `1.0.26`; a build taken from `master` between tags
-is untagged.
+**Current state of this repository:** tags `v0.0.1-beta.1` and `v0.1.0` exist. Since `v0.1.0` the tag name
+and `package.json` version agree (`0.1.0`), so installer file names and the update manifest no longer carry
+the inherited `1.0.26`; a build taken from `master` between tags is untagged. Versions are plain
+`major.minor.patch` — `electron/updater.js` compares them with `Number()`, so a `-beta` suffix would parse
+as `NaN` and the update check would never fire.
 
 ```bash
-git tag v0.1.0-beta.1
-git push origin v0.1.0-beta.1
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
 ## Notes for forks
