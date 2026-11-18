@@ -324,6 +324,14 @@ or the commit, for a build that predates one — that you run.
   VSIX rewrite would carry away with it. The same text now also sits at `LICENSES/AICmd-MIT.txt`, and
   both READMEs point there. Housekeeping, not a relicence: the notice still travels with every build,
   which is the single obligation MIT imposes.
+- **The root `LICENSE` is plain MIT text again, so GitHub reports MIT instead of `Other`.** Explaining the
+  lineage in the middle of the file — a paragraph between the copyright block and *Permission is hereby
+  granted* — made GitHub's licence detection answer `NOASSERTION`: the sidebar printed `Other`, and the
+  repository dropped out of `license:mit` searches, which reads as "terms unclear" to a stranger deciding
+  whether to use the software. The explanation moved to [LICENSES/README.md](LICENSES/README.md); both
+  copyright lines (this project and upstream `fefeding`) stay inside the copyright block of `LICENSE`,
+  where detector tolerance exists and where the MIT obligation is actually discharged. Nothing about the
+  terms changed — only where the prose about them lives.
 
 ### Fixed
 
