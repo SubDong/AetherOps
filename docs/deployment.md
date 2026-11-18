@@ -406,6 +406,7 @@ Two GitHub workflows, separated by tag prefix so they never collide:
 |----------|---------|----------|
 | `.github/workflows/build-vsix.yml` | tag `aetherops-v*` | VSIX + win/mac/linux desktop artifacts on one GitHub Release; then publishes to the VS Code Marketplace (`VSCODE_TOKEN`) and Open VSX (`OVSX_TOKEN`). Runs on `master` pushes and PRs too, as build-only jobs |
 | `.github/workflows/build.yml` | tag `v*`, or manual dispatch with a platform choice | Desktop artifacts only (fallback channel) |
+| `.github/workflows/verify.yml` | called by both workflows above, so every tag, `master` push and PR | Nothing publishable — it is the gate: backend + frontend type checks, the seven verification suites against a throwaway MySQL service, and the bilingual-doc check |
 
 There is a third, non-GitHub pipeline: [`.cnb.yml`](../.cnb.yml) runs on the CNB build platform
 (<https://cnb.cool>). It verifies the build on `master` pushes and, on a tag push, builds the **Linux**
@@ -417,6 +418,11 @@ Details:
 
 - Every job installs with `pnpm install --frozen-lockfile` on pnpm 10 / Node 22 (the VSIX jobs use
   Node 20 for tooling steps, since they do not run the server).
+- `build-vsix.yml` and `build.yml` both start with a `verify` job that calls `verify.yml`, and every
+  artifact job `needs:` it — a failing suite blocks the VSIX, the desktop builds and the marketplace
+  publish. Locally the same gate is `pnpm build-server`, `pnpm type-check`, `pnpm verify` and
+  `pnpm verify:docs`; `pnpm verify:offline` skips the four suites that want a database. The suites
+  run against a disposable schema, so point them at one that may be thrown away.
 - `build-vsix.yml` refuses to release when the tag does not match `packages/vscode/package.json`
   version — bump the extension version before tagging.
 - A tag containing `-` (e.g. `aetherops-v0.1.26-beta1`) is marked `prerelease`.

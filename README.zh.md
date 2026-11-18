@@ -382,6 +382,9 @@ pnpm build-server     # 仅服务端
 pnpm type-check       # vue-tsc
 pnpm lint             # eslint（含 --fix）
 pnpm check-pin        # 校验钉住的依赖与锁文件版本一致
+pnpm verify           # 跑 scripts/verify-*.mjs 里的全部验证套件（需要 MySQL）
+pnpm verify:offline   # 只跑不需要数据库的三套
+pnpm verify:docs      # 双语文档成对、语言切换行、标题结构、相对链接
 pnpm docker:build     # 打 Docker 镜像（加 -- --dry-run 只看要执行什么命令）
 node scripts/migrate.mjs --status   # 查看库结构状态
 pnpm smoke            # 终端链路冒烟（脚本还没带令牌，见下文「已知边界」）
@@ -392,6 +395,13 @@ BASE=http://127.0.0.1:9802 ADMIN_USER=admin ADMIN_PASS=... \
 `pnpm dev` 同样需要能连上 MySQL 与 Redis（迁移在端口绑定之前跑）。依赖安装请用 pnpm 10 ——
 `pnpm-workspace.yaml` 里带着原生模块的构建白名单（`onlyBuiltDependencies` / `allowBuilds`）和
 让 `rz`/`sz` 稳定工作的 `zmodem.js` 补丁，跳过它的后果是「装得上、传不了文件」。
+
+`pnpm verify` 就是 CI 跑的那道门禁，它验的是行为而不是形状：`scripts/verify-*.mjs` 里每一套都
+require **编译产物**（`dist/server/**`），所以先 `pnpm build-server`。其中四套要真实 MySQL ——
+它们自己跑迁移、用随机 `verify-*` 前缀写测试行、在 `finally` 里删掉，请指向一个临时库而不是生产库。
+手边没有数据库时，`pnpm verify:offline` 只跑不需要库的三套。`scripts/verify-docs.mjs` 把下文「文档」
+那段的成对规则变成可执行断言。两个发布工作流都会在打包前调用同一道门禁
+（`.github/workflows/verify.yml`），套件不过就不会有 vsix 与桌面端产物。
 
 ### 依赖钉版
 
@@ -478,6 +488,16 @@ Agent 拥有真实 shell，因此在执行前有一层拦截：
   [packages/vscode/README.md](./packages/vscode/README.md)（英文）。
 - **没有高可用模式**：单进程服务 + 一个 Redis + 一个 MySQL。多实例可以共用数据库，
   但不协调内存里的终端会话。
+- **Agent 的「历史」只包含这个应用跑过的命令**：`search_audit` 与 `recall_fix` 读的是
+  `audit_events` / `error_fingerprints`，记录范围是工具调用与文件传输；直接在终端里手敲的命令
+  两张表里都没有。所以 `recall_fix` 只能回答「在这里是怎么修好的」，找不到时会明说，
+  而不是回一个空列表。
+- **告警没有自己的通知渠道**：投递就是一个签名 webhook（值班表只决定正文里 @谁），
+  认领 / 指派 / 确认 / 解决都不发任何消息。接收端持续不可达时，4 次尝试用完就丢这一条：
+  告警行还在，但那一次「呼人」不再重发。
+- **事件归并是一条规则，不是根因分析**：同一条连接 30 分钟内 3 条未解决告警合成一个事件，
+  之后同主机的命中会并进来，但两台主机永远不会合并。归并只表达「看起来是同一件事」，
+  不推断原因。
 
 ## 文档
 

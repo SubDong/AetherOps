@@ -107,8 +107,49 @@ Electron and VS Code embeds (they launch the same `server.js` and inject `AETHER
 
 ## Test scripts
 
-There is **no unit-test suite** in this repository. Verification is script-based and runs against a
-live instance:
+There is **no unit-test framework** here. Verification is script-based: Node scripts drive the
+**compiled** server (`dist/server/**`) and assert behavior, and CI runs the same scripts this file
+tells you to run.
+
+### Suites — `pnpm verify`
+
+```bash
+pnpm build-server                      # the suites load dist/server, not src
+pnpm verify                            # all seven; four of them need a reachable MySQL
+pnpm verify:offline                    # the three that need no database
+node scripts/verify-all.mjs --list     # the list, and which need a database
+node scripts/verify-all.mjs p4 p6      # a subset
+```
+
+`scripts/verify-all.mjs` runs `scripts/verify-*.mjs` in order and exits non-zero if any of them does.
+The suites are per phase and each one prints `PASS` / `FAIL` per assertion:
+
+| Suite | Covers | Database |
+|-------|--------|----------|
+| `verify-search-audit.mjs` | audit search: `connection_id`, time window, owner isolation, tool output | yes |
+| `verify-p1-tools.mjs` | `list_connections` / `read_file` / `run_on_hosts`: permissions, no dialing, no credential leak, throttling | no |
+| `verify-p2-approval.mjs` | command classification, `NEEDS_CONFIRM`, single-use token binding | no |
+| `verify-p3-skills.mjs` | skill catalog, `load_skill`, per-turn cache, 20,000-character cap | no |
+| `verify-p4-fingerprints.mjs` | normalization, aggregation, attribution, retention | yes |
+| `verify-p5-alerts.mjs` | de-duplication state machine, webhook signing and retries, mutes | yes |
+| `verify-p6-collab.mjs` | claim / assign / on-call, incident grouping, `recall_fix`, skill write path, route status codes | yes |
+
+The database suites apply migrations themselves, write rows under a random `verify-*` owner prefix
+and delete them again in a `finally`. Point them at a schema you may throw away. When you change a
+behavior one of these pins, change the expectation and the code in the same PR — a red suite is a
+regression until proven otherwise, not a test to relax.
+
+### Docs gate — `pnpm verify:docs`
+
+`scripts/verify-docs.mjs` makes the `docs/` pairing rule below mechanical: both copies exist, the
+language switch line points at the twin, the heading structure matches, every doc appears in both
+README tables, relative links resolve, no code fence is left open, no line ends in whitespace. It
+needs no build and no database, so it is the cheapest check to run after editing documentation.
+
+### Live instance — `verify-auth.mjs`
+
+This one needs a server that is already running, because it exercises login, tokens and WebSocket
+handshakes end to end:
 
 ```bash
 BASE=http://127.0.0.1:9802 ADMIN_USER=admin ADMIN_PASS=<password> \
@@ -116,7 +157,7 @@ BASE=http://127.0.0.1:9802 ADMIN_USER=admin ADMIN_PASS=<password> \
 ```
 
 `verify-auth.mjs` asserts real behavior end to end: token issue and 7200 s expiry, `pending` accounts
-getting 403, permission enforcement, cross-account data isolation, single-session takeover, sliding
+remaining 403, permission enforcement, cross-account data isolation, single-session takeover, sliding
 renewal (it pokes Redis directly to shorten a TTL), no-renewal-when-fresh, revoke, delete-account
 purging owner rows, uniform `invalid_grant` on a bad password, WS handshake with and without a token,
 and that `?token=` is accepted only on `/ws/`. It exits non-zero on failure and prints a pass count.
@@ -284,7 +325,8 @@ Types in use: `feat`, `fix`, `build`, `docs`, `refactor`, `test`, `chore`.
 
 Before opening a PR:
 
-1. `pnpm lint`, `pnpm type-check`, `pnpm build-only` all clean.
+1. `pnpm lint`, `pnpm type-check`, `pnpm build-only`, `pnpm verify:docs` all clean, and `pnpm verify`
+   (or `pnpm verify:offline` without a database) green.
 2. `node scripts/verify-auth.mjs` passing if you touched anything auth- or owner-scoped.
 3. Migration state sane (`node scripts/migrate.mjs --status`) if you touched the schema.
 4. No secrets, internal hostnames, real usernames or customer data anywhere in the diff — including

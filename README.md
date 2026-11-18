@@ -457,6 +457,9 @@ pnpm build-server     # backend only
 pnpm type-check       # vue-tsc
 pnpm lint             # eslint (+ --fix)
 pnpm check-pin        # verify pinned dependencies match the lockfile
+pnpm verify           # every verification suite in scripts/verify-*.mjs (needs MySQL)
+pnpm verify:offline   # the three suites that need no database
+pnpm verify:docs      # bilingual doc pairs, switch lines, mirrored headings, links
 pnpm docker:build     # build the Docker image (--dry-run to see the command only)
 node scripts/migrate.mjs --status   # database schema state
 pnpm smoke            # terminal pipeline smoke test (does not send a token yet — see
@@ -469,6 +472,16 @@ BASE=http://127.0.0.1:9802 ADMIN_USER=admin ADMIN_PASS=... \
 `pnpm install` with pnpm 10 — `pnpm-workspace.yaml` carries the native-module build allow-list
 (`onlyBuiltDependencies` / `allowBuilds`) and the `zmodem.js` patch that makes `rz`/`sz` reliable;
 skipping it produces a build that installs but cannot transfer files.
+
+`pnpm verify` is the gate CI runs, and it asserts behaviour rather than shape: the suites in
+`scripts/verify-*.mjs` drive the **compiled** server (`dist/server/**`), so `pnpm build-server` comes
+first. Four of them talk to MySQL — they apply migrations themselves, write rows under a random
+`verify-*` owner prefix and delete them again in a `finally`, so point them at a scratch schema. On a
+machine without a database, `pnpm verify:offline` runs the three suites that need none.
+`scripts/verify-docs.mjs` is the mechanical half of the `docs/` pairing rule described under
+[Documentation](#documentation). Both release workflows call the same gate
+(`.github/workflows/verify.yml`) before they package anything, so a red suite means no VSIX and no
+desktop build.
 
 ### Version pinning
 
@@ -573,6 +586,17 @@ Honest status, so nobody files the same issue twice:
   [packages/vscode/README.md](./packages/vscode/README.md#known-gaps-in-this-host).
 - **No high-availability mode**: one server process, one Redis, one MySQL. Multi-instance
   deployments share state through the database but do not coordinate in-memory terminal sessions.
+- **The agent's history is only what this app ran.** `search_audit` and `recall_fix` read
+  `audit_events` / `error_fingerprints`, which cover tool calls and file transfers; a command typed
+  by hand into a terminal is not in either table. `recall_fix` can therefore only answer "how was
+  this fixed in here", and says so instead of returning an empty list.
+- **Alerts have no notification channel of their own.** Delivery is one signed webhook — the
+  on-call roster only decides who is @-mentioned in its payload — and claim / assign / acknowledge /
+  resolve send nothing at all. A receiver that stays down loses the event after four attempts; the
+  alert row survives, the page does not.
+- **Incidents are a grouping rule, not root-cause analysis.** Three unresolved alerts on the same
+  connection within 30 minutes become one incident, later hits on that host join it, and two hosts
+  never merge. The grouping claims "these looked like one event" and nothing more.
 
 ## Documentation
 

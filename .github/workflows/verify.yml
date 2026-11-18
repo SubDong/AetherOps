@@ -1,0 +1,117 @@
+name: Verify
+
+# 类型检查 + 验证套件 + 双语文档检查。
+# 本地等价命令（CI 跑的是同一份脚本，不另写一套断言）：
+#   pnpm build-server && pnpm type-check
+#   node scripts/verify-docs.mjs
+#   node scripts/verify-all.mjs          # 需要 MySQL，见下
+#
+# 这是可复用工作流：build.yml（v* 标签）与 build-vsix.yml（aetherops-v* 标签 / master / PR）
+# 都以 `uses: ./.github/workflows/verify.yml` 调用它并 needs 它 —— 检查不过就不出安装包。
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # 不需要数据库、几十秒出结果的那部分：文档成对 + 两端类型检查
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: pnpm install --frozen-lockfile
+
+      # 双语文档成对、语言切换行、标题结构、README 覆盖、相对链接；不需要构建产物
+      - name: Documentation pairs & links
+        run: node scripts/verify-docs.mjs
+
+      - name: Type check (backend)
+        run: pnpm build-server
+
+      - name: Type check (frontend)
+        run: pnpm type-check
+
+  # 七套验证脚本：P1 两片 / P2 / P3 / P4 / P5 / P6。
+  # 其中四套要真实 MySQL —— 用 service 容器起一个一次性的库，迁移由脚本自己跑；
+  # 每个套件用随机 owner 前缀写测试行并自行清理，容器用完即弃。
+  suites:
+    needs: checks
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: aetherops
+          MYSQL_ROOT_HOST: '%'
+          MYSQL_DATABASE: aetherops_verify
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -paetherops --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+    env:
+      # 数据目录放 runner 的临时目录：配置模板、加密密钥都写在这里，不碰 $HOME
+      AETHEROPS_DATA_DIR: ${{ runner.temp }}/aetherops-data
+      AETHEROPS_DB_HOST: 127.0.0.1
+      AETHEROPS_DB_PORT: '3306'
+      AETHEROPS_DB_USER: root
+      AETHEROPS_DB_PASSWORD: aetherops
+      AETHEROPS_DB_NAME: aetherops_verify
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ~/.pnpm-store
+          key: ${{ runner.os }}-pnpm-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-
+
+      - name: Install dependencies
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: pnpm install --frozen-lockfile
+
+      # 套件 require 的是 dist/server/**（编译产物），不是 src
+      - name: Build server
+        run: pnpm build-server
+
+      - name: Run verification suites
+        run: node scripts/verify-all.mjs

@@ -33,7 +33,7 @@ supported build, and record the commit you run.
   an assignee still needs the `monitor` bit to open the panel, and an empty string clears it;
   claiming or assigning sends no webhook, since delivery still fires only on *created* /
   *escalated*; incidents have no delete path — they are pruned together with their alerts after the
-  30-day retention, and an `open` one is never pruned. Asserted in `temp/verify-p6-collab.mjs`.
+  30-day retention, and an `open` one is never pruned. Asserted in `scripts/verify-p6-collab.mjs`.
   Documented under `alerts` in [docs/configuration.md](docs/configuration.md#alerts) /
   [docs/configuration.zh.md](docs/configuration.zh.md#alerts).
 - **`recall_fix`: how this exact error was fixed last time.** A failure that looks familiar can now
@@ -51,7 +51,7 @@ supported build, and record the commit you run.
   to the terminal this chat is attached to and has to be passed explicitly when there is none; a
   failure that was never recorded as a fingerprint returns `FINGERPRINT_NOT_FOUND` rather than an
   empty answer; `run_on_hosts` results are not candidates (one row covers N hosts, so it cannot be
-  attributed to one machine). Asserted in `temp/verify-p6-collab.mjs` — the "fixed once, broke
+  attributed to one machine). Asserted in `scripts/verify-p6-collab.mjs` — the "fixed once, broke
   again" fixture, with a second command that exited 0 without fixing anything, returns exactly the
   one real fix.
 - **Per-account skills can be written from the UI.** Until now the `skills` table had a schema and a
@@ -137,7 +137,8 @@ supported build, and record the commit you run.
   from tool arguments — and an empty result names the coverage gap instead of implying the command
   never ran. **Boundary:** only what this app ran is recorded (agent tool calls and file transfers);
   commands typed by hand into a terminal are not in the table. The tool's own calls land in
-  `audit_events` through the same `after_tool` hook as every other tool.
+  `audit_events` through the same `after_tool` hook as every other tool. See
+  [README.md](README.md#command-audit--replay) / [README.zh.md](README.zh.md#命令审计与回放).
 - **Three reach tools: `list_connections`, `read_file`, `run_on_hosts`.** The agent could run one
   command in the terminal it was bound to and search stored history; it could not see the rest of the
   account's estate. `list_connections` returns id / name / type / host / user / enabled plus which of
@@ -157,7 +158,7 @@ supported build, and record the commit you run.
   unreachable; `scope=all_open` skips connections marked `sampling: 'skip'`; each tool is gated by its
   own permission bit (`connections` / `files` / `batch`) passed down from the WebSocket user, and a
   missing bit denies instead of defaulting to allow; all three are audited through the same
-  `after_tool` hook.
+  `after_tool` hook. See [README.md](README.md#ai-agent) / [README.zh.md](README.zh.md#ai-agent).
 - **Open-source community files**: [LICENSE](LICENSE) (MIT, with the upstream attribution kept in
   `packages/vscode/LICENSE`), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), this
   changelog, and issue / pull request templates under `.github/`.
@@ -193,7 +194,8 @@ supported build, and record the commit you run.
   own); `sudo` prefixes are stripped before matching so `sudo rm -rf ...` cannot slip past; the gate reads
   command text and is not a sandbox (`bash -c "$(cat script)"` is outside what it can see); the legacy
   `safe` field keeps its old meaning for the batch panel (`confirm` counts as `safe` there, because a
-  human clicking Execute *is* the confirmation), so `batch.service` needed no change.
+  human clicking Execute *is* the confirmation), so `batch.service` needed no change. See
+  [README.md](README.md#safety-rails) / [README.zh.md](README.zh.md#安全机制).
 - **Skills load on demand: a catalog in the system prompt, the full text only when asked for.** A skill
   used to reach the model one way only — a human picked it and the whole Markdown went into that run's
   prompt — so the model could not choose a runbook and every selected skill cost its full length in
@@ -212,7 +214,7 @@ supported build, and record the commit you run.
   arguments; with no skill service wired the catalog is omitted and the tool answers
   `SKILLS_UNAVAILABLE` instead of pretending the library is empty. Prompt growth is now one line per
   skill: going from 3 to 10 skills adds seven lines, not seven documents (asserted in
-  `temp/verify-p3-skills.mjs`). See [README.md](README.md#skills) /
+  `scripts/verify-p3-skills.mjs`). See [README.md](README.md#skills) /
   [README.zh.md](README.zh.md#skills-技能).
 - **Failure fingerprints: the same error on the same host is one row, not N audit lines.** `audit_events`
   records every tool call as a separate row and prunes it after 30 days, which answers "what did this
@@ -238,8 +240,11 @@ supported build, and record the commit you run.
   returns one blob for N hosts while the hook carries a single session, so recording it would blame the
   wrong machine — and a run whose session is already gone has no connection to attribute to, so the
   write is skipped rather than guessed. Fingerprinting never blocks anything: a database error is
-  logged and the command result is untouched (asserted in `temp/verify-p4-fingerprints.mjs`). The same
-  module will back P5's alert de-duplication, so the two phases cannot drift into two different keys.
+  logged and the command result is untouched (asserted in `scripts/verify-p4-fingerprints.mjs`). The
+  same module will back P5's alert de-duplication, so the two phases cannot drift into two different
+  keys. Documented under *Storage layout* in
+  [docs/configuration.md](docs/configuration.md#storage-layout) /
+  [docs/configuration.zh.md](docs/configuration.zh.md#存储布局).
 - **Alerts leave the page: an error is now a stateful entity you can acknowledge, resolve and silence.**
   A log-monitor rule hit used to be a line in a 200-entry in-memory buffer that vanished on reload and
   could not reach anyone who was not looking at the panel. Migration `0010` adds `alerts` — one row per
@@ -266,8 +271,8 @@ supported build, and record the commit you run.
   counted while muted; retention deletes resolved rows older than 30 days and never an `open` / `acked`
   one; pending retries live in the process, so a restart drops them while the rows themselves survive;
   the same `fingerprintLine` export that P4 introduced produces the key, and the endpoint keeps the
-  monitor's permission bit. Asserted in `temp/verify-p5-alerts.mjs` (100 hits on one line → one open row,
-  `occurrences = 100`, one webhook). Documented under `alerts` in
+  monitor's permission bit. Asserted in `scripts/verify-p5-alerts.mjs` (100 hits on one line → one open
+  row, `occurrences = 100`, one webhook). Documented under `alerts` in
   [docs/configuration.md](docs/configuration.md#alerts) /
   [docs/configuration.zh.md](docs/configuration.zh.md#alerts).
 
@@ -277,6 +282,29 @@ supported build, and record the commit you run.
   and `temp/`. The `Dockerfile` uses `COPY . .`, so anything left out of this file is shipped into
   the build context: the first time it is just slow, the second time it is wrong, because stale local
   build output gets mixed into an image whose dependencies were installed with `--frozen-lockfile`.
+- **The verification suites left `temp/` and became a gate.** Seven scripts asserted P1–P6 — the
+  agent's reach, approval tiers, skills, fingerprints, alerts and collaboration — but they lived in
+  `temp/`, which `.gitignore` excludes: the only record of them was a note in this file, and they ran
+  only when somebody remembered to type the path. They now live in `scripts/verify-*.mjs` beside
+  `verify-auth.mjs`, behind one entry point: `scripts/verify-all.mjs` (`pnpm verify`; `--offline` for
+  the three suites that need no database; `--list`; or a named subset such as `pnpm verify p5-alerts`)
+  runs the migrations once, spawns each suite as its own process, prints a summary table and exits
+  non-zero if any suite failed. A new reusable workflow, `.github/workflows/verify.yml`, runs the docs
+  check, both type checks and the seven suites against a throwaway `mysql:8.0` service; `build.yml`
+  (desktop artifacts) and `build-vsix.yml` (VSIX + Marketplace / Open VSX) each call it and `needs:`
+  it, so a red suite now means no package is produced — until now the release path only installed
+  and built. The same workflow runs `scripts/verify-docs.mjs`, which turns the `docs/` pairing rule
+  into assertions instead of review attention: every `foo.md` has a `foo.zh.md`, the language switch
+  line points at its twin, the h1–h4 structure matches heading for heading, both README tables list
+  every document, the *Known limitations* / *已知边界* sections carry the same number of items, links
+  resolve and code fences pair up. **Boundary:** the suites assert the *compiled* server
+  (`dist/server/**`), so `pnpm build-server` comes first, exactly as in CI; four of them need a real
+  MySQL and the offline subset is precisely the three in-memory ones, which makes
+  `pnpm verify:offline` a fast pre-commit check rather than a substitute for the full run; the
+  assertions are behavioural fixtures, not coverage — a phase that changes shape needs its fixture
+  changed too, and green proves the recorded behaviours still hold, nothing more; the docs check
+  proves structure and links, never that two prose paragraphs say the same thing. See
+  [CONTRIBUTING.md](CONTRIBUTING.md#test-scripts).
 
 ### Fixed
 

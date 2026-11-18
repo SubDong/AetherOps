@@ -397,6 +397,7 @@ pnpm run vscode:package      # build-only → prepare-vscode-runtime → vsce pa
 |----------|----------|------|
 | `.github/workflows/build-vsix.yml` | tag `aetherops-v*` | 在同一个 GitHub Release 上产出 VSIX + win/mac/linux 桌面产物；随后发布到 VS Code Marketplace（`VSCODE_TOKEN`）和 Open VSX（`OVSX_TOKEN`）。在 `master` 推送和 PR 上也会跑，但只作为构建校验任务 |
 | `.github/workflows/build.yml` | tag `v*`，或手动 dispatch 并选择平台 | 只产出桌面产物（备用渠道） |
+| `.github/workflows/verify.yml` | 由上面两条 workflow 调用，因此每个 tag、`master` 推送和 PR 都会跑 | 不产出任何可发布物 —— 它就是门禁：前后端类型检查、七套验证脚本（配一个一次性 MySQL 服务）以及双语文档检查 |
 
 还有第三条非 GitHub 的流水线：[`.cnb.yml`](../.cnb.yml) 跑在 CNB 构建平台（<https://cnb.cool>）上。
 它在 `master` 推送时做构建校验，而在 tag 推送时只构建 **Linux** 的 Electron 产物，并把它们发布到一个
@@ -407,6 +408,10 @@ pnpm run vscode:package      # build-only → prepare-vscode-runtime → vsce pa
 
 - 每个任务都在 pnpm 10 / Node 22 上用 `pnpm install --frozen-lockfile` 安装（VSIX 相关的任务在工具链
   步骤上用 Node 20，因为它们不跑服务端）。
+- `build-vsix.yml` 与 `build.yml` 都以一个 `verify` 作业起步，它 `uses:` `verify.yml`，后面每个
+  产出作业都 `needs:` 它 —— 套件红了就没有 VSIX、没有桌面端产物，也不会发到应用市场。本地等价命令是
+  `pnpm build-server`、`pnpm type-check`、`pnpm verify`、`pnpm verify:docs` 四条；
+  `pnpm verify:offline` 会跳过需要数据库的那四套。套件跑在一个用完即弃的库上，请指向允许被清空的库。
 - 当 tag 与 `packages/vscode/package.json` 里的 version 不匹配时，`build-vsix.yml` 会拒绝发版 ——
   请先提升插件版本，再打 tag。
 - 名字里含 `-` 的 tag（例如 `aetherops-v0.1.26-beta1`）会被标记为 `prerelease`。

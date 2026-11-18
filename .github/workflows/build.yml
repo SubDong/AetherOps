@@ -20,10 +20,15 @@ permissions:
 # pnpm-lock.yaml 必须同进一个 commit。
 
 jobs:
+  # 发布门禁：类型检查 + 七套验证脚本 + 双语文档（见 .github/workflows/verify.yml）
+  verify:
+    uses: ./.github/workflows/verify.yml
+
   # ============================================================
   # Windows Build
   # ============================================================
   build-windows:
+    needs: verify
     if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'win' }}
     runs-on: windows-latest
     steps:
@@ -83,6 +88,7 @@ jobs:
   # macOS Build
   # ============================================================
   build-macos:
+    needs: verify
     if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'mac' }}
     runs-on: macos-latest
     steps:
@@ -157,6 +163,7 @@ jobs:
   # Linux Build
   # ============================================================
   build-linux:
+    needs: verify
     if: ${{ github.event_name == 'push' || inputs.platforms == 'all' || inputs.platforms == 'linux' }}
     runs-on: ubuntu-latest
     steps:

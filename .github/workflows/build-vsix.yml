@@ -26,7 +26,13 @@ permissions:
 # 升级 @cicctencent/agent-core / vite 走 pnpm run upgrade-pin，package.json 与 lock 同提交。
 
 jobs:
+  # 发布门禁：类型检查 + 七套验证脚本 + 双语文档（见 .github/workflows/verify.yml）。
+  # 跑在标签、master 推送和每个 PR 上 —— 检查不过就不会有新的 vsix / 安装包。
+  verify:
+    uses: ./.github/workflows/verify.yml
+
   build-vsix:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
