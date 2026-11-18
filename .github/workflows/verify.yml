@@ -76,8 +76,6 @@ jobs:
           --health-timeout=5s
           --health-retries=30
     env:
-      # 数据目录放 runner 的临时目录：配置模板、加密密钥都写在这里，不碰 $HOME
-      AETHEROPS_DATA_DIR: ${{ runner.temp }}/aetherops-data
       AETHEROPS_DB_HOST: 127.0.0.1
       AETHEROPS_DB_PORT: '3306'
       AETHEROPS_DB_USER: root
@@ -113,5 +111,10 @@ jobs:
       - name: Build server
         run: pnpm build-server
 
+      # 数据目录放 runner 的临时目录：配置模板、加密密钥都写在这里，不碰 $HOME。
+      # `runner` 上下文在 job 级 env 里是未识别的值（被 call 的复用工作流直接报
+      # "Unrecognized named-value: 'runner'"，整个 workflow 起不来），只能放在 step 级。
       - name: Run verification suites
+        env:
+          AETHEROPS_DATA_DIR: ${{ runner.temp }}/aetherops-data
         run: node scripts/verify-all.mjs
