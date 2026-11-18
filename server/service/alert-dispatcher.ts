@@ -15,7 +15,7 @@
  */
 import * as crypto from 'crypto';
 import type { AlertsConfig } from '../utils/config';
-import type { AlertRow } from '../db/repositories/alert.repo';
+import type { AlertOnCallRow, AlertRow } from '../db/repositories/alert.repo';
 
 export type AlertDeliveryKind = 'created' | 'escalated';
 
@@ -23,6 +23,18 @@ export interface AlertWebhookPayload {
   event: 'alert.created' | 'alert.escalated';
   deliveredAt: string;
   ownerId: string;
+  /**
+   * 此刻的值班人（alert_oncall 的时间窗命中者）。
+   * 只给数据、不代收件人决定怎么 @：飞书是 <at user_id="...">、Slack 是 <@U123>，
+   * 写死一种语法会让另一半接收端拿到看不懂的字符串。mention 只是缺省建议。
+   */
+  onCall: {
+    userId: string;
+    username: string;
+    displayName: string;
+    /** 缺省的 @ 文本（@username）；接收端可忽略并按自己的语法重拼 */
+    mention: string;
+  } | null;
   alert: {
     id: number;
     connectionId: string;
@@ -66,11 +78,24 @@ export const DEFAULT_RETRY_DELAYS_MS = [30_000, 120_000, 600_000];
 /** 同一指纹的投递去抖窗口 */
 export const DEFAULT_DEBOUNCE_MS = 5 * 60_000;
 
-export function buildPayload(kind: AlertDeliveryKind, alert: AlertRow, now = new Date()): AlertWebhookPayload {
+export function buildPayload(
+  kind: AlertDeliveryKind,
+  alert: AlertRow,
+  onCall?: AlertOnCallRow | null,
+  now = new Date(),
+): AlertWebhookPayload {
   return {
     event: kind === 'escalated' ? 'alert.escalated' : 'alert.created',
     deliveredAt: now.toISOString(),
     ownerId: alert.ownerId,
+    onCall: onCall
+      ? {
+        userId: onCall.userId,
+        username: onCall.username,
+        displayName: onCall.displayName,
+        mention: `@${onCall.username}`,
+      }
+      : null,
     alert: {
       id: alert.id,
       connectionId: alert.connectionId,
@@ -107,8 +132,8 @@ export class AlertDispatcher {
   }
 
   /** 投递入口：调用方不需要 await，也不需要处理异常 */
-  enqueue(kind: AlertDeliveryKind, alert: AlertRow): void {
-    void this.dispatch(kind, alert).catch((error: any) => {
+  enqueue(kind: AlertDeliveryKind, alert: AlertRow, onCall?: AlertOnCallRow | null): void {
+    void this.dispatch(kind, alert, onCall).catch((error: any) => {
       this.log(`[AlertDispatcher] 投递异常（已忽略）: ${error?.message || error}`);
     });
   }
@@ -117,7 +142,7 @@ export class AlertDispatcher {
    * 真正发一次（含重试）。返回结果供验证脚本断言；
    * 生产路径只走 enqueue，不关心返回值。
    */
-  async dispatch(kind: AlertDeliveryKind, alert: AlertRow): Promise<DispatchResult> {
+  async dispatch(kind: AlertDeliveryKind, alert: AlertRow, onCall?: AlertOnCallRow | null): Promise<DispatchResult> {
     const config = this.options.getConfig();
     const url = (config.webhookUrl || '').trim();
     if (!url) return { delivered: false, skipped: true, attempts: 0 };
@@ -131,7 +156,7 @@ export class AlertDispatcher {
     this.sentAt.set(key, stamp);
     this.pruneSent(stamp);
 
-    const body = JSON.stringify(buildPayload(kind, alert, new Date(stamp)));
+    const body = JSON.stringify(buildPayload(kind, alert, onCall, new Date(stamp)));
     const headers = this.buildHeaders(kind, body, Math.floor(stamp / 1000), (config.webhookSecret || '').trim());
 
     let attempts = 0;

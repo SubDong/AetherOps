@@ -200,6 +200,30 @@ export async function queryAuditEvents(q: AuditQueryRow): Promise<{ entries: Aud
   return { entries: rows.map(toEntry), total: Number(countRow?.n) || 0 };
 }
 
+/**
+ * 「这次报错之后，哪条命令跑成功了」—— recall_fix 的专用查询（P6）。
+ *
+ * 为什么单独写一条而不是复用 queryAuditEvents：
+ * - 排序方向相反：修好它的那条命令通常是失败之后**最早**成功的那条，而列表要最新的；
+ * - 必须按 connection + 时间下界收窄：跨主机、跨时间窗的成功命令与这次故障无关；
+ * - LIMIT 200 是硬上限：命中太多时宁可只给最早的 200 条候选，也不把整张表拉进内存。
+ * 指纹匹配留给服务层做（要复用 utils/fingerprint，不能在 SQL 里重算）。
+ */
+export async function listSuccessfulCommandsAfter(
+  ownerId: string,
+  connectionId: string,
+  since: Date,
+): Promise<AuditEventRow[]> {
+  const rows = await query<any>(
+    `SELECT ${SELECT_COLUMNS} FROM audit_events
+      WHERE owner_id = ? AND connection_id = ? AND status = 'success' AND tool = 'execute_command'
+        AND occurred_at > ?
+      ORDER BY occurred_at ASC, id ASC LIMIT 200`,
+    [ownerId, connectionId, since],
+  );
+  return rows.map(toEntry);
+}
+
 /** 导出用：某个账号在一段日期范围内的全部流水 */
 export async function listAuditRange(ownerId: string, startDate: string, endDate: string): Promise<AuditEventRow[]> {
   const rows = await query<any>(

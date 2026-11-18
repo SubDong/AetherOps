@@ -8,6 +8,10 @@ import type { FingerprintService } from './fingerprint.service';
 import { assessDangerousCommand } from '../utils/shell';
 import type { CommandRiskLevel } from '../utils/shell';
 import { assertReadablePath } from '../utils/security';
+import { fingerprintLine, pickFailureLine } from '../utils/fingerprint';
+import { getErrorFingerprint } from '../db/repositories/error-fingerprint.repo';
+import { listSuccessfulCommandsAfter } from '../db/repositories/audit.repo';
+import type { AuditEventRow } from '../db/repositories/audit.repo';
 import {
   AgentEngine, ToolRegistry, ContextManager, SecurityGuard,
   createLLMProvider,
@@ -350,6 +354,23 @@ function oneLine(value: string, max: number): string {
   return text.length > max ? `${text.slice(0, max)}...` : text;
 }
 
+/**
+ * 一条「成功」的命令，输出里是否仍带着同一个错误（recall_fix 的过滤条件）。
+ *
+ * 退出码 0 不等于修好：`systemctl restart nginx` 成功了、输出里却还在打同一个错误，
+ * 把它当成「上次的修法」教给模型，下次一定还是同一个故障。
+ * 只扫前 8000 字符：指纹行几乎总在输出开头，扫全量 MEDIUMTEXT 没有意义。
+ */
+function outputCarriesFingerprint(result: string, fingerprint: string): boolean {
+  const text = String(result || '').slice(0, 8000);
+  if (!text) return false;
+  for (const line of text.split(/\r?\n/)) {
+    const sample = line.trim();
+    if (sample && fingerprintLine(sample)?.fingerprint === fingerprint) return true;
+  }
+  return false;
+}
+
 /** agentRun 每轮通过 context.custom 带进来的「本轮已加载的技能」缓存 */
 const SKILL_CACHE_KEY = 'skillCache';
 
@@ -511,9 +532,10 @@ Your capabilities:
 6. Read the beginning of a file on a host that already has an open terminal via the read_file tool
 7. Run one command on several already-open hosts at once via the run_on_hosts tool
 8. Load a skill's full instructions on demand via the load_skill tool (only the catalog is in your prompt)
-9. Understand command execution results and make decisions accordingly
-10. Automatically complete multi-step tasks
-11. Generate script files to execute complex or multi-step operations
+9. Recall which command stopped this exact error last time via the recall_fix tool (fingerprint-based, same host)
+10. Understand command execution results and make decisions accordingly
+11. Automatically complete multi-step tasks
+12. Generate script files to execute complex or multi-step operations
 
 Working principles:
 1. **Take action**: When the user asks you to do something, use tools to execute directly, don't just suggest commands
@@ -522,8 +544,8 @@ Working principles:
 4. **Step-by-step**: Complete complex tasks step by step, checking results after each step
 5. **Error handling**: If a command fails, analyze the cause and try to fix it or use an alternative
 6. **Past vs now**: top / df / free only show this instant. For anything about trends, peaks, or "what happened earlier" (e.g. "why was it slow at 3am"), call query_metrics instead of extrapolating from a single snapshot
-7. **Memory**: before guessing at a fix, or telling the user you don't know what changed, check whether this exact failure happened before - search_audit finds earlier failures on the same connection and the commands that followed them
-8. **Reach**: apart from query_metrics and search_audit (which read stored history), every tool works only on hosts that already have an open terminal session - nothing dials a new connection. If the target host has no open terminal, say so and ask the user to open one; never describe it as the host being unreachable
+7. **Memory**: before guessing at a fix, or telling the user you don't know what changed, check whether this exact failure happened before - search_audit finds earlier failures on the same connection and the commands that followed them. recall_fix answers the narrower question (which command made this exact error stop) and only returns commands that succeeded after the failure and whose output no longer carried it
+8. **Reach**: apart from query_metrics, search_audit and recall_fix (which read stored history), every tool works only on hosts that already have an open terminal session - nothing dials a new connection. If the target host has no open terminal, say so and ask the user to open one; never describe it as the host being unreachable
 9. **Wide reach needs intent**: run_on_hosts runs the same command on every targeted host, so use it when the user actually asked for a sweep (inventory, health check, "all web servers"). Changing something on many hosts at once is not a decision you make on your own
 10. **Permission denials are final**: if a tool answers PERMISSION_DENIED, this account was never granted it. Report that to the user; do not retry with other arguments and do not try to reproduce the tool with execute_command
 11. **Skills are loaded, not assumed**: the catalog tells you which runbooks exist and what each is for, not what they contain. When a task matches one, call load_skill first and follow that playbook instead of improvising; load only what the task needs
@@ -1417,6 +1439,45 @@ export class AIService {
       },
       category: 'builtin',
     });
+
+    // recall_fix —— 按错误指纹召回「上次是怎么修好的」（P6）。只读指纹表 + 审计，不碰终端。
+    this.toolRegistry.register({
+      definition: {
+        type: 'function',
+        function: {
+          name: 'recall_fix',
+          description: 'Recall how this exact error was fixed last time. Give the error line from the failing output '
+            + '(error_text) or its 16-char fingerprint, and this returns up to 3 commands on the SAME host that '
+            + 'succeeded after that error first appeared and whose own output no longer contained it. Use it before '
+            + 'guessing at a fix when a failure looks familiar ("it broke again"). It only reads stored history and '
+            + 'never runs anything; it only knows commands executed through this app, not commands typed by hand.',
+          parameters: {
+            type: 'object',
+            properties: {
+              error_text: {
+                type: 'string',
+                description: 'One line copied from the failing output (the error line). The fingerprint is computed '
+                  + 'from it the same way the failure log computes it.',
+              },
+              fingerprint: {
+                type: 'string',
+                description: '16 hex chars identifying the error, when you already have it (e.g. printed next to an '
+                  + 'alert or a fingerprint note). Takes precedence over error_text.',
+              },
+              connection_id: {
+                type: 'string',
+                description: 'Which host to search (id from list_connections). Defaults to the connection the '
+                  + 'terminal attached to this chat belongs to.',
+              },
+            },
+          },
+        },
+      },
+      executor: async (args: Record<string, unknown>, ctx: ToolContext) => (
+        this.recallFix(ownerIdOf(ctx), terminalSessionOf(ctx), args)
+      ),
+      category: 'builtin',
+    });
   }
 
   // ========== 命令安全检查 ==========
@@ -1906,6 +1967,114 @@ export class AIService {
 
     const output = lines.join('\n');
     return output.length > 8000 ? `${output.slice(0, 8000)}\n... (truncated)` : output;
+  }
+
+  /**
+   * recall_fix 的实现（P6）。
+   *
+   * 与 search_audit 的分工：search_audit 回答「这个错误以前出过吗」，recall_fix 只回答
+   * 「哪条命令让它停下来了」—— 它回的是**失败之后成功**的命令，而且这些命令自己的输出里
+   * 不能还带着同一个错误（退出码 0 不等于修好）。
+   *
+   * 时间下界用指纹行的 firstSeen 而不是 lastSeen：lastSeen 就是这次复发本身，
+   * 从它往后查只会拿到复发之后的尝试，恰好把「上次修好的那条」排除掉。
+   * firstSeen 之后、本次复发之前的成功命令里，最新的几条才是可复用的修法。
+   *
+   * 为什么不直接扫 audit_events 找带指纹的失败行：指纹是归一化 + 哈希算出来的，
+   * 库里没有这一列（也不该为一次查询改历史表），LIKE 原文还会漏掉换了时间戳/路径的同一错误。
+   */
+  private async recallFix(ownerId: string, currentSessionId: string, args: Record<string, any>): Promise<string> {
+    if (!this.auditService) {
+      return 'AUDIT_UNAVAILABLE: command history is not available in this deployment.';
+    }
+    if (!ownerId) {
+      return 'AUDIT_UNAVAILABLE: this run has no account binding, so no history can be recalled.';
+    }
+
+    // 指纹：显式给的优先；只给原文就按 P4 同一条路径现算（pickFailureLine → fingerprintLine），
+    // 模型把终端里那行报错原样抄进来就能命中，不需要它自己算 hash。
+    const explicit = typeof args?.fingerprint === 'string' ? args.fingerprint.trim().toLowerCase() : '';
+    if (explicit && !/^[0-9a-f]{16}$/.test(explicit)) {
+      return `Invalid fingerprint "${oneLine(explicit, 40)}": expected 16 hex chars (as shown next to the failure). `
+        + 'Omit it and pass error_text instead if you only have the error line.';
+    }
+    const errorText = typeof args?.error_text === 'string' ? args.error_text.trim() : '';
+    let fingerprint = explicit;
+    if (!fingerprint && errorText) {
+      const sample = pickFailureLine(errorText);
+      fingerprint = sample ? (fingerprintLine(sample)?.fingerprint || '') : '';
+    }
+    if (!fingerprint) {
+      return 'Invalid arguments: pass error_text (one line copied from the failing output) or fingerprint '
+        + '(16 hex chars). Both being empty means there is no error to look up.';
+    }
+
+    // 目标主机：显式 connection_id 优先，否则用这个对话绑定的终端所在的连接。
+    // 读会话元数据而不是 getSession：终端关掉之后历史也该查得到，这正是 recall_fix 的用法。
+    let connectionId = typeof args?.connection_id === 'string' ? args.connection_id.trim() : '';
+    if (!connectionId && currentSessionId && this.sshService) {
+      const meta = (this.sshService.getSessions(ownerId) || [])
+        .find((session) => String(session?.sessionId || '') === currentSessionId);
+      connectionId = String(meta?.connectionId || '');
+    }
+    if (!connectionId) {
+      return 'NO_TARGET_CONNECTION: this chat has no terminal, or its connection could not be resolved. '
+        + 'Pass connection_id (ids come from list_connections). recall_fix only reads stored history - it never '
+        + 'dials a host, so this is not about the host being reachable.';
+    }
+
+    let record: Awaited<ReturnType<typeof getErrorFingerprint>>;
+    try {
+      record = await getErrorFingerprint(ownerId, connectionId, fingerprint);
+    } catch (error: any) {
+      return `FINGERPRINT_QUERY_FAILED: ${error?.message || error}`;
+    }
+    if (!record) {
+      return `FINGERPRINT_NOT_FOUND: fingerprint ${fingerprint} has no recorded occurrence on connection `
+        + `"${connectionId}". Only commands that failed through this app are fingerprinted - if this error was seen '
+        + 'in a log or typed by hand, use search_audit with a keyword from the error instead.`;
+    }
+
+    let rows: AuditEventRow[];
+    try {
+      rows = await listSuccessfulCommandsAfter(ownerId, connectionId, record.firstSeen);
+    } catch (error: any) {
+      return `AUDIT_SEARCH_FAILED: ${error?.message || error}`;
+    }
+
+    const fixed = rows.filter((row) => !outputCarriesFingerprint(row.result, fingerprint));
+    const firstAt = new Date(record.firstSeen).toISOString().replace('T', ' ').slice(0, 19);
+    const lastAt = new Date(record.lastSeen).toISOString().replace('T', ' ').slice(0, 19);
+
+    if (!fixed.length) {
+      return `No successful command on connection "${connectionId}" after this error first appeared (${firstAt} UTC) `
+        + 'stopped showing it. Either it is still unfixed, or the fix was done by hand - the audit log only covers '
+        + 'commands executed through this app. Use search_audit with a keyword from the error to see what was run '
+        + 'around that time.';
+    }
+
+    // 只回最新的 3 条：修好它的是复发前最近的一次成功，更早的往往是「试了但没解决」
+    const picked = fixed.slice(-3);
+    const lines = [
+      `Recall for fingerprint ${fingerprint} on connection "${connectionId}"`,
+      `  error: ${oneLine(record.sampleText, 300)}`,
+      `  seen ${record.occurrences} time(s); first ${firstAt} UTC, latest ${lastAt} UTC`,
+      '',
+      `${fixed.length} successful command(s) no longer showed this error; showing the latest ${picked.length} `
+        + '(oldest first, times in UTC):',
+    ];
+    picked.forEach((entry, index) => {
+      const when = new Date(entry.timestamp).toISOString().replace('T', ' ').slice(0, 19);
+      const host = entry.connectionId || connectionId;
+      lines.push(`${index + 1}. ${when} | conn=${host} | ${entry.tool || 'execute_command'} | ${entry.duration}ms`);
+      if (entry.command) lines.push(`   cmd: ${oneLine(entry.command, 300)}`);
+      if (entry.result) lines.push(`   out: ${oneLine(entry.result, 200)}`);
+    });
+    lines.push('', 'These are candidates, not a proven fix: re-check that the command still fits the current state of the '
+      + 'host before reusing it. If the newest candidate predates the latest failure, that earlier fix did not stick.');
+
+    const output = lines.join('\n');
+    return output.length > 6000 ? `${output.slice(0, 6000)}\n... (truncated)` : output;
   }
 
   /**

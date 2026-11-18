@@ -213,6 +213,9 @@ const EXACT_PERMISSIONS: Record<string, PermissionKey[]> = {
   '/api/ai/testProfile': ['aiConfig'],
   '/api/ai/getSkills': ['skills', 'ai'],
   '/api/ai/getSkill': ['skills', 'ai'],
+  // 技能自建（P6）：写自己的技能库，不碰别人的，也不碰内置技能文件
+  '/api/ai/saveSkill': ['skills', 'ai'],
+  '/api/ai/deleteSkill': ['skills', 'ai'],
 };
 
 const PREFIX_PERMISSIONS: Array<[string, PermissionKey[]]> = [
@@ -288,6 +291,17 @@ function parseAlertId(value: any): number {
   const id = Number(value);
   if (!Number.isInteger(id) || id <= 0) throw new ApiError('Missing parameter: id', 400);
   return id;
+}
+
+/** incident 状态只有两个；写错不能被当成「查全部」 */
+const INCIDENT_STATUSES = ['open', 'resolved'] as const;
+function parseIncidentStatus(value: any): 'open' | 'resolved' | '' {
+  if (value === undefined || value === null || value === '') return '';
+  const status = String(value);
+  if (!(INCIDENT_STATUSES as readonly string[]).includes(status)) {
+    throw new ApiError(`status 只能是 ${INCIDENT_STATUSES.join(' / ')}`, 400);
+  }
+  return status as 'open' | 'resolved';
 }
 
 /**
@@ -609,6 +623,31 @@ export async function handleRoutes(pathname: string, body: any, ctx: AuthContext
       return skill;
     }
 
+    // 新建/更新用户技能（P6）：校验在 SkillService 里，这里只收参数
+    if (pathname === '/api/ai/saveSkill') {
+      try {
+        return await skillService.saveUserSkill(ownerId, {
+          id: body?.id,
+          name: body?.name,
+          description: body?.description,
+          tags: body?.tags,
+          content: body?.content,
+        });
+      } catch (e: any) {
+        // 校验失败是参数问题（400），不要报成 500 让前端以为服务挂了
+        throw new ApiError(e?.message || '保存技能失败', 400);
+      }
+    }
+
+    // 删除用户技能：只能删自己的；内置技能不在库里，删不到
+    if (pathname === '/api/ai/deleteSkill') {
+      const id = typeof body?.id === 'string' ? body.id.trim().toLowerCase() : '';
+      if (!id) throw new ApiError('Missing parameter: id', 400);
+      const removed = await skillService.deleteUserSkill(ownerId, id);
+      if (!removed) throw new ApiError('技能不存在或属于内置技能', 404);
+      return true;
+    }
+
     // ========== 审计日志 ==========
 
     // 查询审计日志
@@ -742,6 +781,72 @@ export async function handleRoutes(pathname: string, body: any, ctx: AuthContext
       const rule = typeof body?.rule === 'string' ? body.rule : '';
       if (!rule.trim()) throw Error('Missing parameter: rule');
       return await alertService.unmute(ownerId, rule);
+    }
+
+    // ========== 告警协同（P6：认领 / 值班 / 事件归并） ==========
+
+    // 认领 = 确认 + 指派给自己（已解决 → 409）
+    if (pathname === '/api/alerts/claim') {
+      const id = parseAlertId(body?.id);
+      const updated = await alertService.claim(ownerId, id, ctx.userId);
+      if (!updated) throw new ApiError('告警不存在或已解决', 409);
+      return updated;
+    }
+
+    // 转派 / 取消指派（assigneeId 传空表示清空）
+    if (pathname === '/api/alerts/assign') {
+      const id = parseAlertId(body?.id);
+      const assigneeId = typeof body?.assigneeId === 'string' ? body.assigneeId : '';
+      try {
+        const updated = await alertService.assign(ownerId, id, assigneeId);
+        if (!updated) throw new ApiError('告警不存在或已解决', 409);
+        return updated;
+      } catch (e: any) {
+        // 服务层只在这里抛「成员不存在」，转成 400 让前端能提示而不是当 500
+        if (/member/i.test(e?.message || '')) throw new ApiError(e.message, 400);
+        throw e;
+      }
+    }
+
+    // 可指派成员（只有 id / username / displayName）
+    if (pathname === '/api/alerts/members') {
+      return await alertService.members();
+    }
+
+    // 值班表：只影响 webhook 里的 onCall，不建通知渠道
+    if (pathname === '/api/alerts/oncall') {
+      return await alertService.onCall(ownerId);
+    }
+
+    if (pathname === '/api/alerts/setOncall') {
+      try {
+        return await alertService.setOnCall(ownerId, body?.userId, body?.startMinute, body?.endMinute);
+      } catch (e: any) {
+        // 时间窗参数错（不在 0-1439 / 长度为 0 / 成员不存在）都是参数问题，不能报成 500
+        throw new ApiError(e?.message || '保存值班时间窗失败', 400);
+      }
+    }
+
+    if (pathname === '/api/alerts/clearOncall') {
+      try {
+        return await alertService.clearOnCall(ownerId, body?.userId, body?.startMinute);
+      } catch (e: any) {
+        throw new ApiError(e?.message || '删除值班时间窗失败', 400);
+      }
+    }
+
+    // 事件列表（规则版归并的结果）
+    if (pathname === '/api/alerts/incidents') {
+      const status = parseIncidentStatus(body?.status);
+      return await alertService.incidents(ownerId, { status, limit: body?.limit });
+    }
+
+    // 人工关联：并进同主机仍然活跃的事件（没有就新建）
+    if (pathname === '/api/alerts/attachIncident') {
+      const id = parseAlertId(body?.id);
+      const result = await alertService.attachIncident(ownerId, id);
+      if (!result) throw new ApiError('告警不存在', 404);
+      return result;
     }
 
     // ========== 批量操作 ==========

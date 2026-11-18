@@ -204,8 +204,12 @@ backend, plus **multi-account access control** so a team can share one deploymen
   notice), and repeated loads within the same turn are served from a per-turn cache.
 - There is no tag-based auto-matching: the match happens in the prompt, by the model reading the
   catalog.
-- User-scoped skills live in the `skills` table (schema and service layer in place; the write API
-  is not exposed yet — see [docs/skills-guide.md](./docs/skills-guide.md)).
+- User-scoped skills are written from the skills panel: `/api/ai/saveSkill` and
+  `/api/ai/deleteSkill` (behind `skills` + `ai`) create, update and delete a skill that belongs
+  to one account. An id must match `^[a-z0-9][a-z0-9._-]{0,63}$`, a built-in id cannot be
+  overwritten, the body is capped at 20,000 characters, and tags are trimmed, de-duplicated and
+  limited to eight. The built-in playbooks in `data/skills/` stay files on disk and read-only in
+  that editor — see [docs/skills-guide.md](./docs/skills-guide.md).
 
 ### Command audit & replay
 
@@ -219,12 +223,26 @@ backend, plus **multi-account access control** so a team can share one deploymen
   summary, so *"this exact failure happened before — here is what we ran next"* is answered from
   data instead of a fresh guess. Coverage stops at what this app ran: commands typed by hand into a
   terminal are not recorded, and the tool says so when a search comes back empty.
+- **It also remembers the fix.** `recall_fix` takes the error line (or its fingerprint) and returns
+  up to three commands that succeeded on that host *after the error first appeared* and whose own
+  output no longer contains it — so "it broke again" is answered with the command that fixed it the
+  first time, not with the command that already failed. Read-only: it never dials a host, and it
+  only knows commands this app ran.
 
 ### Real-time log monitoring + AI anomaly detection
 
 - `tail -f` any log file on a remote host or locally; patterns for ERROR / FATAL / CRITICAL /
   Exception / Traceback raise categorized alerts; color-coded streaming; one click sends the recent
   window to the agent for analysis.
+- **A hit becomes a row that belongs to someone, not a line that vanishes on reload.** Rule
+  matches raise alerts stored in MySQL (`open` / `acked` / `resolved`, de-duplicated per host +
+  fingerprint, with an occurrence count) and can be pushed to `alerts.webhookUrl` under an HMAC
+  signature. In the panel a row can be **claimed** (acknowledge and take ownership in one
+  click), **assigned** to another active account, and **merged** into an incident — three
+  unresolved alerts on one host inside 30 minutes group themselves. An **on-call roster**
+  (account + time window) decides who is @-mentioned in the webhook; it does not open a second
+  notification channel.
+- Details: [docs/configuration.md](./docs/configuration.md#alerts).
 
 ### Batch operations
 
@@ -544,8 +562,6 @@ Honest status, so nobody files the same issue twice:
 - **Jump-host sessions**: the AI environment context describes the *target* machine, but the status
   panel and file manager use the direct SSH channel, so on a bastion-only connection they describe
   the bastion. Use a real `-J`/ProxyJump style connection when you need end-to-end tooling.
-- **Per-account skill creation** has storage and service support but no UI/API yet; today you edit
-  `data/skills/*.md` (or mount that directory in Docker).
 - **`scripts/smoke-terminal.mjs` predates the account system**: it calls the API without a bearer
   token, so against an instance with authentication enabled (always, today) it stops at the first
   call with 401. `verify-auth.mjs` is the script that currently works end to end; teaching the smoke

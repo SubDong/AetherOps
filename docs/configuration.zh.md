@@ -136,6 +136,19 @@ AetherOps 实际连上的那台机器 —— 也就是跳板机本身，和状�
 规则级静默（告警页里的 **静默** 菜单，存在 `alert_mutes`）只压制投递。静默期间的命中照样计数，
 窗口过去后能看到那段时间到底发生了什么。
 
+认领、指派与归并都挂在告警旁边，**这一段没有新增任何键** —— 没有可配置的东西：
+
+- **认领**一步完成确认 + 把处理人设成自己；**指派**只改处理人，第一个确认人留给它 —— 这两件事本来就
+  不是一回事。可指派成员就是本账号下 `active` 的账号；指派给停用账号会被拒绝。
+- **值班**（`alert_oncall`）是「账号 + 一天中的分钟窗口」，`start > end` 表示跨零点，两端都是左闭右开
+  （08:00 结束的那一班与 08:00 开始的那一班在接口处交接）。它只改一件事：告警触发时的 webhook 正文里多
+  一个 `onCall`（`userId`、`username`、`displayName`、`mention`），写明此刻谁在岗。投递、去抖与重试全
+  部不变，也不会另开通知渠道 —— 要不要打电话、发邮件、推 IM，由接收端自己决定。
+- **事件**（`incidents`）按主机归并告警：同一连接 30 分钟内凑够 3 条未解决的告警就算一件事，之后同一台
+  主机的命中继续并进去，其它行可以手动关联，最后一条关联告警解决时事件自己关闭。这是一条启发式规则，
+  不是根因判断 —— 30 分钟窗口与 3 条阈值是 `server/db/repositories/incident.repo.ts` 里的常量，
+  不对外开放配置。
+
 `loadConfig` 在进程内缓存，也没有任何东西盯着文件：**改完这一段或 `AETHEROPS_ALERTS_*` 变量必须重启服务**。
 本页其它段落同理。
 
@@ -200,6 +213,7 @@ AI 服务商的设置（Base URL、Key、模型）**不能**通过环境变量�
 | `0008-connection-sampling` | `connections.sampling`（`''` = 跟随 `metrics.offlineSampling`，`skip` = 无人值守时永不拨号这个连接） |
 | `0009-error-fingerprints` | 新增 `error_fingerprints`：每个归属 / 连接 / 指纹一行，记 `occurrences`、`first_seen`、`last_seen`（由 Agent 的 `after_tool` 钩子写入） |
 | `0010-alerts` | 新增 `alerts`（有状态告警：`open` / `acked` / `resolved`，靠生成列 `open_key` 按归属 + 连接 + 指纹去重）与 `alert_mutes`（规则级静默窗口） |
+| `0011-collaboration` | `alerts.assignee_id` / `alerts.incident_id` 两列，另加 `idx_alerts_assignee` / `idx_alerts_incident`；新增 `incidents`（每个归属 / 连接的事件一行，`open` / `resolved`，`alert_count` 以 alerts 表为准刷新）与 `alert_oncall`（账号 + 一天中的分钟班次，主键 `(owner_id, user_id, start_minute)`） |
 
 如果你打算加迁移，这些表结构约束值得先知道：
 
@@ -235,11 +249,11 @@ node scripts/migrate.mjs --force     # 忽略 checksum 不一致 / 已应用的�
 | Token 用量与成本 | MySQL `ai_usage` | 否 |
 | 预算上限 | MySQL `ai_budget` | 否 |
 | 审计事件（命令、传输、被拦截/被改写） | MySQL `audit_events` | 否 |
-| 技能 | MySQL `skills`（用户技能）+ `<app>/data/skills/*.md`（内置技能） | 否 |
+| 技能 | MySQL `skills`（用户技能，从技能编辑器写入）+ `<app>/data/skills/*.md`（内置技能） | 否 |
 | 命令片段 | MySQL `snippets` | 否 |
 | 主机指标历史（每分钟的 CPU / 内存 / 磁盘 / load） | MySQL `host_metrics_minute`（按归属隔离） | 否 |
 | 错误指纹（每个归属 / 连接 / 归一化错误一行） | MySQL `error_fingerprints` | 否 |
-| 告警与规则级静默 | MySQL `alerts`、`alert_mutes`（按归属隔离） | 否 |
+| 告警、规则级静默、事件与值班表 | MySQL `alerts`（含 `assignee_id` / `incident_id`）、`alert_mutes`、`incidents`、`alert_oncall`（按归属隔离） | 否 |
 | 账号（scrypt 哈希、角色、状态、10 个权限位） | MySQL `users` | 只存口令哈希，不可逆 |
 | 登录令牌 | Redis（`aetherops:token:*`，哈希存储，滑动 TTL） | 不适用 |
 | 解密密钥 | 数据目录下的 `*.key` 文件 | 这些**就是**秘密本身 |

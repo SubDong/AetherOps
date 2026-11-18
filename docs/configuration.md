@@ -149,6 +149,24 @@ Rule-level silence (the **Mute** menu in the Alerts tab, stored in `alert_mutes`
 delivery. Matching lines are still counted while muted, so you can see what happened during the
 silent window once it expires.
 
+Ownership and grouping sit beside the alerts and have **no keys in this section** — there is nothing
+to configure:
+
+- **Claim** acknowledges a row and assigns it to you in one step; **Assign** moves only the assignee
+  and keeps the first acknowledger, because those are two different facts. The member list is the
+  account's `active` users; assigning to a disabled account is refused.
+- **On-call** (`alert_oncall`) is a roster of account + minute-of-day window, `start > end` crossing
+  midnight, half-open at both ends (a shift ending at 08:00 hands over to the one starting at
+  08:00). It changes exactly one thing: the webhook body carries `onCall` (`userId`, `username`,
+  `displayName`, `mention`) for whoever is on duty when the alert fires. Delivery, debounce and
+  retries are unchanged and no second channel is opened — whether to page, mail or post to IM is the
+  receiver's decision.
+- **Incidents** (`incidents`) group alerts by host: three unresolved alerts on one connection within
+  30 minutes become one incident, later hits on that host join it, other rows can be attached by
+  hand, and it closes when its last attached alert is resolved. This is a heuristic and not a
+  diagnosis — the window and the threshold are constants in
+  `server/db/repositories/incident.repo.ts`, not configuration.
+
 `loadConfig` caches the file in-process and nothing watches it: **restart the server after editing
 this section or the `AETHEROPS_ALERTS_*` variables**. The same applies to every other section here.
 
@@ -214,6 +232,7 @@ statement text with whitespace normalized.
 | `0008-connection-sampling` | `connections.sampling` (`''` = follow `metrics.offlineSampling`, `skip` = never dial this connection unattended) |
 | `0009-error-fingerprints` | New `error_fingerprints`: one row per owner / connection / fingerprint, with `occurrences`, `first_seen`, `last_seen` (written by the agent `after_tool` hook) |
 | `0010-alerts` | New `alerts` (stateful alerts: `open` / `acked` / `resolved`, deduplicated by owner + connection + fingerprint through the generated column `open_key`) and `alert_mutes` (rule-level silence windows) |
+| `0011-collaboration` | `alerts.assignee_id` / `alerts.incident_id` plus `idx_alerts_assignee` / `idx_alerts_incident`; new `incidents` (one row per owner / connection event, `open` / `resolved`, `alert_count` refreshed from the alerts table) and `alert_oncall` (account + minute-of-day shift, primary key `(owner_id, user_id, start_minute)`) |
 
 Schema constraints worth knowing if you intend to add a migration:
 
@@ -252,11 +271,11 @@ node scripts/migrate.mjs --force     # ignore checksum mismatch / already-applie
 | Token usage and cost | MySQL `ai_usage` | no |
 | Budget caps | MySQL `ai_budget` | no |
 | Audit events (commands, transfers, blocked/rewritten) | MySQL `audit_events` | no |
-| Skills | MySQL `skills` (user) + files in `<app>/data/skills/*.md` (built-in) | no |
+| Skills | MySQL `skills` (user, written from the skills editor) + files in `<app>/data/skills/*.md` (built-in) | no |
 | Command snippets | MySQL `snippets` | no |
 | Host metrics history (per-minute CPU / memory / disk / load) | MySQL `host_metrics_minute` (owner-scoped) | no |
 | Error fingerprints (one row per owner / connection / normalized error) | MySQL `error_fingerprints` | no |
-| Alerts and rule-level mutes | MySQL `alerts`, `alert_mutes` (owner-scoped) | no |
+| Alerts, rule-level mutes, incidents and the on-call roster | MySQL `alerts` (with `assignee_id` / `incident_id`), `alert_mutes`, `incidents`, `alert_oncall` (owner-scoped) | no |
 | Accounts (scrypt hash, role, status, 10 permission bits) | MySQL `users` | password hash only, irreversible |
 | Login tokens | Redis (`aetherops:token:*`, hashed, sliding TTL) | n/a |
 | Decryption keys | data dir `*.key` files | these **are** the secrets |

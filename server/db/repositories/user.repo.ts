@@ -59,6 +59,28 @@ export async function listUsers(): Promise<UserRecord[]> {
   return (rows as any[]).map(rowToUser);
 }
 
+/**
+ * 成员简表：告警指派 / 值班表只需要「谁能被指派」。
+ * 刻意不返回 role / permissions / 最近登录：有 monitor 权限的人能看到这份名单，
+ * 但没有任何理由顺带看到别人的权限位与登录痕迹。
+ */
+export interface MemberBrief {
+  id: string;
+  username: string;
+  displayName: string;
+}
+
+export async function listActiveMembers(): Promise<MemberBrief[]> {
+  const [rows] = await getPool().query(
+    "SELECT id, username, display_name FROM users WHERE status = 'active' ORDER BY username ASC",
+  );
+  return (rows as any[]).map((r) => ({
+    id: String(r.id),
+    username: String(r.username),
+    displayName: String(r.display_name || r.username),
+  }));
+}
+
 export async function countUsers(): Promise<number> {
   const [rows] = await getPool().query('SELECT COUNT(*) AS n FROM users');
   return Number((rows as any[])[0]?.n || 0);
@@ -136,7 +158,14 @@ export async function deleteUserRow(id: string): Promise<number> {
  */
 export async function purgeOwnerData(ownerId: string): Promise<void> {
   const pool = getPool();
-  const tables = ['ai_messages', 'ai_history', 'audit_events', 'snippets', 'skills', 'sessions', 'ai_config', 'connections'];
+  // 子表在前：alerts 挂在 incidents 上，先删告警再删事件。
+  // host_metrics_minute / error_fingerprints / alerts / alert_mutes / incidents / alert_oncall
+  // 都是 P4–P6 新增的按账号数据，漏一张就会在删号后留下孤儿行（凭 id 还能被别处读到）。
+  const tables = [
+    'ai_messages', 'ai_history', 'audit_events', 'snippets', 'skills', 'sessions', 'ai_config',
+    'host_metrics_minute', 'error_fingerprints', 'alerts', 'alert_mutes', 'incidents', 'alert_oncall',
+    'connections',
+  ];
   for (const table of tables) {
     await pool.query(`DELETE FROM ${table} WHERE owner_id = ?`, [ownerId]);
   }

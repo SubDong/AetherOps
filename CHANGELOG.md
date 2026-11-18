@@ -12,6 +12,60 @@ supported build, and record the commit you run.
 
 ### Added
 
+- **Alerts can be handed to a person: claim, assignment, an on-call roster, and rule-based
+  incidents.** Migration `0011` adds `alerts.assignee_id` / `alerts.incident_id` (with the two
+  indexes the list actually filters on), a new `incidents` table and `alert_oncall`. *Claim* is one
+  click that acknowledges the row **and** puts your name on it; *Assign* moves only the assignee —
+  the first acknowledger is kept (`acked_by` is not overwritten by a later claim), because "who saw
+  it first" and "who owns it now" are two different facts. Assignment only accepts active accounts,
+  and the list renders the account id as a display name. The on-call roster is account +
+  minute-of-day window (`start > end` means the window crosses midnight, and it is half-open, so a
+  shift ending at 08:00 hands over to the one starting at 08:00); it decides **only** who is
+  @-mentioned in the webhook payload (`onCall: { userId, username, displayName, mention:
+  '@username' }`) — no new notification channel, no mail, no IM: that stays the receiver's job.
+  Incidents are rule-based: three unresolved alerts on the same connection within a rolling 30
+  minutes become one incident, later hits on that host join it, a manual *Merge* action attaches a
+  row by hand, and an incident closes itself when its last alert is resolved. **Boundary:** no
+  root-cause inference — the grouping says "these looked like one event", nothing more; the
+  threshold counts rows whose `last_seen` falls inside the window, so an alert older than 30
+  minutes neither counts toward the third hit nor gets attached by it; two connections never merge,
+  because "same host" is the only evidence available; assignment is a label and not a permission —
+  an assignee still needs the `monitor` bit to open the panel, and an empty string clears it;
+  claiming or assigning sends no webhook, since delivery still fires only on *created* /
+  *escalated*; incidents have no delete path — they are pruned together with their alerts after the
+  30-day retention, and an `open` one is never pruned. Asserted in `temp/verify-p6-collab.mjs`.
+  Documented under `alerts` in [docs/configuration.md](docs/configuration.md#alerts) /
+  [docs/configuration.zh.md](docs/configuration.zh.md#alerts).
+- **`recall_fix`: how this exact error was fixed last time.** A failure that looks familiar can now
+  be answered from data instead of a fresh guess: give the error line (or its 16-character
+  fingerprint) and the tool returns up to three `execute_command` rows on that host which succeeded
+  *after the error first appeared* and whose own output no longer carries the error, newest first,
+  each with host and timestamp. Two details are the whole point. The time floor is
+  `error_fingerprints.first_seen`, not `last_seen`: keyed on the latest sighting, the command that
+  fixed the *first* occurrence falls outside the window and the tool would answer "nothing found"
+  precisely when it has the answer. And a zero exit code is not a fix: a `service nginx restart`
+  that returns 0 while its output still ends with the same `[emerg]` is filtered out, so the model
+  is not handed the command that already failed. **Boundary:** it only reads stored history and
+  never dials a host; it only knows commands executed through this app, so a fix typed by hand into
+  a terminal is invisible and the answer says so when the candidate list is empty; the host defaults
+  to the terminal this chat is attached to and has to be passed explicitly when there is none; a
+  failure that was never recorded as a fingerprint returns `FINGERPRINT_NOT_FOUND` rather than an
+  empty answer; `run_on_hosts` results are not candidates (one row covers N hosts, so it cannot be
+  attributed to one machine). Asserted in `temp/verify-p6-collab.mjs` — the "fixed once, broke
+  again" fixture, with a second command that exited 0 without fixing anything, returns exactly the
+  one real fix.
+- **Per-account skills can be written from the UI.** Until now the `skills` table had a schema and a
+  service layer but no write path, so a new skill meant editing `data/skills/*.md` — which also made
+  it shared by everyone and impossible to remove from the app. `/api/ai/saveSkill` and
+  `/api/ai/deleteSkill` (gated by `skills` + `ai`) now create, update and delete a skill owned by
+  one account, and the skills panel carries the editor: id, name, one-line purpose, tags and the
+  Markdown body. An id must match `^[a-z0-9][a-z0-9._-]{0,63}$`, a built-in id cannot be
+  overwritten, the body must be non-empty and at most 20,000 characters, and tags are trimmed,
+  de-duplicated and capped at eight. Deleting an id that does not exist — or that belongs to a
+  built-in — answers 404 instead of 200-with-nothing. **Boundary:** user skills only — the built-in
+  playbooks in `data/skills/` stay files on disk and read-only in this editor; a saved skill reaches
+  the model on the *next* turn, because the catalog is built per run, not mid-stream; `load_skill`
+  and the catalog both read the caller's own rows, so one account's skill is invisible to another.
 - **Queued messages in the AI chat, so a follow-up no longer has to wait for the turn to end.** The
   input box used to be disabled while a turn ran. It now stays editable: Enter — or the send button,
   which turns into a queue button — appends the message to a queue drawn above the input. Each row
@@ -366,7 +420,8 @@ increments.
 
 Recorded here rather than hidden, and expanded in the README's *Known limitations* section:
 
-- No per-account UI or API for creating skills; the table and service layer exist, the write path does not.
+- No per-account UI or API for creating skills; the table and service layer exist, the write path does not
+  (added later — see the *Per-account skills* entry under Unreleased).
 - `scripts/smoke-terminal.mjs` predates the account system and sends no token, so it cannot pass
   against a current build.
 - The VS Code extension's **native sidebar** still calls `/api/connection/*` without a bearer token, so

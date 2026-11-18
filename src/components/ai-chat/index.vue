@@ -212,34 +212,84 @@
       </div>
     </div>
 
-    <!-- Skills 面板 -->
-    <div v-if="showSkillsPanel" class="skills-panel">
+    <!-- Skills 面板：列表 / 技能编辑（P6）二选一，不新开弹窗 -->
+    <div v-if="showSkillsPanel" class="skills-panel" :class="{ editing: skillEditor.open }">
       <div class="skills-panel-header">
-        <span>{{ t('ai.selectSkill') }}</span>
-        <button class="btn-ai-action" @click="showSkillsPanel = false">
-          <i class="bi bi-x"></i>
-        </button>
+        <span>{{ skillEditor.open ? t('ai.skillEditorTitle') : t('ai.selectSkill') }}</span>
+        <div class="d-flex align-items-center gap-1">
+          <button v-if="!skillEditor.open" class="btn-ai-action" @click="openSkillEditor()" :title="t('ai.skillNew')">
+            <i class="bi bi-plus-lg"></i>
+          </button>
+          <button class="btn-ai-action" @click="skillEditor.open ? cancelSkillEditor() : (showSkillsPanel = false)">
+            <i class="bi bi-x"></i>
+          </button>
+        </div>
       </div>
-      <div class="skills-hint">{{ t('ai.skillsHint') }}</div>
-      <div class="skills-grid">
-        <div
-          v-for="skill in skills"
-          :key="skill.id"
-          class="skill-item"
-          :class="{ active: selectedSkill?.id === skill.id }"
-          @click="toggleSkill(skill)"
-        >
-          <div class="skill-item-header">
-            <i class="bi bi-lightning-charge-fill"></i>
-            <span class="skill-name">{{ skill.name }}</span>
-            <span v-if="skill.source === 'user'" class="skill-source">{{ t('ai.userSkill') }}</span>
+
+      <div v-if="skillEditor.open" class="skill-editor">
+        <label class="skill-field">
+          <span>{{ t('ai.skillId') }}</span>
+          <input v-model="skillEditor.id" :disabled="skillEditor.isEdit" placeholder="my-runbook" />
+        </label>
+        <label class="skill-field">
+          <span>{{ t('ai.skillName') }}</span>
+          <input v-model="skillEditor.name" :placeholder="t('ai.skillNamePlaceholder')" />
+        </label>
+        <label class="skill-field">
+          <span>{{ t('ai.skillDescription') }}</span>
+          <input v-model="skillEditor.description" :placeholder="t('ai.skillDescPlaceholder')" />
+        </label>
+        <label class="skill-field">
+          <span>{{ t('ai.skillTags') }}</span>
+          <input v-model="skillEditor.tags" :placeholder="t('ai.skillTagsPlaceholder')" />
+        </label>
+        <label class="skill-field">
+          <span>{{ t('ai.skillContent') }}</span>
+          <textarea v-model="skillEditor.content" rows="8" :placeholder="t('ai.skillContentPlaceholder')"></textarea>
+        </label>
+        <div class="skill-editor-actions">
+          <span class="skill-editor-hint">{{ t('ai.skillEditorHint') }}</span>
+          <button
+            class="skill-editor-btn"
+            :disabled="skillEditor.saving || !skillEditor.id.trim() || !skillEditor.content.trim()"
+            @click="saveSkillEditor"
+          >
+            <i class="bi bi-check-lg"></i>{{ skillEditor.saving ? t('common.processing') : t('common.save') }}
+          </button>
+        </div>
+      </div>
+
+      <template v-else>
+        <div class="skills-hint">{{ t('ai.skillsHint') }}</div>
+        <div class="skills-grid">
+          <div
+            v-for="skill in skills"
+            :key="skill.id"
+            class="skill-item"
+            :class="{ active: selectedSkill?.id === skill.id }"
+            @click="toggleSkill(skill)"
+          >
+            <div class="skill-item-header">
+              <i class="bi bi-lightning-charge-fill"></i>
+              <span class="skill-name">{{ skill.name }}</span>
+              <span v-if="skill.source === 'user'" class="skill-source">{{ t('ai.userSkill') }}</span>
+              <!-- 只有用户自建技能能改：内置技能随代码发布，盖掉它就再也拿不回来了 -->
+              <span v-if="skill.source === 'user'" class="skill-row-actions">
+                <button class="skill-row-btn" @click.stop="openSkillEditor(skill)" :title="t('common.edit')">
+                  <i class="bi bi-pencil"></i>
+                </button>
+                <button class="skill-row-btn danger" @click.stop="removeSkill(skill)" :title="t('common.delete')">
+                  <i class="bi bi-trash"></i>
+                </button>
+              </span>
+            </div>
+            <div v-if="skill.description" class="skill-desc">{{ skill.description }}</div>
           </div>
-          <div v-if="skill.description" class="skill-desc">{{ skill.description }}</div>
+          <div v-if="skills.length === 0" class="skills-empty">
+            {{ t('ai.noSkills') }}
+          </div>
         </div>
-        <div v-if="skills.length === 0" class="skills-empty">
-          {{ t('ai.noSkills') }}
-        </div>
-      </div>
+      </template>
     </div>
 
     <!-- 对话列表面板（与当前连接绑定） -->
@@ -984,6 +1034,106 @@ function toggleSkill(skill: SkillItem) {
 
 function clearSelectedSkill() {
   selectedSkill.value = null;
+}
+
+/* ---------------- 技能自建（P6） ---------------- */
+
+/**
+ * 技能编辑器：嵌在技能面板里而不是另开弹窗。
+ * 面板本来就悬在输入区上方，编辑时用户还能看到终端；弹窗会盖掉终端，
+ * 而写技能正文恰恰需要对照终端里的真实命令。
+ */
+interface SkillEditorState {
+  open: boolean;
+  /** 编辑已有技能时 id 不可改：改 id 等于新建，旧条目会默默留在库里 */
+  isEdit: boolean;
+  saving: boolean;
+  id: string;
+  name: string;
+  description: string;
+  /** 逗号分隔：保持「一个输入框写完」的轻量，归一化在服务端 */
+  tags: string;
+  content: string;
+}
+
+function emptySkillEditor(): SkillEditorState {
+  return { open: false, isEdit: false, saving: false, id: '', name: '', description: '', tags: '', content: '' };
+}
+
+const skillEditor = ref<SkillEditorState>(emptySkillEditor());
+
+async function openSkillEditor(skill?: SkillItem) {
+  if (skill && skill.source !== 'user') return;
+  const id = skill?.id || '';
+  skillEditor.value = {
+    open: true,
+    isEdit: !!skill,
+    saving: false,
+    id,
+    name: skill?.name || '',
+    description: skill?.description || '',
+    tags: (skill?.tags || []).join(', '),
+    content: '',
+  };
+  if (!skill) return;
+  try {
+    const data: any = await aiService.getSkill(id);
+    // 响应可能晚到：面板已关或已经换了一条，就不能拿旧内容覆盖当前编辑
+    if (skillEditor.value.open && skillEditor.value.id === id) {
+      skillEditor.value.name = String(data?.name || skill.name);
+      skillEditor.value.description = String(data?.description || skill.description || '');
+      if (Array.isArray(data?.tags)) skillEditor.value.tags = data.tags.join(', ');
+      skillEditor.value.content = String(data?.content || '');
+    }
+  } catch (e: any) {
+    toast.error(e?.message || t('ai.skillLoadFailed'));
+  }
+}
+
+function cancelSkillEditor() {
+  skillEditor.value = emptySkillEditor();
+}
+
+async function saveSkillEditor() {
+  const editor = skillEditor.value;
+  const id = editor.id.trim().toLowerCase();
+  if (!id || !editor.content.trim() || editor.saving) return;
+  editor.saving = true;
+  try {
+    await aiService.saveSkill({
+      id,
+      name: editor.name.trim(),
+      description: editor.description.trim(),
+      tags: editor.tags,
+      content: editor.content,
+    });
+    await loadSkills();
+    // 选中的就是这条时换成新的对象：否则发消息带的还是旧名字
+    if (selectedSkill.value?.id === id) {
+      selectedSkill.value = skills.value.find(s => s.id === id) || null;
+    }
+    skillEditor.value = emptySkillEditor();
+    toast.success(t('ai.skillSaved'));
+  } catch (e: any) {
+    toast.error(e?.message || t('ai.skillSaveFailed'));
+  } finally {
+    editor.saving = false;
+  }
+}
+
+async function removeSkill(skill: SkillItem) {
+  if (skill.source !== 'user') return;
+  const ok = await modal.confirm(t('ai.skillDeleteConfirm', { name: skill.name }));
+  if (!ok) return;
+  try {
+    await aiService.deleteSkill(skill.id);
+    if (selectedSkill.value?.id === skill.id) selectedSkill.value = null;
+    if (skillEditor.value.open && skillEditor.value.id === skill.id) skillEditor.value = emptySkillEditor();
+    await loadSkills();
+    toast.success(t('ai.skillDeleted'));
+  } catch (e: any) {
+    toast.error(e?.message || t('ai.skillDeleteFailed'));
+  }
 }
 
 // 斜杠命令检测
@@ -2856,6 +3006,91 @@ defineExpose({ handleAgentEvent, scrollToBottom, handleMonitorEvent });
   color: var(--text-secondary);
   font-size: 12px;
 }
+
+/* 编辑态要装下正文，200px 不够；但仍限高，不能把消息区挤没 */
+.skills-panel.editing { max-height: 420px; }
+.skill-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 12px 10px;
+}
+.skill-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.skill-field input,
+.skill-field textarea {
+  width: 100%;
+  background: var(--bg-recess);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 5px;
+  padding: 4px 7px;
+  font-size: 12px;
+  font-family: inherit;
+  outline: none;
+  resize: vertical;
+}
+.skill-field input:focus,
+.skill-field textarea:focus { border-color: var(--accent); }
+.skill-field input:disabled { opacity: 0.6; cursor: not-allowed; }
+.skill-field textarea {
+  min-height: 96px;
+  max-height: 220px;
+  font-family: var(--font-mono, monospace);
+  line-height: 1.45;
+}
+.skill-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.skill-editor-hint {
+  flex: 1;
+  min-width: 0;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-secondary);
+}
+.skill-editor-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  border: 1px solid rgb(var(--accent-rgb) / 30%);
+  border-radius: 5px;
+  background: rgb(var(--accent-rgb) / 12%);
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.skill-editor-btn:hover:not(:disabled) { background: rgb(var(--accent-rgb) / 20%); }
+.skill-editor-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* 行内编辑 / 删除：只在自定义技能上出现 */
+.skill-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 2px;
+}
+.skill-row-btn {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  line-height: 1;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0.7;
+}
+.skill-row-btn:hover { opacity: 1; color: var(--accent); }
+.skill-row-btn.danger:hover { color: var(--danger); }
 
 /* 已选 Skill 栏 */
 .selected-skill-bar {

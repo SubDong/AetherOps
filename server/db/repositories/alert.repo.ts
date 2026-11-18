@@ -29,6 +29,10 @@ export interface AlertRow {
   lastSeen: Date;
   ackedBy: string | null;
   ackedAt: Date | null;
+  /** 处理人（账号 ID）。与 ackedBy 分开：确认是「我看到了」，指派是「这件事归你」 */
+  assigneeId: string | null;
+  /** 归并到的事件；NULL = 尚未归并 */
+  incidentId: number | null;
   resolvedAt: Date | null;
 }
 
@@ -69,7 +73,7 @@ export interface AlertMuteRow {
 
 const COLUMNS = `id, owner_id, connection_id, fingerprint, status, source, rule, level,
                  message, sample_text, occurrences, first_seen, last_seen,
-                 acked_by, acked_at, resolved_at`;
+                 acked_by, acked_at, assignee_id, incident_id, resolved_at`;
 
 function toDate(value: any): Date {
   return value instanceof Date ? value : new Date(value);
@@ -97,6 +101,8 @@ function mapRow(r: any): AlertRow {
     lastSeen: toDate(r.last_seen),
     ackedBy: r.acked_by === null || r.acked_by === undefined ? null : String(r.acked_by),
     ackedAt: toDateOrNull(r.acked_at),
+    assigneeId: r.assignee_id === null || r.assignee_id === undefined ? null : String(r.assignee_id),
+    incidentId: r.incident_id === null || r.incident_id === undefined ? null : Number(r.incident_id),
     resolvedAt: toDateOrNull(r.resolved_at),
   };
 }
@@ -236,6 +242,88 @@ export async function pruneResolvedAlerts(before: Date): Promise<number> {
   const { affectedRows } = await execute(
     `DELETE FROM alerts WHERE status = 'resolved' AND resolved_at < ?`,
     [before],
+  );
+  return affectedRows;
+}
+
+/**
+ * 认领 = 确认 + 指派给自己。
+ * 已确认过的行只改处理人，不覆盖第一个确认人（COALESCE 的方向很重要：
+ * 「谁先看到」是事后追溯的依据，不能被后来点认领的人改写）。
+ * 已解决的行不接受认领 —— 那是历史，不再属于任何人。
+ */
+export async function claimAlert(ownerId: string, id: number, userId: string, at: Date): Promise<boolean> {
+  const { affectedRows } = await execute(
+    `UPDATE alerts
+        SET status = CASE WHEN status = 'open' THEN 'acked' ELSE status END,
+            acked_by = COALESCE(acked_by, ?),
+            acked_at = COALESCE(acked_at, ?),
+            assignee_id = ?
+      WHERE owner_id = ? AND id = ? AND status <> 'resolved'`,
+    [userId, at, userId, ownerId, id],
+  );
+  return affectedRows > 0;
+}
+
+/** 转派 / 清空处理人；同样只对未解决的行生效 */
+export async function assignAlert(ownerId: string, id: number, assigneeId: string | null): Promise<boolean> {
+  const { affectedRows } = await execute(
+    'UPDATE alerts SET assignee_id = ? WHERE owner_id = ? AND id = ? AND status <> \'resolved\'',
+    [assigneeId, ownerId, id],
+  );
+  return affectedRows > 0;
+}
+
+// ========== 值班表 ==========
+
+export interface AlertOnCallRow {
+  userId: string;
+  username: string;
+  displayName: string;
+  /** 每日开始（0-1439，本地时区） */
+  startMinute: number;
+  /** 每日结束（0-1440，左闭右开；小于 start 表示跨零点） */
+  endMinute: number;
+}
+
+/** JOIN users 只为拿「@谁」的名字；账号被删后这一行自然不再出现 */
+export async function listOnCall(ownerId: string): Promise<AlertOnCallRow[]> {
+  const rows = await query<any>(
+    `SELECT o.user_id, u.username, u.display_name, o.start_minute, o.end_minute
+       FROM alert_oncall o
+       JOIN users u ON u.id = o.user_id
+      WHERE o.owner_id = ?
+      ORDER BY o.start_minute ASC, u.username ASC`,
+    [ownerId],
+  );
+  return rows.map((r) => ({
+    userId: String(r.user_id),
+    username: String(r.username),
+    displayName: String(r.display_name || r.username),
+    startMinute: Number(r.start_minute) || 0,
+    endMinute: Number(r.end_minute) || 0,
+  }));
+}
+
+/** 同一人同一开始时间就是同一个时间窗：改结束时间等于覆盖 */
+export async function upsertOnCall(
+  ownerId: string,
+  userId: string,
+  startMinute: number,
+  endMinute: number,
+  at: Date,
+): Promise<void> {
+  await execute(
+    'INSERT INTO alert_oncall (owner_id, user_id, start_minute, end_minute, created_at) VALUES (?, ?, ?, ?, ?)\n'
+      + 'ON DUPLICATE KEY UPDATE end_minute = VALUES(end_minute), created_at = VALUES(created_at)',
+    [ownerId, userId, startMinute, endMinute, at],
+  );
+}
+
+export async function deleteOnCall(ownerId: string, userId: string, startMinute: number): Promise<number> {
+  const { affectedRows } = await execute(
+    'DELETE FROM alert_oncall WHERE owner_id = ? AND user_id = ? AND start_minute = ?',
+    [ownerId, userId, startMinute],
   );
   return affectedRows;
 }

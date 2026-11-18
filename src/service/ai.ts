@@ -224,3 +224,21 @@ export function getSkills() {
 export function getSkill(id: string) {
   return request('/api/ai/getSkill', { id }).then(unwrap);
 }
+
+/** 新建/更新用户技能（P6）：校验与归一化在服务端，这里只负责把表单原样交上去 */
+export interface SkillSaveInput {
+  id: string;
+  name?: string;
+  description?: string;
+  /** 逗号分隔或数组，服务端会去重、限条数 */
+  tags?: string | string[];
+  content: string;
+}
+
+export function saveSkill(input: SkillSaveInput) {
+  return request('/api/ai/saveSkill', input).then(unwrap);
+}
+
+export function deleteSkill(id: string) {
+  return request('/api/ai/deleteSkill', { id }).then(unwrap);
+}

@@ -18,7 +18,7 @@ Manage Docker containers, images, volumes, and networks efficiently. Use scripts
 ```
 
 - [Where skills come from](#where-skills-come-from)
-- [Current limits of the write path](#current-limits-of-the-write-path)
+- [Writing skills from the app](#writing-skills-from-the-app)
 - [File format](#file-format)
 - [How a skill is selected](#how-a-skill-is-selected)
 - [What the agent actually receives](#what-the-agent-actually-receives)
@@ -46,22 +46,24 @@ Note that `data/skills` is *not* under the data directory (`~/.aetherops`): the 
 to `/app/data/skills` precisely because the lookup is relative to the working directory. A container
 missing that step shows an empty skill list.
 
-## Current limits of the write path
+## Writing skills from the app
 
-Being explicit here, because the upstream documentation promised more than the code does:
+A user skill is created, edited and deleted in the skills panel — `POST /api/ai/saveSkill` and
+`POST /api/ai/deleteSkill`, behind the same bits as reading them (`skills` or `ai`). The row belongs
+to one account, so nobody else sees it, and no filesystem access or restart is involved.
 
-- `SkillService.saveUserSkill()` and `deleteUserSkill()` exist and work, and the `skills` table is
-  ready, but **no HTTP endpoint and no UI calls them**. The registered routes are
-  `/api/ai/getSkills` and `/api/ai/getSkill` only.
-- Therefore, in practice today: authoring a skill means editing a file in `data/skills`, which requires
-  filesystem access to wherever the backend runs, plus a restart. On a shared deployment that is an
-  operator action, not a user feature.
-- There is no reload endpoint either. Adding or editing a built-in file takes effect on the next
-  restart (`skillService.reload()` is not wired to any route).
-
-If you want per-account skill creation, that is a legitimate contribution: add owner-scoped routes, keep
-them behind the `skills` permission bit, and reuse the existing repository functions rather than
-inventing a second storage path.
+- The id must match `^[a-z0-9][a-z0-9._-]{0,63}$`. It is what `/id` and `load_skill` resolve, so
+  kebab-case is still the convention.
+- A built-in id cannot be overwritten — pick a new id. The playbooks in `data/skills/` remain files
+  that ship with the code.
+- The body must be non-empty and at most 20,000 characters; `tags` are trimmed, de-duplicated and
+  capped at eight.
+- A failed save answers 400 with the reason (bad id, empty body, built-in id); deleting an id that
+  does not exist — or that is built-in — answers 404.
+- A saved skill is picked up on the **next** run: the catalog is built per run, so a turn already
+  streaming keeps the one it started with.
+- Built-in files still need the filesystem and a restart: `skillService.reload()` is not wired to any
+  route.
 
 ## File format
 
@@ -168,7 +170,7 @@ Details worth knowing:
   the agent engine are not bypassed by playbook text.
 - Prompt-injection surface: skill content is trusted input written into the system prompt. On a shared
   instance, whoever can write a skill can steer the agent's behavior for that account — which is why
-  user skills are owner-scoped and why a future write endpoint belongs behind the `skills` bit.
+  user skills are owner-scoped and why the write routes sit behind the `skills` bit.
 
 ## Built-in skills
 

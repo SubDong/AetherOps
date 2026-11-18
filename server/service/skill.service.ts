@@ -29,6 +29,25 @@ export interface SkillCatalogEntry {
 /** 目录里的描述有长度上限：一句话用途写成一段，目录就失去了意义 */
 const CATALOG_DESCRIPTION_MAX = 200;
 
+/**
+ * 用户技能的 id 规则：它同时是斜杠命令（`/docker-manage`）和目录里的主键。
+ * 只允许小写字母、数字、点、下划线、连字符 —— 空格与大写会让「按名字加载」变成一场猜谜。
+ */
+const SKILL_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/** 与 ai.service 的注入上限一致：写得更长，加载时也会被截断 */
+const MAX_CONTENT_CHARS = 20000;
+const MAX_TAGS = 8;
+const MAX_TAG_CHARS = 32;
+
+export interface SkillSaveInput {
+  id?: string;
+  name?: string;
+  description?: string;
+  tags?: unknown;
+  content?: string;
+}
+
 function clipText(text: string, max: number): string {
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 }
@@ -216,12 +235,49 @@ export class SkillService {
   }
 
   /**
-   * 保存用户 Skill（创建或更新）
+   * 保存用户 Skill（创建或更新）。
+   *
+   * 校验放在服务层而不是路由：验证脚本与将来的 CLI 都走同一个入口，
+   * 少一处重复校验就少一处能被绕开的写入口。
    */
-  async saveUserSkill(ownerId: string, skill: Omit<Skill, 'source'>): Promise<Skill> {
-    const fullSkill: Skill = { ...skill, source: 'user' };
+  async saveUserSkill(ownerId: string, input: SkillSaveInput): Promise<Skill> {
+    const id = String(input?.id || '').trim().toLowerCase();
+    if (!SKILL_ID_PATTERN.test(id)) {
+      throw new Error('技能 id 只能用小写字母、数字、点、下划线、连字符（1-64 位，且不能以符号开头）');
+    }
+    // 内置技能随代码发布、可 review；允许同名用户技能覆盖它，等于让人在界面上永久盖掉一个随代码升级的 runbook
+    if (this.systemSkills.has(id)) {
+      throw new Error(`内置技能 id「${id}」不能覆盖，请换一个 id`);
+    }
+
+    const content = String(input?.content || '').trim();
+    if (!content) throw new Error('技能正文不能为空');
+    if (content.length > MAX_CONTENT_CHARS) {
+      throw new Error(`技能正文最多 ${MAX_CONTENT_CHARS} 字符（超出部分在加载时也会被截断）`);
+    }
+
+    const name = String(input?.name || '').trim().slice(0, 120) || id;
+    const description = String(input?.description || '').trim().slice(0, CATALOG_DESCRIPTION_MAX);
+    const tags = this.normalizeTags(input?.tags);
+
+    const fullSkill: Skill = { id, name, description, tags, content, source: 'user' };
     await upsertUserSkill(ownerId, fullSkill);
     return fullSkill;
+  }
+
+  /** 字符串数组 / 逗号分隔字符串都接受，去重去空 */
+  private normalizeTags(value: unknown): string[] {
+    const raw = Array.isArray(value)
+      ? value.map((t) => String(t))
+      : String(value || '').split(',');
+    const seen = new Set<string>();
+    for (const item of raw) {
+      const tag = item.trim().slice(0, MAX_TAG_CHARS);
+      if (!tag || seen.has(tag)) continue;
+      seen.add(tag);
+      if (seen.size >= MAX_TAGS) break;
+    }
+    return [...seen];
   }
 
   /**
