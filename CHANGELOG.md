@@ -319,6 +319,11 @@ or the commit, for a build that predates one — that you run.
   offer this build to anyone running 1.0.26; they download it once by hand. `packages/vscode` deliberately
   keeps its own line (`0.1.25`): the VSIX version has to equal whatever follows `aetherops-v` in the tag,
   and it ships on a different cadence from the app.
+- **The upstream MIT notice is archived outside the extension package.** Upstream declares MIT in its
+  README, but the only full copy of the text lives at `packages/vscode/LICENSE` — a path that a future
+  VSIX rewrite would carry away with it. The same text now also sits at `LICENSES/AICmd-MIT.txt`, and
+  both READMEs point there. Housekeeping, not a relicence: the notice still travels with every build,
+  which is the single obligation MIT imposes.
 
 ### Fixed
 

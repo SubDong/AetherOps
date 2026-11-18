@@ -4,7 +4,8 @@ Copyright (c) 2026 SubDong
 
 AetherOps is derived from AICmd (https://github.com/fefeding/ai-cmd),
 Copyright (c) fefeding, which is also distributed under the MIT License.
-The upstream copyright notice is retained in packages/vscode/LICENSE.
+The upstream copyright notice is retained in packages/vscode/LICENSE and archived at
+LICENSES/AICmd-MIT.txt.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

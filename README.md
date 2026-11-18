@@ -638,9 +638,11 @@ Project layout, licensing and naming notes:
 
 Released under the [MIT License](./LICENSE).
 
-AetherOps is a fork of [AICmd](https://github.com/fefeding/ai-cmd) by fefeding, also MIT-licensed;
-the upstream notice is kept in [`packages/vscode/LICENSE`](./packages/vscode/LICENSE). The agent
-engine [`@cicctencent/agent-core`](https://www.npmjs.com/package/@cicctencent/agent-core) is used as
+AetherOps is a fork of [AICmd](https://github.com/fefeding/ai-cmd) by fefeding. Upstream declares MIT in its
+README and ships the only full copy of the text inside the extension package; that notice is kept
+verbatim in [`packages/vscode/LICENSE`](./packages/vscode/LICENSE) and archived as
+[`LICENSES/AICmd-MIT.txt`](./LICENSES/AICmd-MIT.txt), so it survives any future rewrite of that package.
+The agent engine [`@cicctencent/agent-core`](https://www.npmjs.com/package/@cicctencent/agent-core) is used as
 a pinned dependency, and the product stands on many excellent open-source components — xterm.js,
 ssh2, node-pty, Vue 3, Vite, Bootstrap, CodeMirror, mysql2, redis, ws. Each keeps its own license;
 please review them if you redistribute a build.

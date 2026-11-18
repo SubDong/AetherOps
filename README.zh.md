@@ -539,8 +539,11 @@ Bug 反馈、功能请求与 PR 都欢迎。开发闭环、代码风格、提交
 
 本项目以 [MIT License](./LICENSE) 发布。
 
-AetherOps 是 [AICmd](https://github.com/fefeding/ai-cmd)（fefeding 所作，同为 MIT）的 fork，
-上游版权声明保留在 [`packages/vscode/LICENSE`](./packages/vscode/LICENSE)。Agent 引擎
+AetherOps 是 [AICmd](https://github.com/fefeding/ai-cmd)（fefeding 所作）的 fork。上游在 README 里声明为
+MIT，完整文本只附在它的扩展包里；那段声明逐字保留在
+[`packages/vscode/LICENSE`](./packages/vscode/LICENSE)，并在
+[`LICENSES/AICmd-MIT.txt`](./LICENSES/AICmd-MIT.txt) 存了一份归档 —— 那个扩展包将来怎么改都不影响它。
+Agent 引擎
 [`@cicctencent/agent-core`](https://www.npmjs.com/package/@cicctencent/agent-core) 以钉版依赖方式使用。
 产品还站在众多优秀开源组件之上 —— xterm.js、ssh2、node-pty、Vue 3、Vite、Bootstrap、CodeMirror、
 mysql2、redis、ws。它们各自保留自己的许可证，再分发构建产物时请一并核对。
