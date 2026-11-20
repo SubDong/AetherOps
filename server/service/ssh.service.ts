@@ -349,8 +349,18 @@ export class SSHService {
   private osFamilyProbes = new Map<string, Promise<OsFamily>>();
   /** 是否曾在本实例创建过 session（用于区分主进程/渲染进程实例，仅主进程实例执行定时清理） */
   private hasCreatedSession: boolean = false;
+  /**
+   * 本实例创建过的会话 id。
+   *
+   * 僵尸清理只允许动这批：sessions 表可能被多个实例共用（同一台机器开两个服务、
+   * 或者另一台机器连同一个库），别的实例正在用的终端在本进程的 sessions 里当然找不到，
+   * 按「库里所有没有句柄的行」去删就会把对端的活会话删掉。
+   */
+  private createdSessionIds: Set<string> = new Set();
   /** 定时清理僵尸 session 的定时器 */
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+  /** 「库里有 0 行、内存里还有活会话」这条告警的上次打印时间（节流用） */
+  private lastMetaLostLog = 0;
   /** 正在建立中的 SFTP 连接（避免并发重复创建） */
   private sftpPromises: Map<string, Promise<any>> = new Map();
   /** 传输审计写入器：由 index.ts 注入，本模块不依赖 audit.service 的实例 */
@@ -373,9 +383,11 @@ export class SSHService {
   /**
    * 创建会话（自动判断 SSH 或默认服务器 Shell）
    */
-  async createSession(sessionId: string, connectionId: string, cols: number = 80, rows: number = 24, name?: string, onLog?: (msg: string) => void, ownerId: string = '', options?: { serverShellPassword?: string }): Promise<TerminalSession> {
+  async createSession(sessionId: string, connectionId: string, cols: number = 80, rows: number = 24, name?: string, onLog?: (msg: string) => void, ownerId: string = '', options?: { serverShellPassword?: string; clearScreen?: boolean }): Promise<TerminalSession> {
     // 标记本实例曾创建过 session（用于定时清理判断）
     this.hasCreatedSession = true;
+    // 先进册再建：即使建到一半失败，最坏也只是多删一条本来就不存在的行
+    this.createdSessionIds.add(sessionId);
     // 如果已存在同 ID 的会话，先关闭；但别人的 sessionId 不能被覆盖
     if (this.sessions.has(sessionId) || this.sessionMetadata.has(sessionId)) {
       const existingOwner = this.sessionMetadata.get(sessionId)?.ownerId;
@@ -423,7 +435,7 @@ export class SSHService {
         createdAt: new Date(),
         updatedAt: new Date(),
       };
-      const localSession = await this.createLocalSession(sessionId, connectionId, localConn, cols, rows, name, onLog);
+      const localSession = await this.createLocalSession(sessionId, connectionId, localConn, cols, rows, name, onLog, options?.clearScreen !== false);
       // 保存 session 元数据到 server 端
       this.sessionMetadata.set(sessionId, {
         sessionId,
@@ -445,7 +457,7 @@ export class SSHService {
 
     let session: TerminalSession;
     if (connection.type === 'local') {
-      session = await this.createLocalSession(sessionId, connectionId, connection, cols, rows, name, onLog);
+      session = await this.createLocalSession(sessionId, connectionId, connection, cols, rows, name, onLog, options?.clearScreen !== false);
     } else {
       session = await this.createSSHSession(sessionId, connectionId, connection, cols, rows, name, onLog);
     }
@@ -477,8 +489,11 @@ export class SSHService {
 
   /**
    * 创建默认服务器 Shell 会话（优先使用 node-pty，降级使用 child_process.spawn）
+   *
+   * clearScreen=false 用于「刷新页面后恢复 tab」：启动时那条 cls 会把前端刚回放的
+   * 历史抹掉，看起来就像什么都没恢复。
    */
-  private createLocalSession(sessionId: string, connectionId: string, connection: ConnectionEntity, cols: number, rows: number, name?: string, onLog?: (msg: string) => void): Promise<TerminalSession> {
+  private createLocalSession(sessionId: string, connectionId: string, connection: ConnectionEntity, cols: number, rows: number, name?: string, onLog?: (msg: string) => void, clearScreen: boolean = true): Promise<TerminalSession> {
     const log = (msg: string) => { console.log(`[SSH] ${msg}`); onLog?.(msg); };
     return new Promise<TerminalSession>((resolve, reject) => {
       try {
@@ -531,7 +546,7 @@ export class SSHService {
                 if (shell.includes('powershell')) {
                   ptyProcess.write('[Console]::OutputEncoding = [Text.Encoding]::UTF8\r\n');
                 }
-                ptyProcess.write('cls\r\n');
+                if (clearScreen) ptyProcess.write('cls\r\n');
               }, 100);
             }
 
@@ -776,6 +791,7 @@ export class SSHService {
     this.closeSession(sessionId);
     const had = this.sessionMetadata.has(sessionId);
     this.sessionMetadata.delete(sessionId);
+    this.createdSessionIds.delete(sessionId);
     await deleteSessionMeta(sessionId, ownerId);
     console.log(`[SSH] deleteSession: ${sessionId}, had=${had}, remaining: ${this.sessionMetadata.size}`);
   }
@@ -790,11 +806,23 @@ export class SSHService {
   // ========== Session 元数据持久化 ==========
 
   /**
-   * 从 MySQL 载入 session 元数据
+   * 从 MySQL 载入 session 元数据。
+   * 原先在构造函数里同步读 sessions.json，落表后必须等库就绪，
+   * 所以拆出 init()，由 initServices() 在 request 之前 await 完成。
+   *
+   * 是「合并」而不是「覆盖」：库里那行可能被别的实例删了（多个实例共用同一个库，
+   * 对端的僵尸清理会把这里活着的行当僵尸），而本进程手里还有句柄的会话才是事实。
+   * 丢了元数据，指标采集与 AI 上下文就会突然看不到这台主机，
+   * 表现就是「终端明明开着，大屏却一片灰、读数全是 `-`」。
    */
   private async loadSessionsFromDb(): Promise<void> {
     try {
       const list = await listSessionMeta();
+      // 先留一份本进程活着的会话，等下合并回去
+      const live: Array<[string, SessionMetadata]> = [];
+      for (const [sid, meta] of this.sessionMetadata) {
+        if (this.sessions.has(sid)) live.push([sid, meta]);
+      }
       this.sessionMetadata.clear();
       for (const item of list) {
         this.sessionMetadata.set(item.sessionId, {
@@ -807,7 +835,22 @@ export class SSHService {
           systemContext: item.systemContext,
         });
       }
+      // 库里有行的以库为准（名字、系统上下文可能被另一个实例更新过），
+      // 库里没行、内存里还活着的补回来
+      for (const [sid, meta] of live) {
+        if (!this.sessionMetadata.has(sid)) this.sessionMetadata.set(sid, meta);
+      }
       console.log(`[SSH] Loaded ${list.length} session(s) from MySQL`);
+      // 库里的行没了、内存里却还有活会话：采集与 AI 上下文都靠 sessionMetadata 找会话，
+      // 这时它们会彻底看不见这些终端（大屏只剩灰卡片），必须在日志里说出来，
+      // 否则现象就是「明明开着终端，指标一个字都不写」。
+      if (!list.length && this.sessions.size > 0 && Date.now() - this.lastMetaLostLog > 5 * 60_000) {
+        this.lastMetaLostLog = Date.now();
+        console.warn(
+          `[SSH] 会话元数据为空但内存里还有 ${this.sessions.size} 个活会话（${[...this.sessions.keys()].join(', ')}）：`
+          + '指标采集与 AI 上下文将看不到它们',
+        );
+      }
     } catch (error: any) {
       console.error('[SSH] Failed to load sessions from MySQL:', error.message);
     }
@@ -1857,6 +1900,7 @@ export class SSHService {
     }
     for (const sessionId of targetIds) {
       this.sessionMetadata.delete(sessionId);
+      this.createdSessionIds.delete(sessionId);
       try {
         await deleteSessionMeta(sessionId, ownerId);
       } catch (error: any) {
@@ -2355,27 +2399,28 @@ export class SSHService {
   }
 
   /**
-   * 清理僵尸 session：从库里重新加载，移除进程已不存在的条目
+   * 清理僵尸 session：本实例创建过、句柄已经不在了的那些。
+   *
+   * 只清 createdSessionIds，不遍历库里的全部行：sessions 表可能被多个实例共用，
+   * 别的实例正在用的终端在本进程里当然没有句柄，按旧写法会当成僵尸删掉 ——
+   * 对端下一轮 loadSessionsFromDb 就会发现行没了，指标采集随之停摆，
+   * 大屏上就是「终端开着但没数据」。
    */
   private async cleanupZombieSessions(): Promise<void> {
     // 仅当本实例曾创建过 session 时才执行清理（主进程实例）
-    // 不曾经创建过的实例（如预加载进程）跳过，避免误删
     if (!this.hasCreatedSession) return;
-
-    // 从库里重新加载最新状态
+    // 先把库里的最新状态合进来（名字/系统上下文可能被对端改过）
     await this.loadSessionsFromDb();
 
-    // 找出库里有但进程已不存在的 session
     const toRemove: string[] = [];
-    for (const sid of this.sessionMetadata.keys()) {
-      if (!this.sessions.has(sid)) {
-        toRemove.push(sid);
-      }
+    for (const sid of this.createdSessionIds) {
+      if (!this.sessions.has(sid)) toRemove.push(sid);
     }
 
     if (toRemove.length > 0) {
       for (const sid of toRemove) {
         this.sessionMetadata.delete(sid);
+        this.createdSessionIds.delete(sid);
         await deleteSessionMeta(sid);
       }
       console.log(`[SSH] Periodic cleanup: removed ${toRemove.length} zombie session(s): ${toRemove.join(', ')}`);

@@ -64,6 +64,12 @@ export async function upsertSessionMeta(m: SessionMetaRow): Promise<void> {
 
 /** 删除会话元数据；带上 ownerId 时只能删自己的 */
 export async function deleteSessionMeta(sessionId: string, ownerId?: string): Promise<number> {
+  // 「谁把会话行删了」是排查「有终端却不上大屏」时最难的一步：
+  // 删行的路径不止一条（关 tab、紧急断开、僵尸清理），日志里只看得见结果。
+  // 默认关闭，需要时用 AETHEROPS_TRACE_SESSION_DELETE=1 打开，把调用栈打出来。
+  if (process.env.AETHEROPS_TRACE_SESSION_DELETE) {
+    console.log(`[session-trace] delete ${sessionId} owner=${ownerId || '-'}\n${new Error().stack || ''}`);
+  }
   const r = ownerId
     ? await execute('DELETE FROM sessions WHERE session_id = ? AND owner_id = ?', [sessionId, ownerId])
     : await execute('DELETE FROM sessions WHERE session_id = ?', [sessionId]);
