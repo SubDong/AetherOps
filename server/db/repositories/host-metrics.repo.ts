@@ -58,7 +58,13 @@ export interface MetricHostRow {
   connectionId: string;
   hostname: string;
   lastBucket: Date;
+  /** 窗口内的样本总数（各分钟桶 samples 之和） */
   samples: number;
+  /**
+   * 窗口内最后一个分钟桶的整行。
+   * 大屏卡片上的 CPU / 内存 / 磁盘取的是「此刻」的读数，没有它只能显示 `-`。
+   */
+  latest: MinuteMetricRow;
 }
 
 const numOrNull = (value: unknown): number | null => {
@@ -66,6 +72,33 @@ const numOrNull = (value: unknown): number | null => {
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 };
+
+/**
+ * 库行 → 结构体。
+ * 集中的理由：DECIMAL / BIGINT 在 mysql2 里是字符串，这一步漏掉就会在聚合时变成字符串拼接。
+ * 读序列和读「最后一桶」走的是同一张表、同一套列，映射不该有两份。
+ */
+const toMinuteMetricRow = (r: any): MinuteMetricRow => ({
+  connectionId: String(r.connection_id || ''),
+  hostname: String(r.hostname || ''),
+  bucket: r.bucket instanceof Date ? r.bucket : new Date(r.bucket),
+  samples: Number(r.samples) || 0,
+  cpuPctAvg: numOrNull(r.cpu_pct_avg),
+  cpuPctMax: numOrNull(r.cpu_pct_max),
+  memPctAvg: numOrNull(r.mem_pct_avg),
+  memPctMax: numOrNull(r.mem_pct_max),
+  diskPctAvg: numOrNull(r.disk_pct_avg),
+  diskPctMax: numOrNull(r.disk_pct_max),
+  diskTotalBytes: numOrNull(r.disk_total_bytes),
+  diskUsedBytesAvg: numOrNull(r.disk_used_bytes_avg),
+  diskUsedBytesMax: numOrNull(r.disk_used_bytes_max),
+  load1Avg: numOrNull(r.load1_avg),
+  load1Max: numOrNull(r.load1_max),
+  load5Avg: numOrNull(r.load5_avg),
+  load5Max: numOrNull(r.load5_max),
+  load15Avg: numOrNull(r.load15_avg),
+  load15Max: numOrNull(r.load15_max),
+});
 
 /**
  * 写入一条采样并合进当分钟。
@@ -179,49 +212,43 @@ export async function listMinuteMetrics(
      LIMIT ${Number(limit) > 0 ? Number(limit) : 2000}`,
     [ownerId, connectionId, from, to],
   );
-  return rows.map((r) => ({
-    connectionId: String(r.connection_id || ''),
-    hostname: String(r.hostname || ''),
-    bucket: r.bucket instanceof Date ? r.bucket : new Date(r.bucket),
-    samples: Number(r.samples) || 0,
-    cpuPctAvg: numOrNull(r.cpu_pct_avg),
-    cpuPctMax: numOrNull(r.cpu_pct_max),
-    memPctAvg: numOrNull(r.mem_pct_avg),
-    memPctMax: numOrNull(r.mem_pct_max),
-    diskPctAvg: numOrNull(r.disk_pct_avg),
-    diskPctMax: numOrNull(r.disk_pct_max),
-    diskTotalBytes: numOrNull(r.disk_total_bytes),
-    diskUsedBytesAvg: numOrNull(r.disk_used_bytes_avg),
-    diskUsedBytesMax: numOrNull(r.disk_used_bytes_max),
-    load1Avg: numOrNull(r.load1_avg),
-    load1Max: numOrNull(r.load1_max),
-    load5Avg: numOrNull(r.load5_avg),
-    load5Max: numOrNull(r.load5_max),
-    load15Avg: numOrNull(r.load15_avg),
-    load15Max: numOrNull(r.load15_max),
-  }));
+  return rows.map(toMinuteMetricRow);
 }
 
 /**
- * 该账号下有留存数据的主机。
+ * 该账号下有留存数据的主机，**连同它最后一个分钟桶的读数**。
  *
  * 按 connection_id 分组而不是 hostname：同一个 connectionId 换了目标机、
  * 或者两台机器同名都很常见，分组键必须选「你配的那条连接」。
+ *
+ * 为什么要 JOIN 回原表取最后一桶：只回 MAX(bucket) 的话调用方拿不到 CPU / 内存 / 磁盘的值，
+ * 监控大屏的主机卡片就会永远显示 `-`（看上去像采集全挂了）。
  */
 export async function listMetricHosts(ownerId: string, since: Date): Promise<MetricHostRow[]> {
   const rows = await query<any>(
-    `SELECT connection_id, MAX(hostname) AS hostname, MAX(bucket) AS last_bucket, SUM(samples) AS samples
-     FROM host_metrics_minute
-     WHERE owner_id = ? AND bucket >= ?
-     GROUP BY connection_id
-     ORDER BY last_bucket DESC`,
-    [ownerId, since],
+    `SELECT g.connection_id, g.hostname, g.last_bucket, g.total_samples,
+            m.bucket, m.samples AS bucket_samples,
+            m.cpu_pct_avg, m.cpu_pct_max, m.mem_pct_avg, m.mem_pct_max,
+            m.disk_pct_avg, m.disk_pct_max, m.disk_total_bytes, m.disk_used_bytes_avg, m.disk_used_bytes_max,
+            m.load1_avg, m.load1_max, m.load5_avg, m.load5_max, m.load15_avg, m.load15_max
+     FROM (
+       SELECT connection_id, MAX(hostname) AS hostname, MAX(bucket) AS last_bucket, SUM(samples) AS total_samples
+       FROM host_metrics_minute
+       WHERE owner_id = ? AND bucket >= ?
+       GROUP BY connection_id
+     ) g
+     JOIN host_metrics_minute m
+       ON m.owner_id = ? AND m.connection_id = g.connection_id AND m.bucket = g.last_bucket
+     ORDER BY g.last_bucket DESC`,
+    [ownerId, since, ownerId],
   );
   return rows.map((r) => ({
     connectionId: String(r.connection_id || ''),
     hostname: String(r.hostname || ''),
     lastBucket: r.last_bucket instanceof Date ? r.last_bucket : new Date(r.last_bucket),
-    samples: Number(r.samples) || 0,
+    samples: Number(r.total_samples) || 0,
+    // 最后一桶的样本数是它自己那一分钟的，不能与窗口总数混用
+    latest: toMinuteMetricRow({ ...r, samples: r.bucket_samples }),
   }));
 }
 

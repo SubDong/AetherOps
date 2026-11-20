@@ -477,7 +477,12 @@ export class HostMetricsService {
     return '';
   }
 
-  /** 该账号下有留存的主机（供「我有哪些机器有数据」这类问题） */
+  /**
+   * 该账号下有留存的主机，连同最后一个分钟桶的读数。
+   *
+   * `latest` 不能偷懒回 null：监控大屏的主机卡片就直接读它，
+   * 回 null 时 CPU / 内存 / 磁盘只能显示 `-`，看上去像采集全挂了。
+   */
   async listHosts(ownerId: string, windowMinutes = 60): Promise<MetricHostSummary[]> {
     const since = new Date(Date.now() - Math.max(1, windowMinutes) * 60 * 1000);
     const rows = await listMetricHosts(ownerId, since);
@@ -486,7 +491,8 @@ export class HostMetricsService {
       hostname: row.hostname,
       lastAt: row.lastBucket.getTime(),
       samples: row.samples,
-      latest: null,
+      // 走 toPoints 而不是手工挑字段：大屏与 query_metrics 必须是同一套映射
+      latest: this.toPoints([row.latest])[0],
     }));
   }
 

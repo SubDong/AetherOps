@@ -186,6 +186,14 @@ defineEmits<{ (e: 'close'): void; (e: 'toggle-float'): void }>();
 /** 曲线保留的采样点数：2 秒一个点，60 点约 2 分钟 */
 const HISTORY_SIZE = 60;
 const POLL_INTERVAL = 2000;
+/**
+ * 标签页在后台时的轮询节拍。
+ *
+ * 以前这里直接停止轮询，代价是会话没人续：令牌是滑动过期的，需要在剩余不足 1000 秒时
+ * 有请求把它续满；大屏/值班机切到后台或浏览器挂起一阵，回来就变成登录页。
+ * 60 秒一次既不会让主机白白多跑几十次状态采集，也远低于续期阈值。
+ */
+const HIDDEN_POLL_INTERVAL = 60_000;
 /** 网络曲线的纵轴下限，避免空闲时几 KB 的抖动被放大成满屏毛刺 */
 const NET_AXIS_MIN_KB = 10;
 
@@ -380,13 +388,24 @@ function start() {
   if (!props.sessionId) return;
   alive = true;
   void poll();
-  timer = setInterval(() => {
-    // 页面切到后台就别再轮询了，回来时下面会立刻补一次
-    if (!document.hidden) void poll();
-  }, POLL_INTERVAL);
+  schedule();
+}
+
+/** 按当前可见性选节拍；切前后台都要重排定时器，否则会一直沿用旧的间隔 */
+function schedule() {
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
+  }
+  if (!alive) return;
+  const interval = document.hidden ? HIDDEN_POLL_INTERVAL : POLL_INTERVAL;
+  timer = setInterval(() => void poll(), interval);
 }
 
 function handleVisibility() {
+  if (!alive) return;
+  schedule();
+  // 回到前台立刻补一次，后台那一分钟的数据没必要再用
   if (!document.hidden) void poll();
 }
 
