@@ -11,6 +11,7 @@
 import config from '@/base/config';
 import { isElectron } from '@/base/detect';
 import { openSecret, sealOptional, sealSecret } from '@/utils/transport-crypto';
+import { clearWorkspace } from '@/utils/workspace-snapshot';
 
 export type UserRole = 'admin' | 'user';
 export type UserStatus = 'pending' | 'active' | 'disabled';
@@ -104,6 +105,8 @@ export function updateCurrentUser(user: AuthUser | null) {
 
 export function clearAuth() {
   writeStorage(null);
+  // 退出登录 / 令牌失效换回的登录页：上一个人的终端 tab 不该在这个标签页里复活
+  clearWorkspace();
 }
 
 export function hasPermission(key: PermissionKey): boolean {

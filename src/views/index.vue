@@ -567,45 +567,27 @@ onBeforeUnmount(() => {
 });
 
 /**
- * 从 server 端恢复 TAB 信息
+ * 刷新/重进页面时重建 tab 栏。
+ *
+ * 事实来源是本浏览器标签页自己的快照（sessionStorage）：
+ * - 刷新：tab 列表和屏幕上的输出原样回来，看上去就像没刷新过；
+ * - 关掉标签页/浏览器：sessionStorage 跟着没了，下次打开是干净的。
+ *
+ * 不再从服务端 sessions 表恢复：那张表意味着「关掉浏览器再打开，tab 又回来了」，
+ * 与「关掉就彻底丢弃」的预期相反；而且它只有元数据，恢复出来的终端是空的。
  */
 async function restoreOrCreateTabs() {
-  try {
-    const sessionList = await terminalService.getSessions() || [];
-
-    if (sessionList.length > 0) {
-      // 删除 server 端旧的 metadata，然后重建新的 tab
-      for (const session of sessionList) {
-        try {
-          await terminalService.deleteSession(session.sessionId);
-        } catch (e) {
-          console.warn('删除旧 session 失败:', e);
-        }
-      }
-
-      // 重建 tab
-      for (const session of sessionList) {
-        if (session.connectionId === '__local__') {
-          store.openLocalShell(session.name);
-        } else {
-          const conn = store.connections.find(c => c.id === session.connectionId);
-          if (conn) {
-            store.openTab(conn, session.name);
-          }
-        }
-      }
-
-      // 如果有恢复的 TAB，切换到第一个
-      if (store.tabs.length > 0) {
-        store.switchTab(store.tabs[0].id);
-        return;
-      }
+  // 有快照就按快照来，包括「一个 tab 都没有」——那是用户自己关完的，不该再开新的
+  if (store.restoreFromWorkspace()) {
+    // 刷新前的会话在服务端已经没有活进程了，顺手清掉遗留 metadata。
+    // 删失败也无所谓：服务端每 30 秒一轮的僵尸清理会扫走它们。
+    for (const tab of store.tabs) {
+      if (tab.sessionId) void terminalService.deleteSession(tab.sessionId).catch(() => {});
     }
-  } catch (e) {
-    console.warn('从 server 恢复 session 失败:', e);
+    return;
   }
 
-  // 没有可恢复的 TAB，自动创建默认服务器 Shell
+  // 真正的首次打开：自动创建一个默认服务器 Shell
   store.openLocalShell();
 }
 </script>

@@ -4,6 +4,13 @@ import type { ConnectionEntity, TerminalTab } from '@/typings/connection';
 import { toast } from '@/utils/toast';
 import { modal } from '@/utils/modal';
 import * as terminalService from '@/service/terminal';
+import {
+  MAX_SNAPSHOT_TABS,
+  dropTerminalBuffer,
+  loadWorkspace,
+  pruneTerminalBuffers,
+  saveWorkspace,
+} from '@/utils/workspace-snapshot';
 import i18n from '@/utils/i18n';
 
 const t = (key: string) => i18n.global.t(key);
@@ -74,6 +81,7 @@ export const useTerminalStore = defineStore('terminal', {
         this.connections = this.connections.filter(c => c.id !== id);
         // 关闭关联的 tabs
         this.tabs = this.tabs.filter(t => t.connectionId !== id);
+        this.persistWorkspace();
         toast.success(t('sidebar.deleted'));
         return true;
       } catch (e: any) {
@@ -95,6 +103,7 @@ export const useTerminalStore = defineStore('terminal', {
       };
       this.tabs.push(tab);
       this.activeTabId = tabId;
+      this.persistWorkspace();
       return tab;
     },
 
@@ -108,12 +117,15 @@ export const useTerminalStore = defineStore('terminal', {
           console.warn('删除 session 失败:', e);
         }
       }
+      // tab 都关了，它的回放缓冲没有意义，留着只占配额
+      dropTerminalBuffer(tabId);
       const index = this.tabs.findIndex(t => t.id === tabId);
       if (index === -1) return;
       this.tabs.splice(index, 1);
       if (this.activeTabId === tabId) {
         this.activeTabId = this.tabs.length > 0 ? this.tabs[Math.min(index, this.tabs.length - 1)]?.id || null : null;
       }
+      this.persistWorkspace();
     },
 
     // 更新 Tab 状态
@@ -121,14 +133,17 @@ export const useTerminalStore = defineStore('terminal', {
       const tab = this.tabs.find(t => t.id === tabId);
       if (tab) {
         tab.status = status;
+        // sessionId 要跟着快照走：刷新后靠它把服务端遗留的 metadata 清掉
         if (sessionId) tab.sessionId = sessionId;
+        if (sessionId) this.persistWorkspace();
       }
     },
 
     // 切换活动 Tab
     switchTab(tabId: string) {
       this.activeTabId = tabId;
-      this.saveTabs();
+      // 「当前是哪个 tab」也要记：刷新后用户应该回到原来那个终端
+      this.persistWorkspace();
     },
 
     // 切换侧边栏
@@ -167,6 +182,7 @@ export const useTerminalStore = defineStore('terminal', {
       }
       this.tabs = this.tabs.filter(t => t.id === excludeTabId);
       this.activeTabId = excludeTabId;
+      this.persistWorkspace();
     },
 
     // 关闭所有 Tab
@@ -180,8 +196,10 @@ export const useTerminalStore = defineStore('terminal', {
           }
         }
       }
+      for (const tab of this.tabs) dropTerminalBuffer(tab.id);
       this.tabs = [];
       this.activeTabId = null;
+      this.persistWorkspace();
     },
 
     // 重命名 Tab（同步到 server 端）
@@ -197,15 +215,65 @@ export const useTerminalStore = defineStore('terminal', {
           console.warn('重命名 session 失败:', e);
         }
       }
-    },
-    // 保存 TAB 状态到 server（不再使用 localStorage）
-    saveTabs() {
-      // Session 信息由 server 端管理，浏览器端不再持久化
+      this.persistWorkspace();
     },
 
-    // 从 server 恢复 TAB 状态（不再从 localStorage 读取）
-    async restoreTabs(): Promise<void> {
-      // Session 信息由 server 端管理，浏览器端不再持久化
+    /**
+     * 把当前 tab 栏写进本标签页的 sessionStorage 快照。
+     *
+     * 只在「增删改 tab」这类低频动作里调用：输出内容是 terminal-tab 自己按 tab 存的，
+     * 一并塞进这里等于每 1 秒重写一遍整份快照。
+     */
+    persistWorkspace() {
+      saveWorkspace({
+        savedAt: Date.now(),
+        activeTabId: this.activeTabId,
+        tabs: this.tabs.slice(0, MAX_SNAPSHOT_TABS).map(t => ({
+          id: t.id,
+          connectionId: t.connectionId,
+          connectionName: t.connectionName,
+          cols: t.cols,
+          rows: t.rows,
+          sessionId: t.sessionId,
+        })),
+      });
+    },
+
+    /**
+     * 从本标签页的快照恢复 tab 栏。
+     *
+     * 返回 true 表示「这份浏览器标签页本来就有工作区」——哪怕它一个 tab 都没有
+     * （用户刚关完所有 tab 就刷新了），调用方也不该再自作主张开一个新的。
+     * 返回 false 才是真正的首次进入，交给调用方兜底。
+     */
+    restoreFromWorkspace(): boolean {
+      const snapshot = loadWorkspace();
+      if (!snapshot) return false;
+
+      const tabs: TerminalTab[] = [];
+      // 连接列表没拉到时不做过滤：这时分不清「连接被删了」和「网络刚好失败」，
+      // 宁可把一个连不上的 tab 恢复出来，也不能因为一次请求失败把用户的工作区抹掉
+      const knownConnections = this.connections.length > 0;
+      for (const item of snapshot.tabs) {
+        if (knownConnections && item.connectionId !== '__local__' && !this.connections.some(c => c.id === item.connectionId)) continue;
+        tabs.push({
+          id: item.id,
+          connectionId: item.connectionId,
+          connectionName: item.connectionName,
+          cols: item.cols || 80,
+          rows: item.rows || 24,
+          sessionId: item.sessionId,
+          // 进程随上个页面一起没了，恢复出来的 tab 一律从「连接中」开始
+          status: 'connecting',
+        });
+      }
+
+      pruneTerminalBuffers(new Set(tabs.map(t => t.id)));
+      this.tabs = tabs;
+      this.activeTabId = snapshot.activeTabId && tabs.some(t => t.id === snapshot.activeTabId)
+        ? snapshot.activeTabId
+        : tabs[0]?.id || null;
+      return true;
     },
 
     // 创建默认服务器 Shell TAB（不保存到连接列表，每次新建）
@@ -226,6 +294,7 @@ export const useTerminalStore = defineStore('terminal', {
       };
       this.tabs.push(tab);
       this.activeTabId = tabId;
+      this.persistWorkspace();
       return tab;
     },
 

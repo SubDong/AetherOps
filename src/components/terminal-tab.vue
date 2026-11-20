@@ -177,6 +177,7 @@ import { SearchAddon } from '@xterm/addon-search';
 import '@xterm/xterm/css/xterm.css';
 import type { ConnectionEntity, WSMessage } from '@/typings/connection';
 import { createSentry, base64ToOctets, stringToOctets, octetsToBase64, Zmodem } from '@/utils/zmodem';
+import { STARTUP_CLEAR_RE, stripStartupClears } from '@/utils/terminal-restore';
 import AIChat from '@/components/ai-chat/index.vue';
 import FileTransfer from '@/components/file-transfer.vue';
 import FileManager from '@/components/file-manager.vue';
@@ -197,6 +198,7 @@ import { useDraggableFloating } from '@/utils/draggable';
 import * as terminalService from '@/service/terminal';
 import { prompt } from '@/components/prompt';
 import { sealSecret } from '@/utils/transport-crypto';
+import { loadTerminalBuffer, saveTerminalBuffer, MAX_BUFFER_CHARS } from '@/utils/workspace-snapshot';
 
 const { t } = useI18n();
 
@@ -324,6 +326,35 @@ function inferCurrentCwdFromTerminal(): string {
 let terminal: Terminal | null = null;
 let fitAddon: FitAddon | null = null;
 let ws: WebSocket | null = null;
+
+/**
+ * 刷新后回放用的输出尾部：只收服务端推来的文本帧。
+ * 收到就攒在内存里，不每次都写 sessionStorage（输出是高频的，每帧写一次会拖慢主线程），
+ * 由定时器 + pagehide 落地。
+ */
+let outputTail = '';
+let outputDirty = false;
+let outputFlushTimer: ReturnType<typeof setInterval> | null = null;
+/** 本 tab 是从刷新前的快照恢复的：不要再让服务端清屏，否则刚回放出来的内容会被 cls 抹掉 */
+let restoredFromSnapshot = false;
+/**
+ * 恢复中的 tab 要把新会话的输出先扣住。
+ * 只关掉服务端的 cls 还不够：Windows 上 pwsh 自己启动时就会发 \x1b[2J，
+ * 历史刚铺上去就被抹掉。所以等启动横幅吐完（见到清屏序列或超时），
+ * 再按「历史 → 分隔行 → 启动输出」的顺序一次性写进去。
+ */
+let restoreStaging: number[][] | null = null;
+let restoreStagingTimer: ReturnType<typeof setTimeout> | null = null;
+/** 启动期间到达的 conn-log：同样得排到历史后面 */
+let restoreStagingLogs: string[] = [];
+/** 正在重放恢复期间扣住的帧：这些帧的文本早在扣住时就已经进过回放缓冲了，不能再计一次 */
+let replayingStaged = false;
+/** 待回放的原始输出（restoreScrollback 读出来后先存着，等启动横幅结束再写） */
+let restorePending = '';
+const RESTORE_STAGING_TIMEOUT = 1500;
+/** 见到清屏后再多收这么久：服务端的 chcp / cls 是在 spawn 之后 100ms 才写的，会晚于横幅自己的清屏 */
+const RESTORE_STAGING_GRACE = 400;
+const MAX_OUTPUT_TAIL = MAX_BUFFER_CHARS;
 /** 组件已卸载：所有异步回调（onclose / 重连定时器）必须立刻停手 */
 let disposed = false;
 let ipcCleanup: (() => void) | null = null;
@@ -713,6 +744,9 @@ function buildCreateData() {
     cols: terminal?.cols || 80,
     rows: terminal?.rows || 24,
     name: props.connection.name,
+    // 恢复出来的 tab 带上“别清屏”：默认服务器 Shell 在 Windows 上建会话时会发 cls，
+    // 那条清屏会把刚回放的历史抹掉，看起来就像刷新后什么也没留下
+    ...(restoredFromSnapshot ? { clearScreen: false } : {}),
     // 口令只以密文出内存（见 utils/transport-crypto）：明文留在 serverShellPassword 里供重连复用
     ...(serverShellPassword ? { serverShellPassword: sealSecret(serverShellPassword) } : {}),
   };
@@ -1021,6 +1055,22 @@ function handleServerMessage(msg: WSMessage) {
 
   switch (msg.type) {
     case 'terminal':
+      // 先攒一份回放用的尾部：文本帧直接收，中文这类被当成 binary 发来的帧先尝试解码
+      // （恢复期间扣住的帧重放时不再重复计入，见 endRestoreStaging）
+      if (typeof msg.data === 'string' && !replayingStaged) {
+        if (!msg.binary) {
+          appendOutputTail(msg.data);
+        } else {
+          const decoded = decodeBinaryTail(msg.data);
+          if (decoded) appendOutputTail(decoded);
+        }
+      }
+      if (restoreStaging && typeof msg.data === 'string') {
+        // 恢复中：先扣住新会话的启动输出，等历史铺好再接上去；见到清屏就是横幅吐完了
+        restoreStaging.push(stripStartupClears(msg.binary ? base64ToOctets(msg.data) : stringToOctets(msg.data)));
+        if (!msg.binary && STARTUP_CLEAR_RE.test(msg.data)) scheduleStagingEnd(RESTORE_STAGING_GRACE);
+        break;
+      }
       if (msg.data && sentry) {
         let octets: number[];
         if (msg.binary) {
@@ -1120,6 +1170,11 @@ function handleServerMessage(msg: WSMessage) {
 
     case 'conn-log':
       // SSH 连接过程日志，直接写入终端（绕过 ZMODEM sentry）
+      if (restoreStaging) {
+        // 恢复中：排到历史后面，否则日志会插在「刷新前的输出」上面
+        if (msg.data) restoreStagingLogs.push(msg.data);
+        break;
+      }
       if (terminal && msg.data) {
         terminal.writeln(`\r\n\x1b[36m[SSH] ${msg.data}\x1b[0m`);
       }
@@ -1158,6 +1213,126 @@ function sendToServer(msg: WSMessage) {
 // 把文本作为粘贴内容发送到终端
 function pasteToTerminal(text: string) {
   sendToServer({ type: 'terminal', sessionId: sessionId || pendingSessionId, data: text });
+}
+
+/** 攒一份可回放的输出尾部；超过上限只留最后 MAX_OUTPUT_TAIL 个字符 */
+function appendOutputTail(text: string) {
+  if (!text) return;
+  outputTail += text;
+  if (outputTail.length > MAX_OUTPUT_TAIL) outputTail = outputTail.slice(-MAX_OUTPUT_TAIL);
+  outputDirty = true;
+}
+
+/**
+ * 服务端是按「有没有字节 >127」区分 binary 的，中文输出的 UTF-8 字节同样 >127，
+ * 所以中文一律走 base64 + binary 帧。不回放这些帧，中文内容刷新后就没了。
+ *
+ * ZMODEM 传输帧回填进终端只会变成乱码，以及纯二进制垃圾也一并排掉，
+ * 宁可少回放一段，也不能让回放把终端弄脏。
+ */
+function decodeBinaryTail(base64: string): string | null {
+  try {
+    const bytes = base64ToOctets(base64);
+    // **\x18B 是 ZMODEM 帧头（hex header 与 binary header 都以它开头）
+    for (let i = 0; i + 3 < bytes.length; i++) {
+      if (bytes[i] === 0x2a && bytes[i + 1] === 0x2a && bytes[i + 2] === 0x18 && bytes[i + 3] === 0x42) return null;
+    }
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array(bytes));
+    let controls = 0;
+    for (let i = 0; i < text.length; i++) {
+      const c = text.charCodeAt(i);
+      if (c < 32 && c !== 9 && c !== 10 && c !== 13 && c !== 27) controls++;
+    }
+    return controls > text.length * 0.1 ? null : text;
+  } catch {
+    return null;
+  }
+}
+
+function flushOutputTail() {
+  if (!outputDirty) return;
+  outputDirty = false;
+  saveTerminalBuffer(props.tabId, outputTail);
+}
+
+/** 页面被刷新/关闭前无条件落盘：pagehide 之后不再有执行机会 */
+function handlePageHide() {
+  flushOutputTail();
+}
+
+/**
+ * 回放刷新前的屏幕内容。
+ *
+ * 灌回去的是原始输出字节：颜色、光标定位、清屏都原样重现，
+ * 比从 buffer 逐行取文本更接近刷新前那一刻的画面。
+ */
+function restoreScrollback() {
+  const saved = loadTerminalBuffer(props.tabId);
+  if (!saved || !terminal) return;
+  restoredFromSnapshot = true;
+  outputTail = saved;
+  restorePending = saved;
+  // 先不写：新会话一启动，Windows 上的 pwsh 自己就会发 \x1b[2J 清屏，铺了也是白铺。
+  // 等启动横幅吐完（见到清屏序列，或 1.5s 内一直没见到）再按顺序写。
+  restoreStaging = [];
+  restoreStagingLogs = [];
+  scheduleStagingEnd(RESTORE_STAGING_TIMEOUT);
+}
+
+/** 重设定时器：见到启动清屏后又往后退一点，把紧跟其后的 chcp / cls 也收进来 */
+function scheduleStagingEnd(delay: number) {
+  if (restoreStagingTimer) clearTimeout(restoreStagingTimer);
+  restoreStagingTimer = setTimeout(endRestoreStaging, delay);
+}
+
+/**
+ * 启动横幅结束：把「历史 → 分隔行 → 启动输出」按顺序铺进终端。
+ *
+ * 顺序不能反：先写历史，再重放扣住的启动帧（已按字节去掉清屏），
+ * 这样画面看上去就是「刷新前的内容还在，新会话接着往下跑」。
+ */
+function endRestoreStaging() {
+  const staged = restoreStaging;
+  if (!staged) return;
+  restoreStaging = null;
+  if (restoreStagingTimer) {
+    clearTimeout(restoreStagingTimer);
+    restoreStagingTimer = null;
+  }
+  const logs = restoreStagingLogs;
+  restoreStagingLogs = [];
+  const history = restorePending;
+  restorePending = '';
+  if (!terminal) return;
+
+  const writeStartup = () => {
+    for (const line of logs) terminal?.writeln(`\r\n\x1b[36m[SSH] ${line}\x1b[0m`);
+    replayingStaged = true;
+    try {
+      for (const octets of staged) {
+        if (!octets.length) continue;
+        handleServerMessage({
+          type: 'terminal',
+          sessionId: sessionId || pendingSessionId,
+          binary: true,
+          data: octetsToBase64(octets),
+        } as WSMessage);
+      }
+    } finally {
+      replayingStaged = false;
+    }
+  };
+
+  if (!history) {
+    writeStartup();
+    return;
+  }
+  // terminal.write 是异步的，分隔行与启动输出都得等它落完再写，否则会插到历史前面
+  terminal.write(history, () => {
+    if (!terminal) return;
+    terminal.writeln(`\r\n\x1b[90m── ${t('tab.restored')} ──\x1b[0m`);
+    writeStartup();
+  });
 }
 
 // 将状态信息写入终端信息流
@@ -1240,7 +1415,13 @@ watch(() => props.active, (val) => {
 
 onMounted(() => {
   initTerminal();
+  // 先铺刷新前的内容，再追加本次连接状态，顺序反了历史就会压在“正在连接”下面
+  restoreScrollback();
   writeStatusToTerminal('connecting');
+
+  // 输出不定时落地：刷新/关页前 pagehide 还会再补一次
+  outputFlushTimer = setInterval(flushOutputTail, 1500);
+  window.addEventListener('pagehide', handlePageHide);
 
   // VSCode 主题切换时（含明暗切换）实时同步终端配色
   offVscodeTheme = onVscodeThemeChange(() => {
@@ -1269,6 +1450,18 @@ onMounted(() => {
 onBeforeUnmount(() => {
   // 先置位：下面 ws.close() 触发的 onclose 会异步赶到，它必须知道组件已经不在了
   disposed = true;
+  if (outputFlushTimer) {
+    clearInterval(outputFlushTimer);
+    outputFlushTimer = null;
+  }
+  // 还没铺完就被关掉：直接把扣住的输出丢掉，不要让它落到下一个组件里
+  if (restoreStagingTimer) {
+    clearTimeout(restoreStagingTimer);
+    restoreStagingTimer = null;
+  }
+  restoreStaging = null;
+  restorePending = '';
+  window.removeEventListener('pagehide', handlePageHide);
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
@@ -1403,6 +1596,17 @@ function handleContextClear() {
   } else {
     // 断连时终端已死，本地清空即可
     terminal.clear();
+    // 本地清屏把回滚也抹了，回放缓冲要跟着清，否则刷新一下旧内容又回来了
+    outputTail = '';
+    outputDirty = true;
+    // 恢复还没铺完就被手动清屏：扣住的内容一并作废
+    restoreStaging = null;
+    restorePending = '';
+    restoreStagingLogs = [];
+    if (restoreStagingTimer) {
+      clearTimeout(restoreStagingTimer);
+      restoreStagingTimer = null;
+    }
   }
 }
 
