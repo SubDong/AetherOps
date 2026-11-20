@@ -21,6 +21,21 @@ export const router = createRouter({
             meta: { titleKey: 'auth.users', requiresAdmin: true }
         },
         {
+            path: '/watch-tokens',
+            name: 'watchTokens',
+            component: () => import('@/views/watch-tokens.vue'),
+            // 签发/吊销只读监控令牌；服务端还会校 monitor 位，这里不做前端权限拦截
+            meta: { titleKey: 'watch.tokensTitle' }
+        },
+        {
+            path: '/watch',
+            name: 'watch',
+            component: () => import('@/views/watch.vue'),
+            // public：大屏没有登录态，它手里的 aow_ 令牌由自己的请求链校验。
+            // 不加这个标记就会被下面的 beforeEach 直接踢到登录页
+            meta: { titleKey: 'watch.title', public: true }
+        },
+        {
             path: '/:pathMatch(.*)*',
             name: 'terminal',
             component: () => import('@/views/index.vue'),
@@ -36,6 +51,11 @@ export const router = createRouter({
  */
 router.beforeEach((to, _from, next) => {
     abortAllPending();
+    // 免登录页（目前只有大屏）：令牌自己管，不能因为本地没有登录态就改去登录页
+    if (to.meta?.public) {
+        next();
+        return;
+    }
     const hasToken = Boolean(getToken());
     if (!hasToken && to.name !== 'login') {
         next({ name: 'login', query: { redirect: to.fullPath } });

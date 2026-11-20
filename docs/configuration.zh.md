@@ -90,6 +90,12 @@ AetherOps 只有一份配置文件、一套环境变量命名空间，以及数�
 |----|--------|------|
 | `launchToken` | *空* | 健康检查令牌，由 VSCode/Electron 宿主注入，用来让 `/health` 无法被一个恰好占住端口的无关进程糊弄过去。它不是用户身份 |
 | `maxUploadMb` | `100` | 单次上传上限；同时也用来决定 WebSocket 的 `maxPayload` |
+| `tokenTtlSeconds` | `7200` | 登录令牌时长（秒）。滑动续期，续期阈值取它的四分之一（上限 1000 秒、下限 30 秒）。小于 60 会被启动校验拒掉 |
+| `watchTokenTtlSeconds` | `2592000` | 大屏只读令牌的固定寿命（默认 30 天），**不续期**；设为 `0` 表示禁止签发 |
+
+两个 TTL 只决定「令牌还能用多久」，与权限无关。一个提醒：把 `tokenTtlSeconds` 调到一天以上不会让大屏更省心 ——
+大屏应该用只读监控令牌（见[账号、角色与权限](./accounts-and-permissions.zh.md#只读监控令牌)），
+而不是把一个登录会话拖成一周。
 
 ### `debug`
 
@@ -166,6 +172,8 @@ AetherOps 实际连上的那台机器 —— 也就是跳板机本身，和状�
 | `AETHEROPS_DB_SSL_INSECURE` | `database.sslRejectUnauthorized`（取反） | 名字里刻意带 INSECURE，复制粘贴时意思不会丢 |
 | `AETHEROPS_REDIS_URL` / `_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DB` / `_PREFIX` / `_CONNECT_TIMEOUT_MS` | `redis.*` | |
 | `AETHEROPS_MAX_UPLOAD_MB` | `auth.maxUploadMb` | |
+| `AETHEROPS_AUTH_TOKEN_TTL_SECONDS` | `auth.tokenTtlSeconds` | 登录令牌时长；低于 60 被拒 |
+| `AETHEROPS_AUTH_WATCH_TOKEN_TTL_SECONDS` | `auth.watchTokenTtlSeconds` | 大屏只读令牌时长；`0` = 禁止签发 |
 | `AETHEROPS_LAUNCH_TOKEN` | `auth.launchToken` | 由桌面/VSCode 宿主设置 |
 | `AETHEROPS_SSH_DEBUG` | `debug.sshDebug` | `1` 或 `true` |
 | `AETHEROPS_METRICS_OFFLINE_SAMPLING` | `metrics.offlineSampling` | `1` 或 `true`；对没有打开终端的机器也采样 |
@@ -214,6 +222,7 @@ AI 服务商的设置（Base URL、Key、模型）**不能**通过环境变量�
 | `0009-error-fingerprints` | 新增 `error_fingerprints`：每个归属 / 连接 / 指纹一行，记 `occurrences`、`first_seen`、`last_seen`（由 Agent 的 `after_tool` 钩子写入） |
 | `0010-alerts` | 新增 `alerts`（有状态告警：`open` / `acked` / `resolved`，靠生成列 `open_key` 按归属 + 连接 + 指纹去重）与 `alert_mutes`（规则级静默窗口） |
 | `0011-collaboration` | `alerts.assignee_id` / `alerts.incident_id` 两列，另加 `idx_alerts_assignee` / `idx_alerts_incident`；新增 `incidents`（每个归属 / 连接的事件一行，`open` / `resolved`，`alert_count` 以 alerts 表为准刷新）与 `alert_oncall`（账号 + 一天中的分钟班次，主键 `(owner_id, user_id, start_minute)`） |
+| `0012-watch-tokens` | 新增 `auth_watch_tokens`：大屏只读令牌一行一枚（`owner_id`、`label`、`token_hash`、`created_at`、`expires_at`、`revoked_at`、`last_used_at`）。单独一张表而不是塞 Redis，是因为它要能被列出、被单独吊销，并且**不能**挤占「一账号一登录会话」的名额 |
 
 如果你打算加迁移，这些表结构约束值得先知道：
 
@@ -256,6 +265,7 @@ node scripts/migrate.mjs --force     # 忽略 checksum 不一致 / 已应用的�
 | 告警、规则级静默、事件与值班表 | MySQL `alerts`（含 `assignee_id` / `incident_id`）、`alert_mutes`、`incidents`、`alert_oncall`（按归属隔离） | 否 |
 | 账号（scrypt 哈希、角色、状态、10 个权限位） | MySQL `users` | 只存口令哈希，不可逆 |
 | 登录令牌 | Redis（`aetherops:token:*`，哈希存储，滑动 TTL） | 不适用 |
+| 大屏只读令牌 | MySQL `auth_watch_tokens`（按归属隔离，存 SHA-256 哈希） | 不适用；明文只在签发响应里出现一次 |
 | 解密密钥 | 数据目录下的 `*.key` 文件 | 这些**就是**秘密本身 |
 | 服务日志、PID 文件、回收站 | 数据目录 | 否 |
 

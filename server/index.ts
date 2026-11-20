@@ -173,6 +173,11 @@ export interface AuthContext {
   username: string;
   role: 'admin' | 'user';
   permissions: Record<string, boolean>;
+  /**
+   * 令牌类型：登录会话是 session，大屏只读令牌是 watch。
+   * 缺省当 session 处理——所有宿主在加这层分流之前都只发登录令牌。
+   */
+  kind?: 'session' | 'watch';
 }
 
 /** 带 HTTP 状态码的错误：宿主据此回 401/403，而不是把权限问题都报成 500 */
@@ -228,6 +233,8 @@ const PREFIX_PERMISSIONS: Array<[string, PermissionKey[]]> = [
   // 告警是监控的下游（规则命中后才产生），共用 monitor 权限位：
   // 能看日志的人当然能看它产生的告警，反之不成立。
   ['/api/alerts/', ['monitor']],
+  // 大屏只读视图：watch token 解析出来的权限位只有 monitor，这里也只要求它。
+  ['/api/watch/', ['monitor']],
   ['/api/audit/', ['audit']],
   ['/api/snippet/', ['snippets']],
   ['/api/connection/', ['connections']],
@@ -329,6 +336,15 @@ export async function handleRoutes(pathname: string, body: any, ctx: AuthContext
   console.log(`[Server] handleRoutes: ${pathname} user=${ctx?.username || '-'}`);
   const ownerId = ctx?.userId;
   if (!ownerId) throw new ApiError('Unauthorized', 401);
+  // 只读令牌只开一扇门。
+  //
+  // 这层前缀判断不能让路由表去兼：watch token 的权限位是 monitor，
+  // 而 /api/monitor/*、/api/alerts/* 都要求 monitor —— 少写一处判断，
+  // 大屏那串明文就能停监控、确认告警、静默规则。所以默认全部拒绝，
+  // 只有显式声明的 /api/watch/* 才放行。
+  if (ctx.kind === 'watch' && !pathname.startsWith('/api/watch/')) {
+    throw new ApiError('只读监控令牌只能访问 /api/watch/*', 403);
+  }
   assertPermission(pathname, ctx);
   assertSessionOwner(ctx, body);
   try {
@@ -847,6 +863,44 @@ export async function handleRoutes(pathname: string, body: any, ctx: AuthContext
       const result = await alertService.attachIncident(ownerId, id);
       if (!result) throw new ApiError('告警不存在', 404);
       return result;
+    }
+
+    // ========== 大屏只读视图（watch token 唯一入口） ==========
+    //
+    // 一次请求拿全「墙上那块屏」需要的东西：告警计数与列表、未结束的事件、
+    // 各主机最近一分钟的指标、以及连接清单（只给定位信息）。
+    // 合并在一个端点里，是为了让一块每 60 秒刷新的屏只发一个请求 ——
+    // 拆成四个端点除了多三次往返，还多四次「其中一次失败就半张屏是空的」。
+    if (pathname === '/api/watch/overview') {
+      const limit = Math.min(Math.max(Number(body?.limit) || 50, 1), 200);
+      const [alertList, incidents, hosts, connections] = await Promise.all([
+        alertService.list(ownerId, { limit }),
+        alertService.incidents(ownerId, { status: 'open', limit: 20 }),
+        // 指标留存可能还没开始写（第一次采集延后 15s），空表不是错误
+        hostMetricsService.listHosts(ownerId, 60).catch(() => []),
+        connectionService.getAllConnections(ownerId),
+      ]);
+      return {
+        generatedAt: Date.now(),
+        // 大屏要显示「这是谁的屏」，而 watch token 用不了 /api/auth/me
+        viewer: { userId: ctx.userId, username: ctx.username },
+        alerts: { counts: alertList.counts, items: alertList.items },
+        incidents,
+        hosts,
+        // 采集口径：看到「主机是灰的、读数是 -」时，得能分清是「没人连着」还是「采挂了」
+        sampling: { offlineSampling: loadConfig().metrics.offlineSampling },
+        // 只读视图不给凭据：与管理员代管视图同一份白名单思路
+        connections: connections.map((item) => ({
+          id: item.id,
+          name: item.name,
+          type: item.type,
+          host: item.host,
+          port: item.port,
+          username: item.username,
+          enabled: item.enabled,
+          sampling: item.sampling || '',
+        })),
+      };
     }
 
     // ========== 批量操作 ==========

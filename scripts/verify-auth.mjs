@@ -1,6 +1,6 @@
 /**
  * 账号体系端到端验证（对已启动的服务）
- * 覆盖：登录签发 / 待授权限制 / 权限拦截 / 数据隔离 / 单点登录踢人 / 滑动续期 / 删号下线
+ * 覆盖：登录签发 / 待授权限制 / 权限拦截 / 数据隔离 / 单点登录踢人 / 滑动续期 / 只读监控令牌 / 删号下线
  *
  * 用法：node scripts/verify-auth.mjs
  *   BASE=http://127.0.0.1:18080 ADMIN_USER=admin ADMIN_PASS=xxx node scripts/verify-auth.mjs
@@ -23,6 +23,13 @@ const results = [];
  */
 const { sealString } = require(path.join(root, 'dist/server/utils/transport-crypto.js'));
 const seal = (plain) => sealString(plain);
+/**
+ * TTL 与续期阈值从服务端同一份实现取，而不是在断言里再写一遍 7200。
+ * 它们现在是配置项（auth.tokenTtlSeconds），写死等于让改了配置的部署跑出假失败。
+ */
+const { tokenTtl, tokenTtlSeconds, tokenRenewThresholdSeconds } = require(path.join(root, 'dist/server/service/auth.service.js'));
+const TTL = tokenTtlSeconds();
+const RENEW_THRESHOLD = tokenRenewThresholdSeconds();
 function check(name, ok, detail = '') {
   results.push({ name, ok, detail });
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? '  |  ' + detail : ''}`);
@@ -45,7 +52,7 @@ async function main() {
   const adminLogin = await post('/oauth/token', { grant_type: 'password', username: ADMIN_USER, password: seal(ADMIN_PASS) });
   const tokA = adminLogin.json?.access_token;
   check('管理员登录签发 Bearer 令牌', adminLogin.status === 200 && !!tokA, `status=${adminLogin.status}`);
-  check('令牌有效期 7200s', adminLogin.json?.expires_in === 7200, `expires_in=${adminLogin.json?.expires_in}`);
+  check(`令牌有效期 = auth.tokenTtlSeconds (${TTL}s)`, adminLogin.json?.expires_in === TTL, `expires_in=${adminLogin.json?.expires_in}`);
   if (!tokA) throw new Error('管理员登录失败，后续无法验证');
 
   // 2. 自助注册 -> pending
@@ -112,27 +119,68 @@ async function main() {
   const notAdmin = await post('/api/users/list', {}, tokU2);
   check('普通账号调用账号管理接口被 403', notAdmin.status === 403, `status=${notAdmin.status}`);
 
-  // 9. 滑动续期：TTL 压到 300s（低于 1000s 阈值），再发一次请求应回满 7200s
+  // 9. 滑动续期：把 TTL 压到续期阈值以下，再发一次请求应回满
   const { getRedis, redisKey } = require(path.join(root, 'dist/server/db/redis.js'));
-  const { tokenTtl } = require(path.join(root, 'dist/server/service/auth.service.js'));
   const redis = await getRedis();
   const hash = crypto.createHash('sha256').update(tokU2).digest('hex');
-  await redis.expire(redisKey('token:' + hash), 300);
+  const low = Math.max(1, RENEW_THRESHOLD - 60);
+  await redis.expire(redisKey('token:' + hash), low);
   const before = await tokenTtl(tokU2);
   await post('/api/auth/me', {}, tokU2);
   const after = await tokenTtl(tokU2);
-  check('剩余 <1000s 时一次操作即续期到 7200s', before <= 300 && after > 7000, `before=${before}s after=${after}s`);
+  check(`剩余 <${RENEW_THRESHOLD}s 时一次操作即续期到 ${TTL}s`, before <= low && after > TTL - 60, `before=${before}s after=${after}s`);
 
   // 10. TTL 充足时不续期（否则等于永不失效）
-  await redis.expire(redisKey('token:' + hash), 5000);
+  const steadyStart = RENEW_THRESHOLD + 900;
+  await redis.expire(redisKey('token:' + hash), steadyStart);
   await post('/api/auth/me', {}, tokU2);
   const steady = await tokenTtl(tokU2);
-  check('TTL 充足时不做续期', steady > 4000 && steady <= 5000, `ttl=${steady}s`);
+  check('TTL 充足时不做续期', steady > steadyStart - 100 && steady <= steadyStart, `ttl=${steady}s`);
 
   // 11. 登出吊销
   await post('/oauth/revoke', { token: tokU2 });
   const afterLogout = await post('/api/auth/me', {}, tokU2);
   check('登出后令牌立即失效', afterLogout.status === 401, `status=${afterLogout.status}`);
+
+  // 11b. 只读监控令牌：能读大屏端点，别处一律拒绝，且不占单点登录名额
+  const grantMonitor = await post('/api/users/update', {
+    id: u1.id,
+    permissions: { connections: true, terminal: true, files: true, monitor: true },
+  }, tokA);
+  check('管理员给 U1 补 monitor 位', grantMonitor.status === 200, `status=${grantMonitor.status}`);
+  const u1Login3 = await post('/oauth/token', { grant_type: 'password', username: U1, password: seal(PASS) });
+  const tokU3 = u1Login3.json?.access_token;
+  check('补权限后重新登录成功', !!tokU3, `status=${u1Login3.status}`);
+
+  const issued = await post('/api/auth/createWatchToken', { label: 'verify-wall' }, tokU3);
+  const watchToken = issued.json?.data?.token;
+  const watchId = issued.json?.data?.brief?.id;
+  check('签发只读令牌（aow_ 前缀）', issued.status === 200 && String(watchToken).startsWith('aow_'), `status=${issued.status}`);
+
+  const watchOk = await post('/api/watch/overview', {}, watchToken);
+  check('只读令牌能读 /api/watch/overview', watchOk.status === 200 && !!watchOk.json?.data?.alerts, `status=${watchOk.status}`);
+
+  const watchMe = await post('/api/auth/me', {}, watchToken);
+  // 401 而不是 403：三个宿主只对 /api/watch/* 打开 allowWatch，前缀在鉴权那层就被挡了。
+  // handleAccountRoutes 里的 403 是第二道门（今后若有宿主放宽 allowWatch，账号接口仍然进不去）。
+  check('只读令牌被账号接口拒绝（401）', watchMe.status === 401, `status=${watchMe.status}`);
+
+  const watchConn = await post('/api/connection/getConnections', {}, watchToken);
+  check('只读令牌不能读连接接口（401）', watchConn.status === 401, `status=${watchConn.status}`);
+
+  const watchMonitor = await post('/api/monitor/listMonitors', {}, watchToken);
+  check('只读令牌不能冒用 monitor 接口（401）', watchMonitor.status === 401, `status=${watchMonitor.status}`);
+
+  const alive = await post('/api/auth/me', {}, tokU3);
+  check('大屏令牌不占单点登录名额（原会话仍有效）', alive.status === 200, `status=${alive.status}`);
+
+  const list = await post('/api/auth/listWatchTokens', {}, tokU3);
+  check('签发后清单里能看到这一枚',
+    (list.json?.data || []).some((t) => t.id === watchId && t.state === 'active'), `count=${(list.json?.data || []).length}`);
+
+  const rev = await post('/api/auth/revokeWatchToken', { id: watchId }, tokU3);
+  const watchGone = await post('/api/watch/overview', {}, watchToken);
+  check('吊销后令牌立即失效', rev.status === 200 && watchGone.status === 401, `revoke=${rev.status} use=${watchGone.status}`);
 
   // 12. 删号 = 数据一起清。业务表之间没有外键级联，靠 deleteUserByAdmin 主动清；
   //     这里直接查库验证，只看接口返回 200 是看不出有没有留下孤儿数据的。
@@ -145,6 +193,8 @@ async function main() {
 
   const ownedAfter = await query('SELECT COUNT(*) AS c FROM connections WHERE owner_id = ?', [u1.id]);
   check('删号后其连接数据一并清除', Number(ownedAfter[0]?.c || 0) === 0, `left=${ownedAfter[0]?.c}`);
+  const watchLeft = await query('SELECT COUNT(*) AS c FROM auth_watch_tokens WHERE owner_id = ?', [u1.id]);
+  check('删号后其只读令牌一并清除', Number(watchLeft[0]?.c || 0) === 0, `left=${watchLeft[0]?.c}`);
   const ghost = await post('/oauth/token', { grant_type: 'password', username: U1, password: seal(PASS) });
   check('已删账号无法登录', ghost.status === 401, `status=${ghost.status}`);
 

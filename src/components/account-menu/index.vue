@@ -32,6 +32,10 @@
         </div>
       </form>
 
+      <router-link v-if="canMonitor" class="account-item" to="/watch-tokens" @click="open = false">
+        <i class="bi bi-display"></i>{{ t('watch.tokensEntry') }}
+      </router-link>
+
       <router-link v-if="admin" class="account-item" to="/users" @click="open = false">
         <i class="bi bi-people"></i>{{ t('auth.users') }}
       </router-link>
@@ -48,7 +52,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { toast } from '@/utils/toast';
 import { modal } from '@/utils/modal';
-import { changePassword, clearAuth, getCurrentUser, logout, redirectToLogin } from '@/utils/auth';
+import { changePassword, clearAuth, getCurrentUser, hasPermission, logout, redirectToLogin } from '@/utils/auth';
 
 const { t } = useI18n();
 
@@ -63,6 +67,8 @@ const passwordBusy = ref(false);
 const user = ref(getCurrentUser());
 const admin = computed(() => user.value?.role === 'admin');
 const pending = computed(() => user.value?.status === 'pending');
+/** 只读监控令牌只服务监控数据，所以签发入口也只看 monitor 位 */
+const canMonitor = computed(() => hasPermission('monitor'));
 
 function toggle() {
   open.value = !open.value;

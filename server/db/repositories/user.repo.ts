@@ -161,8 +161,11 @@ export async function purgeOwnerData(ownerId: string): Promise<void> {
   // 子表在前：alerts 挂在 incidents 上，先删告警再删事件。
   // host_metrics_minute / error_fingerprints / alerts / alert_mutes / incidents / alert_oncall
   // 都是 P4–P6 新增的按账号数据，漏一张就会在删号后留下孤儿行（凭 id 还能被别处读到）。
+  // auth_watch_tokens 同理：令牌本身会因为「账号不 active」而失效，但行还在，
+  // 留着它等于把一张废弃大屏的哈希永久挂在库里。
   const tables = [
     'ai_messages', 'ai_history', 'audit_events', 'snippets', 'skills', 'sessions', 'ai_config',
+    'auth_watch_tokens',
     'host_metrics_minute', 'error_fingerprints', 'alerts', 'alert_mutes', 'incidents', 'alert_oncall',
     'connections',
   ];

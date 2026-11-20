@@ -9,6 +9,7 @@ import { CONNECTION_SAMPLING_SQL } from './0008-connection-sampling';
 import { ERROR_FINGERPRINTS_SQL } from './0009-error-fingerprints';
 import { ALERTS_SQL } from './0010-alerts';
 import { COLLABORATION_SQL } from './0011-collaboration';
+import { WATCH_TOKENS_SQL } from './0012-watch-tokens';
 
 /**
  * 迁移清单。
@@ -42,6 +43,7 @@ export const MIGRATIONS: Migration[] = [
   { version: '0009', name: 'error-fingerprints', sql: ERROR_FINGERPRINTS_SQL },
   { version: '0010', name: 'alerts', sql: ALERTS_SQL },
   { version: '0011', name: 'collaboration', sql: COLLABORATION_SQL },
+  { version: '0012', name: 'watch-tokens', sql: WATCH_TOKENS_SQL },
 ];
 
 /** 供 CLI 导出 .sql 文本 */

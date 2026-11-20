@@ -133,14 +133,15 @@ function ensureServicesReady() {
 const AUTH_CACHE_MS = 15000;
 const authCache = new Map();
 
-async function resolveUser(token, senderId) {
+async function resolveUser(token, senderId, options = {}) {
   const raw = String(token || '');
   if (!raw) return null;
   const cached = senderId != null ? authCache.get(senderId) : null;
   if (cached && cached.token === raw && Date.now() - cached.at < AUTH_CACHE_MS) return cached.user;
   try {
     const { authenticate } = require(serverDist('service', 'auth.service.js'));
-    const user = await authenticate(raw);
+    // allowWatch：只读监控令牌只在 /api/watch/* 上被认，与 server.js / vite 中间件同一套语义
+    const user = await authenticate(raw, options);
     if (senderId != null) {
       if (user) authCache.set(senderId, { token: raw, user, at: Date.now() });
       else authCache.delete(senderId);
@@ -197,7 +198,8 @@ function setupApiIPC() {
         return { status: 400, data: { ret: 400, msg: 'Invalid API path' } };
       }
       // 业务接口必须登录：三个参数里第三个就是登录人，所有仓储都按它隔离
-      const user = await resolveUser(token);
+      // 只读监控令牌只在 /api/watch/* 上被认
+      const user = await resolveUser(token, null, { allowWatch: pathname.startsWith('/api/watch/') });
       if (!user) return { status: 401, data: { ret: 401, msg: 'Unauthorized' } };
       const data = await services.serverModule.handleRoutes(pathname, body, user);
       return { status: 200, data };
@@ -350,7 +352,7 @@ function setupTerminalIPC() {
 
       switch (type) {
         case 'create': {
-          const { connectionId, cols, rows, name, serverShellPassword } = data || {};
+          const { connectionId, cols, rows, name, serverShellPassword, clearScreen } = data || {};
           if (!connectionId) {
             send({ type: 'error', data: 'Missing connectionId' });
             return;
@@ -363,7 +365,7 @@ function setupTerminalIPC() {
 
           const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, (msg) => {
             send({ type: 'conn-log', sessionId, data: msg });
-          }, user.userId, { serverShellPassword });
+          }, user.userId, { serverShellPassword, clearScreen });
 
           // 绑定输出
           const sendOutput = (chunk) => {
@@ -405,7 +407,7 @@ function setupTerminalIPC() {
             sshService.closeSession(sid);
           }
           // 复用 create 逻辑
-          const { connectionId, cols, rows, name, serverShellPassword } = data || {};
+          const { connectionId, cols, rows, name, serverShellPassword, clearScreen } = data || {};
           if (!connectionId) {
             send({ type: 'error', data: 'Missing connectionId' });
             return;
@@ -417,7 +419,7 @@ function setupTerminalIPC() {
 
           const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, (msg) => {
             send({ type: 'conn-log', sessionId, data: msg });
-          }, user.userId, { serverShellPassword });
+          }, user.userId, { serverShellPassword, clearScreen });
 
           const sendOutput = (chunk) => {
             if (win.isDestroyed()) return;

@@ -95,6 +95,13 @@ ignored by the loader, and so is any other unrecognized key — with a warning, 
 |-----|---------|---------|
 | `launchToken` | *empty* | Health-check token injected by the VSCode/Electron host so `/health` cannot be satisfied by an unrelated process squatting on the port. Not a user identity |
 | `maxUploadMb` | `100` | Per-request upload cap; also sizes the WebSocket `maxPayload` |
+| `tokenTtlSeconds` | `7200` | Login token lifetime in seconds. Sliding renewal, threshold = a quarter of it (capped at 1000 s, floored at 30 s). Values below 60 are rejected at startup |
+| `watchTokenTtlSeconds` | `2592000` | Fixed lifetime of a wallboard read-only token (30 days by default), **never renewed**; `0` disables issuing |
+
+Both TTLs only decide "how long a token stays usable" and have nothing to do with permissions. One reminder:
+raising `tokenTtlSeconds` past a day does not make a wallboard happier — a screen should use a read-only
+watch token (see [Accounts, Roles and Permissions](./accounts-and-permissions.md#read-only-watch-tokens))
+instead of stretching a login session to a week.
 
 ### `debug`
 
@@ -184,6 +191,8 @@ this section or the `AETHEROPS_ALERTS_*` variables**. The same applies to every 
 | `AETHEROPS_DB_SSL_INSECURE` | `database.sslRejectUnauthorized` (inverted) | Named "INSECURE" so the meaning survives a copy-paste |
 | `AETHEROPS_REDIS_URL` / `_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DB` / `_PREFIX` / `_CONNECT_TIMEOUT_MS` | `redis.*` | |
 | `AETHEROPS_MAX_UPLOAD_MB` | `auth.maxUploadMb` | |
+| `AETHEROPS_AUTH_TOKEN_TTL_SECONDS` | `auth.tokenTtlSeconds` | Login token lifetime; below 60 is rejected |
+| `AETHEROPS_AUTH_WATCH_TOKEN_TTL_SECONDS` | `auth.watchTokenTtlSeconds` | Wallboard token lifetime; `0` disables issuing |
 | `AETHEROPS_LAUNCH_TOKEN` | `auth.launchToken` | Set by desktop/VSCode hosts |
 | `AETHEROPS_SSH_DEBUG` | `debug.sshDebug` | `1` or `true` |
 | `AETHEROPS_METRICS_OFFLINE_SAMPLING` | `metrics.offlineSampling` | `1` or `true`; samples hosts without an open terminal |
@@ -233,6 +242,7 @@ statement text with whitespace normalized.
 | `0009-error-fingerprints` | New `error_fingerprints`: one row per owner / connection / fingerprint, with `occurrences`, `first_seen`, `last_seen` (written by the agent `after_tool` hook) |
 | `0010-alerts` | New `alerts` (stateful alerts: `open` / `acked` / `resolved`, deduplicated by owner + connection + fingerprint through the generated column `open_key`) and `alert_mutes` (rule-level silence windows) |
 | `0011-collaboration` | `alerts.assignee_id` / `alerts.incident_id` plus `idx_alerts_assignee` / `idx_alerts_incident`; new `incidents` (one row per owner / connection event, `open` / `resolved`, `alert_count` refreshed from the alerts table) and `alert_oncall` (account + minute-of-day shift, primary key `(owner_id, user_id, start_minute)`) |
+| `0012-watch-tokens` | New `auth_watch_tokens`: one row per wallboard read-only token (`owner_id`, `label`, `token_hash`, `created_at`, `expires_at`, `revoked_at`, `last_used_at`). It is a table rather than Redis because such tokens must be listable and individually revocable, and must **not** consume the "one login session per account" slot |
 
 Schema constraints worth knowing if you intend to add a migration:
 
@@ -278,6 +288,7 @@ node scripts/migrate.mjs --force     # ignore checksum mismatch / already-applie
 | Alerts, rule-level mutes, incidents and the on-call roster | MySQL `alerts` (with `assignee_id` / `incident_id`), `alert_mutes`, `incidents`, `alert_oncall` (owner-scoped) | no |
 | Accounts (scrypt hash, role, status, 10 permission bits) | MySQL `users` | password hash only, irreversible |
 | Login tokens | Redis (`aetherops:token:*`, hashed, sliding TTL) | n/a |
+| Wallboard read-only tokens | MySQL `auth_watch_tokens` (owner-scoped, SHA-256 hash only) | n/a; the cleartext appears once, in the issue response |
 | Decryption keys | data dir `*.key` files | these **are** the secrets |
 | Server log, PID file, trash | data dir | no |
 

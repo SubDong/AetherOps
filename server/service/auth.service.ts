@@ -15,6 +15,16 @@ import {
   type UserUpdate,
 } from '../db/repositories/user.repo';
 import {
+  findWatchTokenByHash,
+  insertWatchToken,
+  listWatchTokens,
+  pruneWatchTokens,
+  revokeWatchToken as revokeWatchTokenRow,
+  touchWatchToken,
+  type WatchTokenRow,
+} from '../db/repositories/watch-token.repo';
+import { loadConfig } from '../utils/config';
+import {
   emptyPermissions,
   fullPermissions,
   toPublicUser,
@@ -33,10 +43,25 @@ const scrypt = promisify(crypto.scrypt) as (
   options: crypto.ScryptOptions,
 ) => Promise<Buffer>;
 
-/** 令牌有效期（秒） */
-export const TOKEN_TTL_SECONDS = 7200;
-/** 剩余有效期低于这个值才续期；太频繁续期会让 redis 写入变成每个请求一次 */
-export const TOKEN_RENEW_THRESHOLD_SECONDS = 1000;
+/**
+ * 登录令牌有效期（秒）。默认 7200，部署方可通过 auth.tokenTtlSeconds 调整：
+ * 2 小时对普通用户在够用与「公用电脑不该永久登录」之间取中，
+ * 而长时间挂着的大屏应该用只读监控令牌，而不是把这个值调到一周。
+ */
+export function tokenTtlSeconds(): number {
+  const configured = Number(loadConfig().auth?.tokenTtlSeconds);
+  return Number.isFinite(configured) && configured >= 60 ? Math.floor(configured) : 7200;
+}
+
+/**
+ * 续期阈值：剩余不足这么多秒才续到满。
+ *
+ * 取 TTL 的四分之一（下限 30 秒、上限 1000 秒）：TTL 很短的部署也能被轮询续上，
+ * TTL 很长的部署不会变成「每个请求都写一次 Redis」。
+ */
+export function tokenRenewThresholdSeconds(): number {
+  return Math.max(30, Math.min(1000, Math.floor(tokenTtlSeconds() / 4)));
+}
 
 const SCRYPT_N = 16384;
 const SCRYPT_R = 8;
@@ -72,6 +97,11 @@ export interface TokenPayload {
   permissions: UserPermissions;
   issuedAt: number;
   loginIp: string;
+  /**
+   * 令牌类型。缺省 = 会话令牌（旧格式的 payload 里没有这个字段，按会话处理）。
+   * `watch` 是只读监控令牌：只能访问 /api/watch/*，且不占「单账号单会话」名额。
+   */
+  kind?: 'session' | 'watch';
 }
 
 function hashToken(token: string): string {
@@ -174,6 +204,7 @@ async function issueToken(user: UserRecord, loginIp: string): Promise<string> {
     permissions: user.permissions,
     issuedAt: Date.now(),
     loginIp,
+    kind: 'session',
   };
   const client = await getRedis();
   // KEYS[1] 是账号索引（userId -> 令牌哈希），KEYS[2] 是本次令牌的 payload key：
@@ -181,17 +212,33 @@ async function issueToken(user: UserRecord, loginIp: string): Promise<string> {
   // ARGV[1] 是 token key 前缀，Lua 里用来拼旧 key。
   await client.eval(ISSUE_SCRIPT, {
     keys: [userTokenKey(user.id), tokenKey(tokenHash)],
-    arguments: [redisKey('token:'), tokenHash, JSON.stringify(payload), String(TOKEN_TTL_SECONDS)],
+    arguments: [redisKey('token:'), tokenHash, JSON.stringify(payload), String(tokenTtlSeconds())],
   });
   return token;
+}
+
+/** 调用方需要显式声明「这个路径允许只读令牌」，默认不允许 —— 漏配的后果是 401，而不是放行 */
+export interface AuthenticateOptions {
+  /**
+   * 允许 `aow_` 开头的只读监控令牌。
+   * 只有 `/api/watch/*` 这类纯读路径应该传 true；WebSocket 永远不要传：
+   * 大屏令牌能开终端，等于把「只读」两个字作废。
+   */
+  allowWatch?: boolean;
 }
 
 /**
  * 校验令牌并滑动续期。
  * 返回 null 表示令牌无效；调用方据此回 401。
  */
-export async function authenticate(token: string): Promise<TokenPayload | null> {
+export async function authenticate(token: string, options: AuthenticateOptions = {}): Promise<TokenPayload | null> {
   if (!token) return null;
+  // 前缀分流，不靠「Redis 没找到就去查库」：只读令牌走库，会话令牌走 Redis，
+  // 两条路径互不干扰，也不会因为一个前缀猜错而多一次全表查询。
+  if (token.startsWith(WATCH_TOKEN_PREFIX)) {
+    if (!options.allowWatch) return null;
+    return authenticateWatchToken(token);
+  }
   const tokenHash = hashToken(token);
   const key = tokenKey(tokenHash);
   const client = await getRedis();
@@ -210,7 +257,7 @@ export async function authenticate(token: string): Promise<TokenPayload | null> 
   // 续期都失败的 Redis 不该被当成「鉴权通过」继续放行。
   await client.eval(RENEW_SCRIPT, {
     keys: [key, userTokenKey(payload.userId)],
-    arguments: [String(TOKEN_RENEW_THRESHOLD_SECONDS), String(TOKEN_TTL_SECONDS)],
+    arguments: [String(tokenRenewThresholdSeconds()), String(tokenTtlSeconds())],
   });
 
   return payload;
@@ -250,7 +297,138 @@ export async function kickUser(userId: string): Promise<void> {
 }
 
 /* ------------------------------------------------------------------ */
-/* 注册 / 登录 / 改密                                                      */
+/* 只读监控令牌（watch token）                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 只读令牌前缀。
+ *
+ * 有了它，鉴权一次 startsWith 就能分流，不必拿同一串去 Redis 和 MySQL 各查一遍；
+ * 日志里看到 aow_ 也知道这是大屏令牌，而不是谁的登录会话。
+ */
+export const WATCH_TOKEN_PREFIX = 'aow_';
+
+/** last_used_at 的内存节流：大屏 60 秒一轮询，不该变成 60 秒一次 UPDATE */
+const watchTouchAt = new Map<number, number>();
+const WATCH_TOUCH_INTERVAL_MS = 5 * 60 * 1000;
+
+export interface WatchTokenBrief {
+  id: number;
+  label: string;
+  createdAt: Date;
+  expiresAt: Date;
+  lastUsedAt: Date | null;
+  revokedAt: Date | null;
+  /** 派生状态，省得每个调用方自己比时间 */
+  state: 'active' | 'revoked' | 'expired';
+}
+
+function toWatchBrief(row: WatchTokenRow, now = Date.now()): WatchTokenBrief {
+  const state: WatchTokenBrief['state'] = row.revokedAt
+    ? 'revoked'
+    : row.expiresAt.getTime() <= now
+      ? 'expired'
+      : 'active';
+  return {
+    id: row.id,
+    label: row.label,
+    createdAt: row.createdAt,
+    expiresAt: row.expiresAt,
+    lastUsedAt: row.lastUsedAt,
+    revokedAt: row.revokedAt,
+    state,
+  };
+}
+
+/**
+ * 签发一枚只读令牌。
+ *
+ * 不碰 Redis 的「一账号一枚」索引 —— 那是登录会话的单点约束；
+ * 大屏令牌可以有任意多枚，每枚独立吊销，所以两边完全分开。
+ */
+export async function issueWatchToken(
+  ownerId: string,
+  label: string,
+  now = new Date(),
+): Promise<{ token: string; brief: WatchTokenBrief }> {
+  const configured = Number(loadConfig().auth?.watchTokenTtlSeconds);
+  if (!Number.isFinite(configured) || configured <= 0) {
+    throw new AuthError('watch_token_disabled', '只读监控令牌已被禁用（auth.watchTokenTtlSeconds 为 0）', 403);
+  }
+  const cleanLabel = String(label || '').trim().slice(0, 64) || '大屏';
+  const token = `${WATCH_TOKEN_PREFIX}${crypto.randomBytes(32).toString('base64url')}`;
+  const expiresAt = new Date(now.getTime() + Math.floor(configured) * 1000);
+  const id = await insertWatchToken({
+    ownerId,
+    label: cleanLabel,
+    tokenHash: hashToken(token),
+    createdAt: now,
+    expiresAt,
+  });
+  // 签发是唯一会让这张表变长的动作，也就顺理成章是清理的节流点：
+  // 只删「过期已超 7 天」的行，最近吊销的记录留在界面上供人核对。
+  pruneWatchTokens(now).catch(() => { /* 清理失败不影响签发 */ });
+  return {
+    token,
+    brief: toWatchBrief({ id, ownerId, label: cleanLabel, createdAt: now, expiresAt, revokedAt: null, lastUsedAt: null }, now.getTime()),
+  };
+}
+
+export async function listWatchTokenBriefs(ownerId: string): Promise<WatchTokenBrief[]> {
+  const rows = await listWatchTokens(ownerId);
+  return rows.map((row) => toWatchBrief(row));
+}
+
+export async function revokeWatchToken(ownerId: string, id: number): Promise<boolean> {
+  return revokeWatchTokenRow(ownerId, id, new Date());
+}
+
+/**
+ * 只读令牌的鉴权。
+ *
+ * 与登录会话三个不同：不写 Redis（没有需要按 TTL 对账的 payload）、**不续期**
+ * （到期时间是签发时定死的绝对时刻，续期就等于永不失效）、每次去库里对一行 ——
+ * 因为「能不能用」的真相在那一行上，吊销必须立刻生效，不能等某个缓存过期。
+ */
+export async function authenticateWatchToken(token: string): Promise<TokenPayload | null> {
+  if (!token.startsWith(WATCH_TOKEN_PREFIX)) return null;
+  const row = await findWatchTokenByHash(hashToken(token));
+  if (!row) return null;
+
+  const now = Date.now();
+  if (row.revokedAt || row.expiresAt.getTime() <= now) return null;
+
+  // 账号本身也得是活的：停用/删号之后，墙上那块大屏不该继续读数据
+  const user = await findUserById(row.ownerId);
+  if (!user || user.status !== 'active') return null;
+  // 令牌本身只读，但仍要求账号有 monitor 位 —— 收回权限就等于收回大屏
+  if (!user.permissions?.monitor) return null;
+
+  const last = watchTouchAt.get(row.id) || 0;
+  if (now - last >= WATCH_TOUCH_INTERVAL_MS) {
+    watchTouchAt.set(row.id, now);
+    // 只是审计字段，写失败不该影响鉴权
+    touchWatchToken(row.id, new Date(now)).catch(() => { /* ignore */ });
+  }
+
+  const permissions = emptyPermissions();
+  permissions.monitor = true;
+
+  return {
+    userId: user.id,
+    username: user.username,
+    displayName: user.displayName,
+    role: user.role,
+    status: user.status,
+    permissions,
+    issuedAt: row.createdAt.getTime(),
+    loginIp: '',
+    kind: 'watch',
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* 注册 / 登录 / 改密                                                     */
 /* ------------------------------------------------------------------ */
 
 const USERNAME_RE = /^[A-Za-z0-9_.-]{3,32}$/;
@@ -335,7 +513,7 @@ export async function login(username: string, password: string, loginIp: string)
 
   return {
     accessToken,
-    expiresIn: TOKEN_TTL_SECONDS,
+    expiresIn: tokenTtlSeconds(),
     user: toPublicUser({ ...user, lastLoginAt: new Date(), lastLoginIp: loginIp }),
   };
 }

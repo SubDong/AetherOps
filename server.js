@@ -118,7 +118,9 @@ app.use(async (req, res, next) => {
   if (token) {
     try {
       const { authenticate } = require('./dist/server/service/auth.service');
-      req.user = await authenticate(token);
+      // allowWatch：只读监控令牌只在 /api/watch/* 上被认；其他接口当作未登录，
+      // 而不是先信了再在业务层拒一次
+      req.user = await authenticate(token, { allowWatch: pathname.startsWith('/api/watch/') });
     } catch (err) {
       // Redis 故障等：不把异常当「已登录」，但要让它落日志而不是静默 401
       console.error('[Auth] 令牌校验失败: ' + (err && err.message ? err.message : err));
@@ -407,7 +409,7 @@ wss.on('connection', async (ws, req) => {
   async function createSSHSession(sid, data) {
     const serverModule = require('./dist/server/index.js');
     const { sshService } = serverModule;
-    const { connectionId, cols, rows, name, serverShellPassword } = data || {};
+    const { connectionId, cols, rows, name, serverShellPassword, clearScreen } = data || {};
     if (!connectionId) {
       ws.send(JSON.stringify({ type: 'error', data: '缺少 connectionId' }));
       return;
@@ -422,7 +424,7 @@ wss.on('connection', async (ws, req) => {
       safeSend(JSON.stringify({ type: 'conn-log', sessionId, data: msg }));
     };
 
-    const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog, ownerId, { serverShellPassword });
+    const session = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog, ownerId, { serverShellPassword, clearScreen });
     console.log(`[WS] SSH session created: ${sessionId}`);
 
     // 根据会话类型绑定输出和关闭事件

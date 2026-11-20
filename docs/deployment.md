@@ -462,6 +462,33 @@ upstream, wrong for the fork" reports:
    `~/.aicmd` → `~/.aetherops`, `__AETHEROPS_SYS__`). If you rename again, keep
    `AETHEROPS_DATA_DIR`/`AETHEROPS_CONFIG` handling and the legacy migration consistent on both sides.
 
+## The on-call wallboard
+
+The screen on the server-room wall does not need — and should not use — a real person's login session:
+sessions are one per account, so the screen signing in again kicks the on-call engineer's browser off,
+and a session only survives while requests renew it, so a machine that sleeps overnight comes back to
+the login page.
+
+Three steps:
+
+1. Create an account that has only `monitor` ticked (say `wallboard`) and no terminal, connection or
+   AI permissions — tokens it issues can read monitoring data and nothing else.
+2. Sign in with it, open Account - Watch tokens, issue one and copy the cleartext onto that machine
+   (it is shown once).
+3. On that machine open `http://<host>:<port>/watch` and paste the token. It then pulls
+   `/api/watch/overview` every 30 seconds, slowing to 2 minutes when the tab is in the background.
+
+Deployment notes:
+
+- The token **never renews** and expires 30 days after issue (`auth.watchTokenTtlSeconds`). Issue a new
+  one before then and the old one simply lapses; the Watch tokens page shows the last-used time of each
+  token, which is how you tell whether a screen is still in use.
+- The wallboard is read-only: it cannot acknowledge alerts, mute rules or stop monitors.
+- A reverse proxy only needs to forward `/watch` and `/api/watch/*`; `/watch` is a front-end route of
+  the same SPA, so no extra static site is required.
+- Unattended sampling (`metrics.offlineSampling`), alerts and incident grouping all run in server-side
+  timers regardless of whether the screen is open — closing it loses no data, it only stops the looking.
+
 ## Operational security
 
 Read this section even if you skip the rest.

@@ -75,6 +75,20 @@ export interface AuthConfig {
   launchToken: string;
   /** 单次上传体积上限（MB） */
   maxUploadMb: number;
+  /**
+   * 登录令牌有效期（秒），滑动续期。默认 7200（2 小时）。
+   *
+   * 需要“开着页面就不想再登录”的大屏/值班机，把监控令牌（watch token）比调这个更合适：
+   * 调大它等于把所有端（包括手机、公用电脑）的会话一起延长。
+   */
+  tokenTtlSeconds: number;
+  /**
+   * 只读监控令牌的有效期（秒）。默认 2592000（30 天）。
+   *
+   * 它与登录会话不完全是一回事：只读、只认 /api/watch/*、不占「单账号单会话」的名额，
+   * 吊销在界面里一键完成。零表示禁用签发。
+   */
+  watchTokenTtlSeconds: number;
 }
 
 export interface DebugConfig {
@@ -164,6 +178,10 @@ const DEFAULTS: AppConfig = {
   auth: {
     launchToken: '',
     maxUploadMb: 100,
+    // 2 小时；续期阈值由它派生（ttl/4，上限 1000 秒），见 auth.service
+    tokenTtlSeconds: 7200,
+    // 30 天；只读大屏的默认寿命，与登录会话互不影响
+    watchTokenTtlSeconds: 2592000,
   },
   debug: {
     sshDebug: false,
@@ -284,6 +302,8 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
     ['server.host', str(env.HOST ?? env.AETHEROPS_HOST)],
     ['auth.launchToken', str(env.AETHEROPS_LAUNCH_TOKEN)],
     ['auth.maxUploadMb', num(env.AETHEROPS_MAX_UPLOAD_MB)],
+    ['auth.tokenTtlSeconds', num(env.AETHEROPS_AUTH_TOKEN_TTL_SECONDS)],
+    ['auth.watchTokenTtlSeconds', num(env.AETHEROPS_AUTH_WATCH_TOKEN_TTL_SECONDS)],
     ['debug.sshDebug', bool(env.AETHEROPS_SSH_DEBUG)],
     ['metrics.offlineSampling', bool(env.AETHEROPS_METRICS_OFFLINE_SAMPLING)],
     ['alerts.webhookUrl', str(env.AETHEROPS_ALERTS_WEBHOOK_URL)],
@@ -386,6 +406,13 @@ export function validateConfig(config: AppConfig): string[] {
   }
   if (!Number.isFinite(config.auth.maxUploadMb) || config.auth.maxUploadMb <= 0) {
     problems.push(`auth.maxUploadMb 应大于 0: ${config.auth.maxUploadMb}`);
+  }
+  // 60 秒是下限：再短就不可能被“滑动续期”救回来（阈值取 ttl/4，一次轮询间隔内就过期）
+  if (!Number.isInteger(config.auth.tokenTtlSeconds) || config.auth.tokenTtlSeconds < 60) {
+    problems.push(`auth.tokenTtlSeconds 应为不小于 60 的整数: ${config.auth.tokenTtlSeconds}`);
+  }
+  if (!Number.isInteger(config.auth.watchTokenTtlSeconds) || config.auth.watchTokenTtlSeconds < 0) {
+    problems.push(`auth.watchTokenTtlSeconds 应为不小于 0 的整数（0 = 禁止签发）: ${config.auth.watchTokenTtlSeconds}`);
   }
 
   const alerts = config.alerts;

@@ -11,7 +11,10 @@ import {
   register,
   resetUserPassword,
   revokeToken,
-  TOKEN_TTL_SECONDS,
+  issueWatchToken,
+  listWatchTokenBriefs,
+  revokeWatchToken,
+  tokenTtlSeconds,
   updateUserByAdmin,
   type AdminUpdateInput,
 } from '../service/auth.service';
@@ -77,6 +80,13 @@ function requireAdmin(ctx: AccountRouteContext): TokenPayload {
   return user;
 }
 
+/** 大屏令牌只服务监控数据，所以签发/查看/吊销都要求 monitor 位 */
+function requireMonitor(ctx: AccountRouteContext): TokenPayload {
+  const user = requireUser(ctx);
+  if (!user.permissions?.monitor) throw new AuthError('forbidden', '当前账号缺少权限：monitor', 403);
+  return user;
+}
+
 /** OAuth2 令牌端点响应必须禁止缓存，否则中间层可能把令牌缓存下来重放 */
 const NO_STORE_HEADERS = { 'Cache-Control': 'no-store', Pragma: 'no-cache' };
 
@@ -94,6 +104,11 @@ export async function handleAccountRoutes(
 ): Promise<AccountRouteResult | null> {
   const input = body || {};
   try {
+    // 只读监控令牌不是登录会话：改密、签发令牌、用户管理一律不认它。
+    // 大屏需要的那点账号信息随 /api/watch/overview 一起回，不必绕进 /api/auth/*。
+    if (ctx.user?.kind === 'watch' && !PUBLIC_ACCOUNT_PATHS.has(pathname)) {
+      throw new AuthError('forbidden', '只读监控令牌不能访问账号接口', 403);
+    }
     switch (pathname) {
       /* ---------------- OAuth2 ---------------- */
 
@@ -134,7 +149,7 @@ export async function handleAccountRoutes(
 
       case '/api/auth/register': {
         const user = await register(String(input.username || ''), readSecret(input, 'password'), input.displayName);
-        return ok({ user, expiresIn: TOKEN_TTL_SECONDS });
+        return ok({ user, expiresIn: tokenTtlSeconds() });
       }
 
       case '/api/auth/logout': {
@@ -156,6 +171,29 @@ export async function handleAccountRoutes(
         const user = requireUser(ctx);
         await changeOwnPassword(user.userId, readSecret(input, 'oldPassword'), readSecret(input, 'newPassword'));
         return ok(true);
+      }
+
+      /* ---------------- 只读监控令牌（大屏/值班机） ---------------- */
+
+      // 清单：只给自己的，方便「这块屏是哪一枚」与「上次用是什么时候」
+      case '/api/auth/listWatchTokens': {
+        const user = requireMonitor(ctx);
+        return ok(await listWatchTokenBriefs(user.userId));
+      }
+
+      // 签发：明文只在这一次响应里，之后库里只有哈希
+      case '/api/auth/createWatchToken': {
+        const user = requireMonitor(ctx);
+        const issued = await issueWatchToken(user.userId, String(input.label || ''));
+        return { status: 200, headers: NO_STORE_HEADERS, body: { ret: 0, msg: 'success', data: issued } };
+      }
+
+      // 吊销：立即生效（鉴权每次都对库，没有缓存要等）
+      case '/api/auth/revokeWatchToken': {
+        const user = requireMonitor(ctx);
+        const id = Number(input.id);
+        if (!Number.isInteger(id) || id <= 0) throw new AuthError('invalid_request', '缺少参数: id');
+        return ok(await revokeWatchToken(user.userId, id));
       }
 
       /* ---------------- 账号管理（仅管理员） ---------------- */

@@ -224,7 +224,8 @@ const config = defineConfig({
                     let user: AuthContext | null = null;
                     if (token) {
                         try {
-                            user = await authenticate(token) as unknown as AuthContext;
+                            // allowWatch：只读监控令牌只在 /api/watch/* 上被认，与 server.js 同一套语义
+                            user = await authenticate(token, { allowWatch: pathname.startsWith('/api/watch/') }) as unknown as AuthContext;
                         } catch (err: any) {
                             // Redis 故障等：不把异常当「已登录」，但要落日志而不是静默 401
                             console.error('[dev][Auth] 令牌校验失败: ' + (err && err.message ? err.message : err));
@@ -393,7 +394,7 @@ const config = defineConfig({
 
                             switch (type) {
                                 case 'create': {
-                                    const { connectionId, cols, rows, name, serverShellPassword } = data || {};
+                                    const { connectionId, cols, rows, name, serverShellPassword, clearScreen } = data || {};
                                     if (!connectionId) {
                                         safeSend(JSON.stringify({ type: 'error', data: 'Missing connectionId' }));
                                         return;
@@ -405,7 +406,7 @@ const config = defineConfig({
                                             safeSend(JSON.stringify({ type: 'conn-log', sessionId, data: msg }));
                                         };
 
-                                        const sshSession = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog, ownerId, { serverShellPassword });
+                                        const sshSession = await sshService.createSession(sessionId, connectionId, cols || 80, rows || 24, name, sendLog, ownerId, { serverShellPassword, clearScreen });
 
                                         // 根据会话类型设置数据接收
                                         const sendOutput = (chunk: any) => {

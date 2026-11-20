@@ -114,8 +114,9 @@ Passwords on all of these endpoints are **ciphertext**, see [Transport encryptio
 
 - Tokens are `ao_` + 32 random bytes (base64url). Redis stores only a **hash** of the token as the
   key, with the payload (userId, role, status, permission snapshot) as the value.
-- TTL is 7200 s, **sliding**: each authenticated request extends it when less than 1000 s remain,
-  done in one Lua script together with the account index so the renewal cannot race.
+- TTL defaults to 7200 s (`auth.tokenTtlSeconds`), **sliding**: each authenticated request extends it
+  when less than a quarter of the TTL remains (capped at 1000 s, floored at 30 s), done in one Lua
+  script together with the account index so the renewal cannot race.
 - **One active session per account**: issuing a token deletes the previous one atomically. A second
   login from another machine kicks the first; the front-end distinguishes this (`session_replaced`)
   from a plain expiry.
@@ -131,6 +132,47 @@ Passwords on all of these endpoints are **ciphertext**, see [Transport encryptio
   than dropped, and every `sessionId` in a message is owner-checked — except `create`.
 - Deleting an account (admin action) revokes its token, **purges owner-scoped rows** and removes the
   user record. There is no soft delete or recycle bin for accounts, so it is irreversible.
+
+## Read-only watch tokens
+
+A wallboard is a poor fit for a login session: an account has exactly one session, so the screen
+signing in again kicks the on-call engineer's browser off; and a login token survives only while
+requests keep renewing it, so a machine that sleeps overnight comes back to the login page.
+
+Hence the second kind of token — a read-only one stored in MySQL rather than Redis, prefixed `aow_`:
+
+```
+POST /api/auth/listWatchTokens    -> tokens this account issued (revoked / expired included; no hashes)
+POST /api/auth/createWatchToken   -> the cleartext appears in this response only
+POST /api/auth/revokeWatchToken   -> takes effect immediately (auth reads that row every time)
+POST /api/watch/overview          -> the only read endpoint: alert counts and list, open incidents, host metrics, connection inventory
+```
+
+- **Only `/api/watch/*`.** The `handleRoutes` entry rejects `kind=watch` for every other prefix with
+  403, and the account endpoints (password change, issuing tokens, user management) refuse it too.
+  That check cannot live in the permission table: the read-only token's permission bit *is* `monitor`,
+  and `/api/monitor/*` and `/api/alerts/*` require `monitor` as well — one missing check and the wall
+  could stop monitors or acknowledge alerts.
+- Issuing, listing and revoking all require the `monitor` bit; every authentication re-reads the
+  account row, so disabling the account or revoking the permission turns the wall dark at once.
+- **No renewal**: the expiry is an absolute instant fixed at issue time, 30 days by default
+  (`auth.watchTokenTtlSeconds`; `0` disables issuing). A screen that lives forever is the wrong goal —
+  rotate it instead.
+- **Does not consume the single session slot**: one login session plus any number of wallboard tokens
+  coexist without kicking each other.
+- Only a SHA-256 hash is stored; the cleartext is shown once, in the issue response, and the list
+  endpoint never returns it.
+
+### Which account should own the wallboard
+
+**Create a dedicated account for the screen, with only `monitor` ticked.** Tokens it issues cannot see
+another account's connections, audit trail or chats, and an administrator can disable that single
+account to turn every screen dark without asking anyone to change a password. Issuing from a real
+person's account works, but it puts that person's monitoring data on a wall indefinitely — and when
+they are disabled, the screen goes dark with them.
+
+For a colleague who just wants a look, have them sign in with their own account and open the alerts
+panel; do not mint a long-lived credential for that.
 
 ## Data isolation
 
@@ -223,3 +265,6 @@ If you modify authorization behavior:
    renewal and delete-account invalidation. Run it after touching any of these areas.
 5. Do not add a way to disable authentication. The old `auth.disabled` / `auth.accessToken` knobs are
    intentionally dropped and warned about; local development uses real accounts too.
+6. Read-only watch tokens have two gates: `kind === 'watch'` in `handleRoutes` admits only
+   `/api/watch/*`, and `handleAccountRoutes` applies the same rule to account endpoints. When you add
+   a read endpoint, decide explicitly whether it should be open to them — the default is no.

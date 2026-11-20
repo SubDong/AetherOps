@@ -16,6 +16,39 @@ or the commit, for a build that predates one — that you run.
 
 ### Added
 
+- **A read-only watch token, so an always-on screen no longer has to hold a login session.**
+  Migration `0012` adds `auth_watch_tokens` — one row per issued token, scoped by `owner_id`, storing
+  the SHA-256 of the token rather than the token itself, with an absolute `expires_at`, a `revoked_at`
+  and a `last_used_at`. `/api/auth/createWatchToken` returns the plaintext exactly once,
+  `listWatchTokens` reports label / state / created / expires / last used, `revokeWatchToken` kills one
+  row. A token carries the `aow_` prefix, arrives as `kind: 'watch'` on the auth context, holds only
+  the `monitor` bit, and `/api/watch/overview` answers in one round trip with the alert counts and
+  latest rows, the open incidents, per-host metric summaries and a whitelisted connection list. The
+  *Account → Watch tokens* page issues with an optional label and offers copy / *Open wallboard*;
+  `/watch` is a public route rendering a dark wallboard — five counters, one card per connection
+  (CPU / memory / disk, marked stale after 10 minutes without a sample), the alert table and the
+  incident table — that refreshes every 30 s, every 120 s while the tab is hidden, and stops instead
+  of retrying once the token is refused. **Boundary:** the prefix gate lives in `handleRoutes`
+  (`kind === 'watch'` admits only `/api/watch/*`) and not in the permission table, because the token's
+  permission bit *is* `monitor` and `/api/monitor/*` / `/api/alerts/*` ask for the same one; account
+  routes refuse a watch token outright, so it cannot change a password, issue another token or manage
+  accounts; no terminal, no file transfer, no batch — the WebSocket handshake never accepts the
+  prefix, and the three hosts (`server.js`, the Vite dev middleware, Electron IPC) pass `allowWatch`
+  only for paths under `/api/watch/`; the token **never renews** — `expires_at` is fixed at issue time,
+  so an expired token means issuing a new one and there is no "valid forever" option; it is not a
+  session and never occupies the single-session slot, so the wallboard and an operator's browser can
+  be logged in as the same account at the same time; every authenticated request reads the row — that
+  is what makes revocation immediate — at the cost of one indexed `SELECT` per poll; a `disabled`
+  account or a withdrawn `monitor` bit kills the token without touching the row; `last_used_at` is
+  written at most once per 5 minutes; deleting an account clears its token rows with the rest of its
+  data, and issuing prunes rows that expired more than 7 days ago; `auth.watchTokenTtlSeconds = 0`
+  disables issuing. Asserted in `scripts/verify-auth.mjs` — issue, read `/api/watch/overview`, any
+  non-watch API 401, the operator's own session still alive, revoke, 401. The deployment
+  answer for "a screen that outlives a session" — give the screen its own account — is in
+  [docs/deployment.md](docs/deployment.md#the-on-call-wallboard) /
+  [docs/deployment.zh.md](docs/deployment.zh.md#值班大屏); the token model and the two gates are in
+  [docs/accounts-and-permissions.md](docs/accounts-and-permissions.md#read-only-watch-tokens) /
+  [docs/accounts-and-permissions.zh.md](docs/accounts-and-permissions.zh.md#只读监控令牌).
 - **Alerts can be handed to a person: claim, assignment, an on-call roster, and rule-based
   incidents.** Migration `0011` adds `alerts.assignee_id` / `alerts.incident_id` (with the two
   indexes the list actually filters on), a new `incidents` table and `alert_oncall`. *Claim* is one
@@ -282,6 +315,31 @@ or the commit, for a build that predates one — that you run.
 
 ### Changed
 
+- **The login session lifetime is a configuration value, not a constant.** `auth.tokenTtlSeconds`
+  (default `7200`) drives the issued token's TTL and the renewal threshold —
+  `max(30, min(1000, ttl / 4))` — and `AETHEROPS_AUTH_TOKEN_TTL_SECONDS` overrides it at the
+  environment layer; startup validation rejects anything below 60 s, because with a threshold of 15 s
+  no poll interval can renew a token before it lapses. The default is unchanged, so an existing
+  deployment issues exactly the tokens it issued before. **Boundary:** raising the TTL lengthens one
+  browser's session, not a screen's — a session is still single-issue per account, so the wallboard
+  stays the job of a read-only token (previous entry); the renewal threshold stops growing at 1000 s,
+  so a long TTL is refreshed when 1000 s remain rather than at a quarter of its length; the lifetime
+  and the threshold are both derived from that one key at issue and renewal time, so there is no
+  second constant to keep in step (the config layer still caches the file after the first load, so a
+  changed value takes effect on the next process start or config reload). Documented in
+  [docs/configuration.md](docs/configuration.md#auth) /
+  [docs/configuration.zh.md](docs/configuration.zh.md#auth).
+- **A tab left in the background polls the server-status panel every 60 s instead of every 2 s.** The
+  panel keeps its 2 s cadence while visible; when `document.hidden` is set the timer switches to 60 s
+  and a return to the foreground refreshes immediately, so a tab parked behind the wallboard stops
+  being a 2-second request stream. It still polls — that is the point: each poll is an authenticated
+  request, so a background tab keeps its session renewing instead of dropping the user on a login
+  screen the moment they come back. The wallboard page applies the same rule with its own numbers
+  (30 s visible, 120 s hidden), and its token does not renew at all, so there the slower cadence only
+  saves load. **Boundary:** 60 s is well inside the renewal threshold of any sane TTL (1000 s at the
+  default, 30 s at the 60 s minimum), so a hidden tab renews as before; with `auth.tokenTtlSeconds`
+  at its floor a hidden tab can still miss a renewal and be logged out — that configuration is asking
+  for short sessions. Documented in [docs/configuration.md](docs/configuration.md#auth).
 - **`.dockerignore` tightened** to also exclude `packages`, `docs`, `.github`, `*.vsix`, `dist.rootbak`
   and `temp/`. The `Dockerfile` uses `COPY . .`, so anything left out of this file is shipped into
   the build context: the first time it is just slow, the second time it is wrong, because stale local
@@ -335,6 +393,83 @@ or the commit, for a build that predates one — that you run.
 
 ### Fixed
 
+- **A host with an open terminal stopped being sampled, and its wallboard card stayed grey, because another
+  instance kept deleting its `sessions` row.** `cleanupZombieSessions()` ran every 30 s over *every* row of
+  `sessions` and deleted the ones with no handle in this process — correct only while the table belongs to one
+  instance. Two AetherOps sharing one MySQL (here a second server on another machine, visible as a different
+  client IP) delete each other's live rows: each one's "zombie" is the other's open terminal. The next
+  `loadSessionsFromDb()` cleared `sessionMetadata` and refilled it from a now-empty table, and everything
+  downstream reads that map — `HostMetricsService.collectOnce()` walks `ssh.getSessions()`, so with no metadata
+  there was nothing to collect, and with `metrics.offlineSampling` off `collectOffline()` returns on its first
+  line: the round ended without a success line *or* a failure line, and the card read `-` for as long as the
+  terminal stayed open. `loadSessionsFromDb()` now **merges** instead of overwriting — a row that vanished while
+  this process still holds the handle is restored from memory — and the periodic sweep only touches ids this
+  process created (`createdSessionIds`), so one instance can no longer delete another's rows. Two diagnostics
+  came with it: `AETHEROPS_TRACE_SESSION_DELETE=1` prints the stack of every `deleteSessionMeta` call, and
+  "metadata empty but N live handles" logs once per 5 minutes. **Boundary:** the table is still shared and
+  last-writer-wins for name / system context; a row deleted while this process holds no handle for it is still
+  lost, and a restart rebuilds purely from the table, as before; an instance older than this build keeps
+  deleting — the merge makes this process tolerate that, it does not stop the other one, which has to be
+  upgraded or stopped; rows left behind by a crashed run are no longer swept by the periodic timer (this process
+  never created them), so they wait for the tab that restores them or for an explicit delete. Verified against
+  the live deployment: with a probe holding one session open and the deletion still arriving every 30 s from
+  the other host, `sessions` fell to 0 rows while minute buckets kept being written — `cpu` null on the first
+  round (no previous sample to diff against), then 10.46, 22.65, 18.01 on the next three, where before the fix
+  the same probe wrote one bucket and stopped. The `AFTER DELETE` trigger used to attribute the deletion (by
+  `CONNECTION_ID()` and client IP) and its audit table were dropped afterwards.
+- **Every host card on the wallboard was grey with `-` for CPU, memory and disk, even where history existed.**
+  Two layers were wrong at once, and only the first one is a bug. `HostMetricsService.listHosts()` returned
+  `latest: null` unconditionally — a placeholder that looked like "no data yet" but meant the board could
+  never show a reading — and the repository behind it selected only `MAX(bucket)` and `SUM(samples)`, so the
+  page had nothing to read even when the last minute bucket held values. `listMetricHosts` now groups per
+  connection and joins `host_metrics_minute` back on that last bucket to return its whole row, mapped through
+  the same `toMinuteMetricRow` as the time-series query (one mapping, so `DECIMAL` strings become numbers in
+  one place), and `listHosts()` runs it through `toPoints`, so the board and `query_metrics` cannot drift.
+  The second layer is not a bug and is now stated instead of implied: with `metrics.offlineSampling` off (the
+  default) a host is sampled only while a terminal is open to it, so a card with no sample is the normal state
+  of a mostly idle estate. `/api/watch/overview` therefore carries `sampling: { offlineSampling }`, and the host
+  panel adds up to three one-line notes below the cards — only hosts with a session are sampled (turn the switch
+  on to cover the rest), N connections are set to `sampling: 'skip'`, and CPU stays blank for one round because
+  it is derived from two consecutive samples. **Boundary:** the four cards of a host with no sample still read
+  `-` and stay dimmed after 10 minutes; the fix makes an existing sample visible, it does not create one — a
+  host that has never been sampled needs a terminal or the opt-in switch; the connection list still decides
+  which cards exist, so a host with samples but no saved connection shows in `hosts` and not on the board;
+  `sampling` is optional in the client type, so a board left open against an older server shows the cards
+  without the notes. Asserted end to end on a scratch port: a synthetic minute bucket for a throwaway account
+  comes back through `/api/watch/overview` with `cpuAvg` / `memAvg` / `diskAvg`, `lastAt` equal to the bucket,
+  and a non-stale card (10/10 checks); the scratch rows, connection, token and account were removed afterwards.
+- **A refresh threw away every terminal tab together with its scrollback; the workspace now lives in
+  `sessionStorage`.** The tab bar was rebuilt from the server's `sessions` table, which preserved the
+  wrong thing: closing the browser and opening it again brought the tabs back — empty, because the
+  table only ever held metadata — while an ordinary F5 could leave nothing to rebuild from at all
+  (a reconnect that failed, a server restart, an already-pruned table), and what the terminal had
+  printed was gone in every case. The workspace now belongs to the browser tab: `aetherops.workspace.v1`
+  holds the tab list and the active tab, `aetherops.termbuf.v1.<tabId>` holds the last ~120 000
+  characters that terminal received — flushed on a 1.5 s timer and once more on `pagehide`, replayed
+  into a fresh xterm before the new session connects, with a divider line marking where the replay
+  ends. `sessionStorage` is dropped when the tab or the browser closes, which is the requested
+  lifetime; signing out clears it as well, so the next account does not inherit the previous one's
+  terminals. Restored tabs also ask the server not to run its startup `cls` (`clearScreen: false`,
+  honoured by `createLocalSession`) — that clear landed right after the replay and erased it. That alone
+  was not enough: on Windows `pwsh` clears the screen by itself as it starts, so the history disappeared
+  again the moment the new session began. A restored tab therefore holds the new session's startup output
+  until the banner has finished (first `ESC[2J`/`ESC[3J` plus a 400 ms grace, so the server's `chcp` /
+  `cls` tail is caught too, and a 1.5 s ceiling), strips the erase-display
+  and cursor-home sequences out of the held frames (`src/utils/terminal-restore.ts`), and only then writes
+  history → divider → startup output, so the screen ends up as "everything from before, and the new shell
+  continuing below it" rather than a cleared viewport.
+  **Boundary:** the shell process still ends when the WebSocket closes — the text above the divider is
+  a replay, not a reattached PTY, so a command that was still running is gone; a local server shell
+  asks for its password again after a refresh, because that secret is deliberately never written to
+  disk; frames the server marks as binary are replayed only when they decode as text (Chinese output
+  travels that way), and ZMODEM frames are skipped, since replaying a transfer into xterm only paints
+  garbage; `sessionStorage` quotas are handled by dropping buffers, never the tab list.
+  Verified by `vue-tsc`, `vite build`, a Node harness over the real snapshot module (15 checks: round
+  trip, malformed JSON, 12-tab cap, tail trimmed from a whole line, quota fallback, cleanup) and a
+  WebSocket-level run against a real `pwsh` on a scratch port (8 checks: `clearScreen: false` drops the
+  `cls` echo, the banner does carry its own `ESC[2J`, the filter removes exactly that and keeps the
+  text). Not exercised end to end in a browser — no automation was available in this environment, so
+  the F5 round trip itself is untested by machine.
 - **The AI chat's stop button did not stop anything the UI could see.** Clicking it aborted the run on
   the server, but the abort path returned without emitting a terminal event — and the "already produced
   output → give up" check ran first, while an abort mid-stream always has produced output — so the
