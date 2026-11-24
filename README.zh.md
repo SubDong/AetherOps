@@ -232,13 +232,21 @@ pnpm build
 
 # 4. 指定 MySQL 与 Redis
 #    首次运行会在 ~/.aetherops/config.json 落一份模板（权限 0600），
-#    改 database + redis 两段，或者用环境变量覆盖：
+#    改 database + redis 两段，或者用环境变量覆盖。
+#    端口不是默认值时必须一起给，否则会去连 3306 / 6379：
 export AETHEROPS_DB_HOST=127.0.0.1
+export AETHEROPS_DB_PORT=3306
 export AETHEROPS_DB_USER=aetherops
 export AETHEROPS_DB_PASSWORD='...'
 export AETHEROPS_DB_NAME=aetherops
 export AETHEROPS_REDIS_HOST=127.0.0.1
+export AETHEROPS_REDIS_PORT=6379
 export AETHEROPS_REDIS_PASSWORD='...'
+
+#    接管一台已经在用的实例（换机器、搬进容器、连别人搭过的库）时：先把那台机器
+#    数据目录里的 connections.key 与 ai-config.key 拷到本机 ~/.aetherops/ 再启动。
+#    这两把密钥只从文件读，没有环境变量能代替；缺了它们，库里已存的 SSH 口令 /
+#    私钥与 AI Key 会静默解密失败，界面上表现为空值。
 
 # 5.（可选）让采集器也去采没有开着终端的主机
 #    metrics.offlineSampling 默认是关的：每次采样都是一次真实 SSH 登录，目标机的

@@ -181,12 +181,21 @@ Image facts worth knowing:
 - `VOLUME /root/.aetherops` is declared, so forgetting `-v` puts data in a named anonymous volume
   instead of the container's writable layer — safer than losing it, still awkward to back up. Bind an
   explicit volume or path in production. If you set `AETHEROPS_DATA_DIR`, mount *that* path instead.
+- When reusing an existing database, the volume must already contain `connections.key` and
+  `ai-config.key`. They are read from the data directory only — no environment variable exists for
+  them. Without them, stored SSH passwords/private keys and AI keys fail to decrypt silently and show
+  up as empty fields (the only trace is a `Failed to decrypt secret` log line). Deploying against an
+  empty database is the opposite case: do not pre-seed them, let the server generate a pair.
 - `data/skills` is copied to `/app/data/skills` because built-in skills are read from
   `process.cwd()/data/skills` — not from the data directory. Omitting that step yields an image whose
   skill list is empty.
 - `TZ=Asia/Shanghai` is only the container's clock label; timestamps in the database are written UTC.
 - Build-time mirrors (aliyun Debian, npmmirror for pnpm and Electron) are configured in the Dockerfile.
-  If you build in another region, adjust those lines; they change nothing at runtime.
+  If you build in another region, adjust those lines; they change nothing at runtime. You can also swap the
+  mirror for one build with `--build-arg DEBIAN_MIRROR=...`. If the container cannot reach the apt mirrors
+  reliably at all (observed: aborted `Packages` downloads, `.deb` requests returning 403), build with
+  `--build-arg BUILD_IMAGE=node:22` — the full image already ships python3/make/g++, so the apt layer is
+  skipped entirely.
 
 ### Docker Compose with MySQL and Redis
 

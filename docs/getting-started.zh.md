@@ -124,6 +124,9 @@ node server.js
    - 密钥：粘贴私钥，可选带 passphrase。私钥以 `enc:v1:` 前缀的 AES-256-GCM 密文存进 MySQL，
      解密用的密钥留在 `~/.aetherops/connections.key`。
    - `connections.key` **不会**备份进数据库 —— 数据目录丢了，等于存好的凭据全丢。请务必备份该目录。
+   - 反过来也一样：换机器、搬进容器、或者连到一台别人已经用过的库时，先把原数据目录里的
+     `connections.key` 与 `ai-config.key` 拷过去再启动。它们只从文件读取，没有环境变量能代替；
+     缺了它们，旧凭据会静默解密成空值（用 `ai-config.key` 的 AI Key 同理）。
 3. 保存前先用内置的测试按钮验一次连通性。
 4. 走跳板机的话，加一段**启动脚本**（`ssh user@target.internal`）并勾上 **SSH Agent 转发**：
    见 [jump-host.zh.md](./jump-host.zh.md)。

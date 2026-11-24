@@ -132,6 +132,10 @@ What the account model looks like underneath is covered in
      AES-256-GCM ciphertext in MySQL; the decryption key stays in `~/.aetherops/connections.key`.
    - The file `connections.key` is not backed up into the database — losing the data directory means
      losing stored credentials. Back the directory up.
+   - The reverse is just as true: when moving machines, moving into a container, or pointing at a
+     database someone else already used, copy `connections.key` and `ai-config.key` over **before**
+     starting. They are read from files only — no environment variable exists for them — and without
+     them old credentials decrypt silently to empty (same for AI keys via `ai-config.key`).
 3. Test the connection with the built-in test button before saving.
 4. For a bastion, add a **startup script** (`ssh user@target.internal`) and tick **SSH agent
    forwarding**: [jump-host.md](./jump-host.md).

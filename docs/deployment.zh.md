@@ -174,11 +174,17 @@ docker run -d \
 - 声明了 `VOLUME /root/.aetherops`，所以忘了写 `-v` 时数据会落在一个匿名的命名卷里，而不是容器的可写层
   —— 比彻底丢掉安全，但备份起来仍然别扭。生产环境请显式绑定一个卷或路径。如果你设置了
   `AETHEROPS_DATA_DIR`，那就挂载*那个*路径。
+- 复用已有数据库时，卷里必须已经带上 `connections.key` 与 `ai-config.key`。它们只从数据目录读取，
+  没有任何环境变量能提供；缺了它们，库里已存的 SSH 口令 / 私钥与 AI Key 会静默解密失败，
+  界面上表现为空值（日志只有一行 `Failed to decrypt secret`）。部署到空库时相反：不要预先放入，
+  让服务自己生成一对。
 - `data/skills` 会被复制到 `/app/data/skills`，因为内置技能是从
   `process.cwd()/data/skills` 读取的 —— 不是从数据目录。漏掉这一步，产出的镜像技能列表就是空的。
 - `TZ=Asia/Shanghai` 只是容器的时钟标签；数据库里的时间戳是按 UTC 写入的。
 - 构建期的镜像源（Debian 用阿里云、pnpm 与 Electron 用 npmmirror）配置在 Dockerfile 里。如果你在别的
-  区域构建，请改那几行；它们在运行期不影响任何东西。
+  区域构建，请改那几行；它们在运行期不影响任何东西。也可以用 `--build-arg DEBIAN_MIRROR=...` 临时换源；
+  如果容器内访问 apt 源本身就不稳定（实测有 Packages 连接中断、`.deb` 返回 403 的情况），改用
+  `--build-arg BUILD_IMAGE=node:22`：完整镜像自带 python3/make/g++，整段 apt 会被跳过。
 
 ### 用 Docker Compose 一起拉起 MySQL 与 Redis
 

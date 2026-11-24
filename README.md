@@ -294,13 +294,23 @@ pnpm build
 
 # 4. Point it at MySQL and Redis.
 #    The first run drops a template at ~/.aetherops/config.json (mode 0600) —
-#    edit database + redis, or override with environment variables:
+#    edit database + redis, or override with environment variables. Give the
+#    ports too whenever they are not the defaults (3306 / 6379):
 export AETHEROPS_DB_HOST=127.0.0.1
+export AETHEROPS_DB_PORT=3306
 export AETHEROPS_DB_USER=aetherops
 export AETHEROPS_DB_PASSWORD='...'
 export AETHEROPS_DB_NAME=aetherops
 export AETHEROPS_REDIS_HOST=127.0.0.1
+export AETHEROPS_REDIS_PORT=6379
 export AETHEROPS_REDIS_PASSWORD='...'
+
+#    Taking over an instance that already holds data (moving machines, moving
+#    into a container, pointing at a database someone else set up): copy that
+#    machine's connections.key and ai-config.key into this data directory
+#    before starting. Both keys are read from files only — no environment
+#    variable exists for them. Without them, stored SSH credentials and AI keys
+#    fail to decrypt silently and show up as empty fields.
 
 # 5. Optional — let the collector sample hosts with no open terminal.
 #    metrics.offlineSampling is off by default: every sample is a real SSH

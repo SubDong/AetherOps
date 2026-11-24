@@ -222,6 +222,13 @@ per-account data stored in MySQL, edited in the UI. There is no `OPENAI_API_KEY`
 **former** storage of upstream AICmd. They are no longer written: that data now lives in MySQL.
 The directory may still contain them if you migrated from a single-user build.
 
+The two `.key` files are read from the data directory only — **no** environment variable or
+`config.json` key can supply them (`AETHEROPS_DATA_DIR` changes the directory, not the filenames).
+When a file is missing the server generates a fresh pair, so pointing it at a database that already
+holds data without those files does not fail: stored passwords and AI keys simply decrypt to empty
+strings, leaving only a `Failed to decrypt secret` log line. Moving machines, moving into a container
+or restoring a backup must move the whole data directory.
+
 ## Database schema and migrations
 
 Migrations are TypeScript modules under `server/db/migrations/`, applied in version order by
