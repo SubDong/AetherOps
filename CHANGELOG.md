@@ -315,6 +315,15 @@ or the commit, for a build that predates one — that you run.
 
 ### Changed
 
+- **The build stage's base image and Debian mirror are build arguments, so a blocked apt mirror no
+  longer strands a build.** `BUILD_IMAGE` (default `node:22-slim`) and `DEBIAN_MIRROR` (default
+  `mirrors.aliyun.com`) now exist as `ARG`s, and the toolchain layer installs python3/make/g++ only
+  when the base image does not already have them — `--build-arg BUILD_IMAGE=node:22` skips the apt
+  step entirely. **Boundary:** this is a build-time escape hatch, not a runtime setting (the server
+  reads neither value); with no arguments the build pulls the same base and mirrors as before, so a
+  rebuild produces the same image; the skip is decided by probing the base image, so a slim image
+  that happens to carry the toolchain also skips the install.
+
 - **The login session lifetime is a configuration value, not a constant.** `auth.tokenTtlSeconds`
   (default `7200`) drives the issued token's TTL and the renewal threshold —
   `max(30, min(1000, ttl / 4))` — and `AETHEROPS_AUTH_TOKEN_TTL_SECONDS` overrides it at the

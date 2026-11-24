@@ -1,15 +1,26 @@
 # ============================================
 # 构建阶段
 # ============================================
-FROM node:22-slim AS build-stage
+# 默认 slim + apt 装编译工具；但交叉构建（如 linux/arm64）时容器内对几个 apt 源的访问
+# 不稳定（阿里云连接中断、清华对 .deb 返 403、官方源 502），所以留一个口子：
+#   --build-arg BUILD_IMAGE=node:22   # 完整镜像自带 python3/make/g++，整段 apt 直接跳过
+ARG BUILD_IMAGE=node:22-slim
+FROM ${BUILD_IMAGE} AS build-stage
 
 WORKDIR /app
 
-# 1. 更换 Debian 软件源为阿里云，解决 403 和网络超时问题
-RUN sed -i 's@deb.debian.org@mirrors.aliyun.com@g' /etc/apt/sources.list.d/debian.sources
-
-# 2. 安装编译工具 (加入 --fix-missing 防止个别包下载失败)
-RUN apt-get update && apt-get install -y --fix-missing python3 make g++ && rm -rf /var/lib/apt/lists/*
+# 1. 编译工具链：基础镜像已带就跳过，否则换国内源安装。
+#    --fix-missing 与 Acquire::Retries 应对镜像的偶发抖动。
+ARG DEBIAN_MIRROR=mirrors.aliyun.com
+RUN set -eux; \
+    if command -v python3 >/dev/null 2>&1 && command -v make >/dev/null 2>&1 && command -v g++ >/dev/null 2>&1; then \
+      echo "[build] 基础镜像已带编译工具链，跳过 apt"; \
+    else \
+      sed -i "s@deb.debian.org@${DEBIAN_MIRROR}@g" /etc/apt/sources.list.d/debian.sources; \
+      apt-get -o Acquire::Retries=3 update; \
+      apt-get install -y --fix-missing python3 make g++; \
+      rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # 3. 设置 Electron 的国内镜像源，解决下载中断问题
 ENV ELECTRON_MIRROR=https://npmmirror.com/mirrors/electron/
