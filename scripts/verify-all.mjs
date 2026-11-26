@@ -29,6 +29,8 @@ const SUITES = [
   { id: 'p1-tools', file: 'verify-p1-tools.mjs', db: false, note: 'P1 第二片：三个工具' },
   { id: 'p2-approval', file: 'verify-p2-approval.mjs', db: false, note: 'P2：审批分级' },
   { id: 'p3-skills', file: 'verify-p3-skills.mjs', db: false, note: 'P3：技能渐进加载' },
+  // lite 存储自建临时 SQLite 库，不碰 MySQL；但仍需先 build-server（require 编译产物）
+  { id: 'storage-lite', file: 'verify-storage-lite.mjs', db: false, note: 'lite 存储：SQLite 建库 + 仓储 + 令牌' },
   { id: 'search-audit', file: 'verify-search-audit.mjs', db: true, note: 'P1 第一片：search_audit' },
   { id: 'p4-fingerprints', file: 'verify-p4-fingerprints.mjs', db: true, note: 'P4：错误指纹' },
   { id: 'p5-alerts', file: 'verify-p5-alerts.mjs', db: true, note: 'P5：告警实体化' },
