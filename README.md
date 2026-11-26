@@ -94,7 +94,7 @@ backend, plus **multi-account access control** so a team can share one deploymen
   (e.g. CPU busy% on some BSDs, swap on HarmonyOS) shows as *unavailable* instead of a flattering
   `0`, and the history chart stops drawing rather than plotting a fake flat line.
 - **The panel is not the archive.** A page refresh does not erase what the agent can see; the same
-  collector also writes a per-minute aggregate to MySQL — see
+  collector also writes a per-minute aggregate to the database — see
   [Host metrics history](#host-metrics-history--query_metrics).
 
 ### Host metrics history & `query_metrics`
@@ -141,10 +141,11 @@ backend, plus **multi-account access control** so a team can share one deploymen
 - Admin console: create/disable accounts, reset passwords, revoke tokens, and — the single
   deliberate exception to account isolation — inspect a member's audit trail, file transfers,
   connection inventory (secrets stripped) and live sessions, and force-disconnect a user.
-- Sessions are OAuth2-style bearer tokens kept in Redis with a sliding TTL, hashed at rest,
-  single active session per account (a new login replaces the old one).
+- Sessions are OAuth2-style bearer tokens with a sliding TTL, hashed at rest, single active session
+  per account (a new login replaces the old one). They live in Redis on the enterprise backend and in
+  the `auth_sessions` table on the lite one.
 - Passwords use `scrypt`; SSH passwords / private keys / passphrases and AI API keys are stored
-  in MySQL as `enc:v1:` AES-256-GCM ciphertext, with the keys in the local data directory —
+  in the database as `enc:v1:` AES-256-GCM ciphertext, with the keys in the local data directory —
   a database dump alone does not leak credentials.
 
 ### AI model management, auto routing & cost governance
@@ -235,7 +236,7 @@ backend, plus **multi-account access control** so a team can share one deploymen
   Exception / Traceback raise categorized alerts; color-coded streaming; one click sends the recent
   window to the agent for analysis.
 - **A hit becomes a row that belongs to someone, not a line that vanishes on reload.** Rule
-  matches raise alerts stored in MySQL (`open` / `acked` / `resolved`, de-duplicated per host +
+  matches raise alerts stored in the database (`open` / `acked` / `resolved`, de-duplicated per host +
   fingerprint, with an occurrence count) and can be pushed to `alerts.webhookUrl` under an HMAC
   signature. In the panel a row can be **claimed** (acknowledge and take ownership in one
   click), **assigned** to another active account, and **merged** into an incident — three
@@ -257,8 +258,9 @@ backend, plus **multi-account access control** so a team can share one deploymen
 - **Electron desktop** for Windows / macOS / Linux, with an update check against GitHub Releases
   (it notifies, it never auto-downloads).
 - **VSCode extension** embedding the same backend and SPA, launching its own localhost server and
-  adopting the editor theme. It starts the ordinary production backend, so it needs the same MySQL +
-  Redis configuration in `~/.aetherops/config.json` and an account to sign in with — see
+  adopting the editor theme. It starts the ordinary production backend, so it reads the same
+  `~/.aetherops/config.json` — lite storage needs nothing else, enterprise storage needs MySQL + Redis
+  — plus an account to sign in with. See
   [`packages/vscode`](./packages/vscode/README.md).
 - **i18n**: Chinese / English UI, switchable at runtime.
 - **CI/CD**: GitHub Actions builds installers for all platforms and the `.vsix`.
@@ -267,15 +269,25 @@ backend, plus **multi-account access control** so a team can share one deploymen
 
 | Component | Requirement | Notes |
 |-----------|-------------|-------|
-| Node.js | **>= 22.17** | Required by the agent engine's `engines`; CI and the Docker image use Node 22 |
+| Node.js | **>= 22.17** | Required by the agent engine's `engines`. Lite storage needs `>= 22.13`, where built-in `node:sqlite` lost its flag; the CI and the Docker image run Node 24 |
 | Package manager | **pnpm 10** | What the lockfile, CI, the Docker image and `scripts/check-engine-pin.mjs` are standardized on. Native-module build permissions are declared in two places with deliberately overlapping roles — `pnpm-workspace.yaml` (`onlyBuiltDependencies` for pnpm 10/11, `allowBuilds` for pnpm 12+) and `package.json#pnpm` (a shorter list plus the patch, read by older pnpm that ignores the workspace keys). A lock rewritten by pnpm 11/12 is rejected by CI's pnpm 10 under `--frozen-lockfile` |
-| MySQL | 8.x | Hard dependency — the server refuses to start without it |
-| Redis | any recent RESP server | Hard dependency — login tokens live here |
+| MySQL | 8.x | **Enterprise backend only** (the default for a shared instance); unused in lite mode |
+| Redis | any recent RESP server | **Enterprise backend only** — login tokens live here; in lite mode they live in the SQLite file |
 | Build tools | python3, make, g++ (Linux) / Xcode CLT (macOS) / VS Build Tools (Windows) | Native modules: node-pty, ssh2, cpu-features |
 
-MySQL and Redis are **not optional**: startup validates the configuration, probes both services,
-applies schema migrations and only then binds the port. If either is unreachable the process exits
-with a readable message instead of opening a port that answers every query with an error.
+Two storage backends, picked at deploy time; there is no third option and the two cannot be swapped
+later:
+
+- **lite** (default when nothing is configured) — one SQLite file (`~/.aetherops/aetherops.db`) holds
+  accounts, connections, sessions, audit, alerts, metrics **and** login tokens. No external service
+  to install, nothing extra to back up.
+- **enterprise** — MySQL 8.x for business data plus Redis for login tokens. Startup validates the
+  configuration, probes both services, applies schema migrations and only then binds the port; if
+  either is unreachable the process exits with a readable message instead of opening a port that
+  answers every query with an error.
+
+Explicit choice via `storage.mode` (`auto` / `enterprise` / `lite`) or `AETHEROPS_STORAGE_MODE`:
+[configuration.md § Storage backends](./docs/configuration.md#storage-backends-lite-sqlite-vs-enterprise).
 
 ## Quick start
 
@@ -292,10 +304,15 @@ pnpm install --frozen-lockfile
 # 3. Build frontend + server
 pnpm build
 
-# 4. Point it at MySQL and Redis.
-#    The first run drops a template at ~/.aetherops/config.json (mode 0600) —
-#    edit database + redis, or override with environment variables. Give the
-#    ports too whenever they are not the defaults (3306 / 6379):
+# 4. Storage. A single user changes nothing: with no database configured the
+#    server picks the lite backend and creates ~/.aetherops/aetherops.db.
+#    For a shared instance force the enterprise backend and point it at
+#    MySQL + Redis. The first run drops a template at ~/.aetherops/config.json
+#    (mode 0600) — edit storage/database/redis, or override with environment
+#    variables. Give the ports too whenever they are not 3306 / 6379:
+# export AETHEROPS_STORAGE_MODE=enterprise
+# export AETHEROPS_STORAGE_MODE=lite      # or pin the SQLite file explicitly
+# export AETHEROPS_SQLITE_PATH=...        # default: <data dir>/aetherops.db
 export AETHEROPS_DB_HOST=127.0.0.1
 export AETHEROPS_DB_PORT=3306
 export AETHEROPS_DB_USER=aetherops
@@ -308,9 +325,10 @@ export AETHEROPS_REDIS_PASSWORD='...'
 #    Taking over an instance that already holds data (moving machines, moving
 #    into a container, pointing at a database someone else set up): copy that
 #    machine's connections.key and ai-config.key into this data directory
-#    before starting. Both keys are read from files only — no environment
-#    variable exists for them. Without them, stored SSH credentials and AI keys
-#    fail to decrypt silently and show up as empty fields.
+#    before starting — on lite, the aetherops.db* files are part of that copy.
+#    Both keys are read from files only — no environment variable exists for
+#    them. Without them, stored SSH credentials and AI keys fail to decrypt
+#    silently and show up as empty fields.
 
 # 5. Optional — let the collector sample hosts with no open terminal.
 #    metrics.offlineSampling is off by default: every sample is a real SSH
@@ -360,7 +378,7 @@ Rationale, the backoff ladder and the rest:
 | Method | Command / source | Good for |
 |--------|------------------|----------|
 | Source build | `pnpm install && pnpm build && node server.js` | Everyone; currently the only way to get the app |
-| Docker | `pnpm docker:build` (or `docker build -t aetherops .`) + compose with MySQL/Redis | Servers, shared team deployment |
+| Docker | `pnpm docker:build` (or `docker build -t aetherops .`); compose with MySQL/Redis for enterprise, or run it alone on lite | Servers, shared team deployment |
 | Electron desktop | `pnpm electron:build:win \| :mac \| :linux` | Single operators who want a native window |
 | VSCode extension | `pnpm vscode:package` → `.vsix`, then *Install from VSIX* | Keeping terminals inside the editor |
 | GitHub Releases | Created by CI when a version tag is pushed (beta builds) | Installers without a local toolchain |
@@ -380,8 +398,8 @@ docker run -d -p 9802:9802 -v ~/.aetherops:/root/.aetherops aetherops
 ```
 
 See [docs/deployment.md](./docs/deployment.md) for what `docker:build` checks before it runs, a Docker
-Compose file that brings up MySQL and Redis alongside the app, reverse-proxy settings (WebSocket
-upgrade is mandatory), and the release flow.
+Compose file that brings up MySQL and Redis alongside the app (enterprise), reverse-proxy settings
+(WebSocket upgrade is mandatory), and the release flow.
 
 ### CLI
 
@@ -408,8 +426,9 @@ variables.
 |------|-------|
 | Default path | `~/.aetherops/config.json` (auto-created, mode 0600) |
 | Override path | `AETHEROPS_DATA_DIR` (data dir) / `AETHEROPS_CONFIG` (explicit file) |
-| Sections | `server`, `database`, `redis`, `auth`, `debug`, `metrics` |
+| Sections | `server`, `storage`, `database`, `redis`, `auth`, `debug`, `metrics` |
 | Port / bind | `PORT`, `HOST` (defaults: 9802 on 127.0.0.1) |
+| Storage | `AETHEROPS_STORAGE_MODE` (`auto` / `enterprise` / `lite`), `AETHEROPS_SQLITE_PATH`, `AETHEROPS_SQLITE_BUSY_TIMEOUT_MS` |
 | Database | `AETHEROPS_DB_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_NAME` / `_POOL_SIZE` / `_SSL` / `_TZ` / `_SSL_CA` / `_SSL_INSECURE` |
 | Redis | `AETHEROPS_REDIS_URL` or `_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DB` / `_PREFIX` / `_CONNECT_TIMEOUT_MS` |
 | Misc | `AETHEROPS_MAX_UPLOAD_MB` (default 100), `AETHEROPS_SSH_DEBUG`, `AETHEROPS_LAUNCH_TOKEN`, `AETHEROPS_METRICS_OFFLINE_SAMPLING` (default off) |
@@ -452,11 +471,13 @@ carries a bearer token, is checked against the permission table and the session 
 a repository that always takes `owner_id`. Terminal I/O, AI streaming and audit events share the
 WebSocket so panels update live.
 
-Storage: **MySQL** holds connections, sessions, AI profiles/chats/messages/usage/budgets, audit
-events, skills and snippets (schema migrations run automatically; `node scripts/migrate.mjs --status`
-shows what is pending, `--dump <ver>` emits plain SQL for DBA review). **Redis** holds login tokens.
-The **data directory** holds the config template, the two AES key files (`connections.key`,
-`ai-config.key`), `server.log`, the PID file and the `.trash/` recovery bin.
+Storage depends on the backend. On **enterprise**, MySQL holds connections, sessions, AI
+profiles/chats/messages/usage/budgets, audit events, skills and snippets and Redis holds login tokens;
+on **lite** the same tables and the tokens all live in `~/.aetherops/aetherops.db`. Schema migrations
+run automatically either way (`node scripts/migrate.mjs --status` shows what is pending,
+`--dump <ver>` emits plain SQL for DBA review). The **data directory** also holds the config template,
+the two AES key files (`connections.key`, `ai-config.key`), `server.log`, the PID file, the SQLite
+files and the `.trash/` recovery bin.
 
 ## Development
 
@@ -467,8 +488,8 @@ pnpm build-server     # backend only
 pnpm type-check       # vue-tsc
 pnpm lint             # eslint (+ --fix)
 pnpm check-pin        # verify pinned dependencies match the lockfile
-pnpm verify           # every verification suite in scripts/verify-*.mjs (needs MySQL)
-pnpm verify:offline   # the three suites that need no database
+pnpm verify           # every verification suite in scripts/verify-*.mjs (four need MySQL)
+pnpm verify:offline   # the four suites that need no database
 pnpm verify:docs      # bilingual doc pairs, switch lines, mirrored headings, links
 pnpm docker:build     # build the Docker image (--dry-run to see the command only)
 node scripts/migrate.mjs --status   # database schema state
@@ -478,7 +499,8 @@ BASE=http://127.0.0.1:9802 ADMIN_USER=admin ADMIN_PASS=... \
   node scripts/verify-auth.mjs   # end-to-end auth/permission/isolation checks
 ```
 
-`pnpm dev` still needs a reachable MySQL and Redis (migrations run before the port binds). Run
+`pnpm dev` needs no external service on lite (a SQLite file is created before the port binds); on the
+enterprise backend it needs a reachable MySQL and Redis. Run
 `pnpm install` with pnpm 10 — `pnpm-workspace.yaml` carries the native-module build allow-list
 (`onlyBuiltDependencies` / `allowBuilds`) and the `zmodem.js` patch that makes `rz`/`sz` reliable;
 skipping it produces a build that installs but cannot transfer files.
@@ -487,7 +509,7 @@ skipping it produces a build that installs but cannot transfer files.
 `scripts/verify-*.mjs` drive the **compiled** server (`dist/server/**`), so `pnpm build-server` comes
 first. Four of them talk to MySQL — they apply migrations themselves, write rows under a random
 `verify-*` owner prefix and delete them again in a `finally`, so point them at a scratch schema. On a
-machine without a database, `pnpm verify:offline` runs the three suites that need none.
+machine without a database, `pnpm verify:offline` runs the four suites that need none.
 `scripts/verify-docs.mjs` is the mechanical half of the `docs/` pairing rule described under
 [Documentation](#documentation). Both release workflows call the same gate
 (`.github/workflows/verify.yml`) before they package anything, so a red suite means no VSIX and no
@@ -545,7 +567,7 @@ Outbound requests are limited to three things, all of which you control:
 | `https://api.github.com/repos/SubDong/AetherOps/releases/latest` | Electron startup update check (notification only, and forks should edit `electron/updater.js`) | Optional |
 
 Nothing else phones home. Terminal output, transcripts, audit logs and credentials stay in your
-MySQL / Redis / data directory; there is no analytics, no crash reporting, and no cloud sync.
+database / Redis / data directory; there is no analytics, no crash reporting, and no cloud sync.
 Credentials in the database are AES-256-GCM ciphertext whose keys live only in the data directory.
 
 ## Cross-platform support
@@ -594,8 +616,9 @@ Honest status, so nobody files the same issue twice:
   `HTTP 401` error node even when the backend is healthy. The WebView application works normally once
   you sign in there — use its connection management. Details in
   [packages/vscode/README.md](./packages/vscode/README.md#known-gaps-in-this-host).
-- **No high-availability mode**: one server process, one Redis, one MySQL. Multi-instance
-  deployments share state through the database but do not coordinate in-memory terminal sessions.
+- **No high-availability mode**: one server process, one database. Multi-instance deployments share
+  state through the database but do not coordinate in-memory terminal sessions — and the lite backend
+  cannot be shared at all, since only one process should write a SQLite file.
 - **The agent's history is only what this app ran.** `search_audit` and `recall_fix` read
   `audit_events` / `error_fingerprints`, which cover tool calls and file transfers; a command typed
   by hand into a terminal is not in either table. `recall_fix` can therefore only answer "how was
@@ -617,7 +640,7 @@ change the other in the same pull request (see [CONTRIBUTING.md](./CONTRIBUTING.
 |-----|------|--------|
 | [getting-started.md](./docs/getting-started.md) | [getting-started.zh.md](./docs/getting-started.zh.md) | First boot: database, initial admin, permissions, first connection, first AI chat |
 | [configuration.md](./docs/configuration.md) | [configuration.zh.md](./docs/configuration.zh.md) | Every config key and environment variable, storage layout, migrations |
-| [deployment.md](./docs/deployment.md) | [deployment.zh.md](./docs/deployment.zh.md) | Docker Compose with MySQL/Redis, reverse proxy, upgrades, CI releases |
+| [deployment.md](./docs/deployment.md) | [deployment.zh.md](./docs/deployment.zh.md) | Docker Compose with MySQL/Redis (enterprise) or a single lite container, reverse proxy, upgrades, CI releases |
 | [accounts-and-permissions.md](./docs/accounts-and-permissions.md) | [accounts-and-permissions.zh.md](./docs/accounts-and-permissions.zh.md) | Roles, the 10 permission bits, admin oversight, tokens |
 | [ai-models-and-cost.md](./docs/ai-models-and-cost.md) | [ai-models-and-cost.zh.md](./docs/ai-models-and-cost.zh.md) | Provider profiles, auto routing and cost tiers, usage and budgets |
 | [jump-host.md](./docs/jump-host.md) | [jump-host.zh.md](./docs/jump-host.zh.md) | Startup scripts, agent forwarding, multi-hop chains |

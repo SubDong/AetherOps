@@ -34,23 +34,26 @@ VSCode Extension Host
   [Requirements](#requirements)).
 - The data directory defaults to `~/.aetherops` (overridable via the `aetherops.dataDir` setting) and
   is **shared with the standalone desktop / CLI AetherOps**: same `config.json`, same AES key files,
-  same log. The connection list itself is no longer a `connections.json` file — it lives in **MySQL**,
-  scoped to the signed-in account, so the VS Code host sees exactly the connections that account owns.
+  same log. The connection list itself is no longer a `connections.json` file — it lives in the backend
+  database (SQLite under the data directory on the lite backend, MySQL on the enterprise one), scoped to
+  the signed-in account, so the VS Code host sees exactly the connections that account owns.
 
 ## Requirements
 
 - VSCode `^1.75.0` or later.
 - A built AetherOps project (front-end + backend) — see [Local Development](#local-development).
-- Node.js **>= 22.17** available to launch the backend. The extension locates a `node` binary
-  automatically (see [Environment Variables](#environment-variables)); you normally do not need to set
-  anything.
-- **MySQL and Redis reachable, and configured.** The extension starts the ordinary production backend,
-  which refuses to bind a port without them. It adds `AETHEROPS_DATA_DIR`, `AETHEROPS_LAUNCH_TOKEN` and
-  `NODE_ENV` to a copy of VS Code's own environment (dropping `NODE_OPTIONS`, which would crash a clean
-  Node start), so `AETHEROPS_DB_*` variables work only if the VS Code process itself has them — launching
-  from a desktop icon usually means it does not. Put the settings in `~/.aetherops/config.json`: complete
-  step 3 and 4 of [docs/getting-started.md](../../docs/getting-started.md) once, and every host — CLI,
-  desktop, this extension — then shares that one configuration.
+- Node.js **>= 22.17** available to launch the backend (lite storage needs the built-in `node:sqlite`,
+  unflagged since 22.13). The extension locates a `node` binary automatically (see
+  [Environment Variables](#environment-variables)); you normally do not need to set anything.
+- **No external services on the default backend.** With nothing configured the backend uses the lite
+  backend and writes everything into `~/.aetherops/aetherops.db`; only if you point it at the enterprise
+  backend do MySQL and Redis have to be reachable. The extension adds `AETHEROPS_DATA_DIR`,
+  `AETHEROPS_LAUNCH_TOKEN` and `NODE_ENV` to a copy of VS Code's own environment (dropping
+  `NODE_OPTIONS`, which would crash a clean Node start), so `AETHEROPS_DB_*` variables work only if the
+  VS Code process itself has them — launching from a desktop icon usually means it does not. Put the
+  settings in `~/.aetherops/config.json`: complete step 3 and 4 of
+  [docs/getting-started.md](../../docs/getting-started.md) once, and every host — CLI, desktop, this
+  extension — then shares that one configuration.
 - An **account** to sign in with. On a fresh database the first `node server.js` boot prints a random
   password for `admin`; that is the account to use in the WebView.
 
@@ -75,7 +78,7 @@ After activating the extension, an **AetherOps** icon appears in the left Activi
 
 - **Open Default Server Shell** — opens the server-shell terminal (`__local__` connection) inside a VSCode WebView tab.
 - **Saved connections** — the connection list owned by the signed-in account, read from the backend
-  (it is stored in MySQL, not in a file). SSH connections show a globe icon; local connections show a
+  (it lives in the database, not in a file). SSH connections show a globe icon; local connections show a
   terminal icon, with the host and username as a description.
 - **No connections yet** hint — appears when the connection list is empty; click the **+** button in the view title to add one.
 
@@ -121,7 +124,7 @@ Open **Settings → Extensions → AetherOps** (or add to `settings.json`):
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
-| `aetherops.dataDir` | string | *(empty)* | Data directory holding `config.json`, the AES key files, `server.log` and `.trash/`. Empty means `~/.aetherops`, shared with the desktop / CLI app. Business data (connections, chats, audit) is in MySQL, not here. |
+| `aetherops.dataDir` | string | *(empty)* | Data directory holding `config.json`, the AES key files, `server.log`, `.trash/` and (on the lite backend) `aetherops.db`. Empty means `~/.aetherops`, shared with the desktop / CLI app. On the enterprise backend business data (connections, chats, audit) is in MySQL instead. |
 | `aetherops.startPort` | number | `9802` | Starting port used when launching the AetherOps service inside VSCode. If occupied, the extension scans forward for a free port. |
 
 > Changing `aetherops.dataDir` or `aetherops.startPort` requires reloading the VSCode window to take effect (a notification prompts you to reload).
@@ -194,9 +197,10 @@ Stated plainly, because these are the first things a new user hits:
   is tracked in [CONTRIBUTING.md](../../CONTRIBUTING.md) as a known gap.
 - **A missing database configuration looks like a broken extension.** The backend child does inherit VS
   Code's environment, but VS Code launched from a GUI rarely has `AETHEROPS_DB_*` in it, so the
-  practical source of database settings is `~/.aetherops/config.json`. Without them the child exits on
-  `[FATAL] 数据库配置不完整` and the extension can only report "server did not become ready" — read the
-  `[aetherops-server]` lines in the Output panel for the actual reason.
+  practical source of database settings is `~/.aetherops/config.json`. With nothing configured the child
+  simply uses the lite backend; if you pinned the enterprise backend and left `database`/`redis` empty,
+  it exits on `[FATAL] 数据库配置不完整` and the extension can only report "server did not become ready" —
+  read the `[aetherops-server]` lines in the Output panel for the actual reason.
 - **The extension can reuse a server that is already running.** Before spawning a child it probes
   `/health` on ports from `aetherops.startPort` upward. That probe sends no launch token, so it succeeds
   only against an instance started without `auth.launchToken` configured — a server launched by another

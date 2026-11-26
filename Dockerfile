@@ -3,8 +3,12 @@
 # ============================================
 # 默认 slim + apt 装编译工具；但交叉构建（如 linux/arm64）时容器内对几个 apt 源的访问
 # 不稳定（阿里云连接中断、清华对 .deb 返 403、官方源 502），所以留一个口子：
-#   --build-arg BUILD_IMAGE=node:22   # 完整镜像自带 python3/make/g++，整段 apt 直接跳过
-ARG BUILD_IMAGE=node:22-slim
+#   --build-arg BUILD_IMAGE=node:24   # 完整镜像自带 python3/make/g++，整段 apt 直接跳过
+#
+# 为什么是 Node 24：lite 存储用内置 node:sqlite（从 22.13 起已不需要 --experimental-sqlite
+# 开关，但 24 是当前 LTS，内置 SQLite 版本与 API 也更稳）。两个阶段保持一致，
+# 免得构建期与运行期的 Node 版本不同带来的差异。
+ARG BUILD_IMAGE=node:24-slim
 FROM ${BUILD_IMAGE} AS build-stage
 
 WORKDIR /app
@@ -52,7 +56,7 @@ RUN pnpm run build
 # ============================================
 # 生产阶段 (运行环境)
 # ============================================
-FROM node:22-slim AS production-stage
+FROM node:24-slim AS production-stage
 
 WORKDIR /app
 
@@ -78,7 +82,8 @@ COPY --from=build-stage /app/public ./public
 COPY --from=build-stage /app/data/skills ./data/skills
 
 # 数据默认落在 $HOME/.aetherops（本镜像即 /root/.aetherops，含 config.json、连接配置、
-# 加密密钥、审计日志）。声明 VOLUME 后，即使忘记 -v，数据也进命名卷而不是容器可写层，
+# 加密密钥、审计日志；lite 模式下还有 aetherops.db 及其 -wal/-shm 两个兄弟文件）。
+# 声明 VOLUME 后，即使忘记 -v，数据也进命名卷而不是容器可写层，
 # 不会因容器重建被静默丢弃。若用 AETHEROPS_DATA_DIR 改了路径，就要改成挂那个路径。
 VOLUME ["/root/.aetherops"]
 

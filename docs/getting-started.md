@@ -3,8 +3,10 @@
 **English** · [简体中文](./getting-started.zh.md)
 
 This walkthrough takes you from an empty machine to an AI agent executing commands on a real server.
-It assumes you are deploying for yourself or for a small team. Time: roughly 15 minutes if MySQL and
-Redis are already reachable.
+It assumes you are deploying for yourself or for a small team. A single user needs no database and no
+cache: with nothing configured the server uses the **lite** backend and keeps accounts, connections,
+audit history and login tokens in one SQLite file under the data directory — about 10 minutes. Sharing
+one dataset across machines (**enterprise**) adds MySQL and Redis (section 2), about 15 minutes.
 
 - [0. Prerequisites](#0-prerequisites)
 - [1. Install and build](#1-install-and-build)
@@ -21,10 +23,10 @@ Redis are already reachable.
 
 | Requirement | Minimum | Why |
 |-------------|---------|-----|
-| Node.js | 22.17 | The agent engine declares `engines: { node: '>=22.17.0' }` |
+| Node.js | 22.17 | The agent engine declares `engines: { node: '>=22.17.0' }`; lite storage needs built-in `node:sqlite` (unflagged since 22.13) |
 | pnpm | 10.x | The lockfile is pnpm-10 shaped; see [CONTRIBUTING.md](../CONTRIBUTING.md#dependency-pinning) |
-| MySQL | 8.x | Hard dependency |
-| Redis | recent | Hard dependency (login tokens) |
+| MySQL | 8.x | Enterprise backend only (many machines / many users sharing data) |
+| Redis | recent | Enterprise backend only (login tokens); lite keeps them in the SQLite file |
 | C++ toolchain | gcc/clang or VS Build Tools | node-pty, ssh2, cpu-features are native |
 
 ## 1. Install and build
@@ -47,6 +49,10 @@ corepack would resolve whatever major it considers current — and a pnpm 11/12 
 lockfile into a shape CI's pnpm 10 rejects.
 
 ## 2. Prepare MySQL and Redis
+
+**This section is only needed for the enterprise backend.** A single-machine deployment can skip it
+entirely (section 3 then needs no `database`/`redis` either): the server uses the lite backend and writes
+everything to `~/.aetherops/aetherops.db`.
 
 Create a database and a least-privilege account:
 
@@ -75,6 +81,7 @@ abridged here — the file carries more keys than the three groups below:
 ```json
 {
   "server":   { "port": 9802, "host": "127.0.0.1" },
+  "storage":  { "mode": "auto", "sqlitePath": "", "busyTimeoutMs": 5000 },
   "database": { "host": "", "port": 3306, "user": "", "password": "", "database": "aetherops" },
   "redis":    { "url": "", "host": "", "port": 6379, "password": "", "db": 0, "keyPrefix": "aetherops:" },
   "auth":     { "launchToken": "", "maxUploadMb": 100 },
@@ -82,8 +89,9 @@ abridged here — the file carries more keys than the three groups below:
 }
 ```
 
-Fill in `database` and `redis` — or keep them empty and use environment variables so credentials
-never touch the disk:
+With `storage.mode` left at `auto`, any non-empty `database.host` / `redis.host` / `redis.url` selects
+the enterprise backend; otherwise you get lite. On enterprise, fill in `database` and `redis` — or keep
+them empty and use environment variables so credentials never touch the disk:
 
 ```bash
 export AETHEROPS_DB_HOST=127.0.0.1
@@ -105,9 +113,9 @@ Full reference: [configuration.md](./configuration.md).
 node server.js
 ```
 
-Startup order is deliberate: validate config → connect MySQL → apply migrations → probe Redis →
-initialize services → only then bind the port. A missing dependency exits with a readable message
-instead of opening a port that errors on every request.
+Startup order is deliberate: validate config → create/migrate the schema (on lite, create the SQLite
+file) → probe Redis on enterprise → initialize services → only then bind the port. A missing dependency
+exits with a readable message instead of opening a port that errors on every request.
 
 When the `users` table is empty, one administrator is created for you. Its password is random,
 printed **once**, and not stored in any file other than the log:
@@ -129,7 +137,7 @@ What the account model looks like underneath is covered in
    console when managing another member's inventory).
 2. Fill host, port, username. Authentication can be key-based, password, or automatic.
    - Key: paste a private key, optionally with a passphrase. The key is stored as `enc:v1:`
-     AES-256-GCM ciphertext in MySQL; the decryption key stays in `~/.aetherops/connections.key`.
+     AES-256-GCM ciphertext in the database; the decryption key stays in `~/.aetherops/connections.key`.
    - The file `connections.key` is not backed up into the database — losing the data directory means
      losing stored credentials. Back the directory up.
    - The reverse is just as true: when moving machines, moving into a container, or pointing at a

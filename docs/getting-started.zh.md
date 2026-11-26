@@ -3,7 +3,9 @@
 [English](./getting-started.md) · **简体中文**
 
 这篇走查带你从一台空机器一路走到「AI Agent 在真实服务器上执行命令」。假设你是给自己或一个小团队部署。
-MySQL 与 Redis 已经可连通的话，整体大约 15 分钟。
+个人自用不需要装数据库和缓存：什么都不配时服务会落到 lite 后端，把账号、连接、审计与登录令牌
+都放在数据目录下的一个 SQLite 文件里，整体大约 10 分钟。要多人/多机共享一份数据时，才需要 MySQL 与
+Redis（下文第 2 节），那时整体大约 15 分钟。
 
 - [0. 前置要求](#0-前置要求)
 - [1. 安装与构建](#1-安装与构建)
@@ -20,10 +22,10 @@ MySQL 与 Redis 已经可连通的话，整体大约 15 分钟。
 
 | 组件 | 最低要求 | 原因 |
 |------|----------|------|
-| Node.js | 22.17 | Agent 引擎声明了 `engines: { node: '>=22.17.0' }` |
+| Node.js | 22.17 | Agent 引擎声明了 `engines: { node: '>=22.17.0' }`；lite 存储需要内置 `node:sqlite`（Node 22.13 起无需开关） |
 | pnpm | 10.x | 锁文件是 pnpm 10 的形状，见 [CONTRIBUTING.md](../CONTRIBUTING.md#dependency-pinning) |
-| MySQL | 8.x | 硬依赖 |
-| Redis | 较新版本 | 硬依赖（登录令牌存放处） |
+| MySQL | 8.x | 仅企业级（多人/多机共享） |
+| Redis | 较新版本 | 仅企业级（登录令牌存放处）；lite 的令牌在 SQLite 里 |
 | C++ 工具链 | gcc/clang 或 VS Build Tools | node-pty、ssh2、cpu-features 是原生模块 |
 
 ## 1. 安装与构建
@@ -45,6 +47,9 @@ pnpm 必须显式装 10 这个大版本。只执行 `corepack enable` 不够：�
 认为的当前大版本，而 pnpm 11/12 装出来的锁文件形状会被 CI 的 pnpm 10 直接拒绝。
 
 ## 2. 准备 MySQL 与 Redis
+
+**只有企业级后端才需要这一节。** 个人单机部署可以整节跳过（第 3 节也不需要填 `database`/`redis`）：
+服务会用 lite 后端把数据写进 `~/.aetherops/aetherops.db`。
 
 建库并建一个最小权限账号：
 
@@ -73,6 +78,7 @@ Redis 只要能连通就行，不需要任何初始化。只要它没有绑定�
 ```json
 {
   "server":   { "port": 9802, "host": "127.0.0.1" },
+  "storage":  { "mode": "auto", "sqlitePath": "", "busyTimeoutMs": 5000 },
   "database": { "host": "", "port": 3306, "user": "", "password": "", "database": "aetherops" },
   "redis":    { "url": "", "host": "", "port": 6379, "password": "", "db": 0, "keyPrefix": "aetherops:" },
   "auth":     { "launchToken": "", "maxUploadMb": 100 },
@@ -80,7 +86,8 @@ Redis 只要能连通就行，不需要任何初始化。只要它没有绑定�
 }
 ```
 
-填好 `database` 与 `redis` 两段 —— 或者让这两段留空、改用环境变量提供，这样凭据不落盘：
+`storage.mode` 留 `auto` 时：`database.host` / `redis.host` / `redis.url` 任一有值就走企业级，否则走 lite。
+企业级就把 `database` 与 `redis` 两段填好 —— 或者让这两段留空、改用环境变量提供，这样凭据不落盘：
 
 ```bash
 export AETHEROPS_DB_HOST=127.0.0.1
@@ -102,7 +109,8 @@ export AETHEROPS_REDIS_PASSWORD='redis-secret'
 node server.js
 ```
 
-启动顺序是刻意设计的：校验配置 → 连 MySQL → 执行迁移 → 探活 Redis → 初始化服务 → 最后才绑端口。
+启动顺序是刻意设计的：校验配置 → 建库/迁移（lite 下是建出 SQLite 文件）→ 企业级探活 Redis →
+初始化服务 → 最后才绑端口。
 缺依赖时会带着一句可读的报错退出，而不是把一个「每个请求都报错」的端口开出来。
 
 `users` 表为空时，系统会替你创建好一个管理员账号。它的密码是随机的、**只打印一次**，
@@ -121,7 +129,7 @@ node server.js
 
 1. 在左侧边栏选择 **连接 → 新建**（管理员在代管其他成员的连接清单时，用的是同一个对话框）。
 2. 填主机、端口、用户名。认证方式可以是密钥、口令，或自动判断。
-   - 密钥：粘贴私钥，可选带 passphrase。私钥以 `enc:v1:` 前缀的 AES-256-GCM 密文存进 MySQL，
+   - 密钥：粘贴私钥，可选带 passphrase。私钥以 `enc:v1:` 前缀的 AES-256-GCM 密文存进数据库，
      解密用的密钥留在 `~/.aetherops/connections.key`。
    - `connections.key` **不会**备份进数据库 —— 数据目录丢了，等于存好的凭据全丢。请务必备份该目录。
    - 反过来也一样：换机器、搬进容器、或者连到一台别人已经用过的库时，先把原数据目录里的

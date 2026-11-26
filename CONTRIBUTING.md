@@ -34,10 +34,10 @@ commitment; if you are waiting on something, a helpful nudge beats a deadline.
 
 | Requirement | Version | Notes |
 |-------------|---------|-------|
-| Node.js | >= 22.17 | Enforced by `@cicctencent/agent-core`'s `engines` |
+| Node.js | >= 22.17 | Enforced by `@cicctencent/agent-core`'s `engines`; the lite backend's built-in `node:sqlite` needs >= 22.13, so the floor already covers it |
 | pnpm | 10 | The lockfile shape depends on it; see [Dependency pinning](#dependency-pinning) |
-| MySQL | 8.x | Hard dependency — nothing starts without it |
-| Redis | recent | Hard dependency — login tokens |
+| MySQL | 8.x | Enterprise backend only — lite storage is a single SQLite file |
+| Redis | recent | Enterprise backend only — login tokens (lite keeps them in `auth_sessions`) |
 | C++ toolchain | platform-specific | `node-pty`, `ssh2`, `cpu-features` need build scripts |
 
 ```bash
@@ -47,7 +47,10 @@ npm i -g pnpm@10                   # or: corepack prepare pnpm@10 --activate
 pnpm install --frozen-lockfile      # applies patches/zmodem.js.patch; do not skip the patch
 pnpm build-only                     # pin check → vite build → tsc -p tsconfig.server.json
 
-# point at your own MySQL/Redis (config file or env)
+# A solo setup configures nothing: with no database set, the server picks the
+# lite backend and creates ~/.aetherops/aetherops.db. To develop against
+# MySQL/Redis instead, pin the backend and point it at your own servers:
+export AETHEROPS_STORAGE_MODE=enterprise
 export AETHEROPS_DB_HOST=127.0.0.1 AETHEROPS_DB_USER=aetherops AETHEROPS_DB_PASSWORD=...
 export AETHEROPS_REDIS_HOST=127.0.0.1
 
@@ -78,6 +81,7 @@ production systems — the agent's delete protection is a guardrail, not a safet
 | Account routes / tokens | `server/routes/auth.routes.ts`, `server/service/auth.service.ts` | same |
 | Business services | `server/service/*.ts` | the service you are touching |
 | SQL | `server/db/repositories/*.repo.ts`, `server/db/migrations/` | [docs/configuration.md](./docs/configuration.md#database-schema-and-migrations) |
+| Storage backend / SQL dialect | `server/db/pool.ts`, `server/db/sqlite.ts`, `server/db/dialect.ts`, `server/db/token-store.ts` | [docs/configuration.md](./docs/configuration.md#storage-backends-lite-sqlite-vs-enterprise) |
 | Config keys | `server/utils/config.ts` | [docs/configuration.md](./docs/configuration.md) |
 | OS detection & metric scripts | `server/utils/os-detect.ts` | [docs/troubleshooting.md](./docs/troubleshooting.md#server-status-panel) |
 | Vue front-end | `src/components/`, `src/views/`, `src/service/`, `src/locales/` | `src/platform/router.ts` for route wiring |
@@ -115,8 +119,8 @@ tells you to run.
 
 ```bash
 pnpm build-server                      # the suites load dist/server, not src
-pnpm verify                            # all seven; four of them need a reachable MySQL
-pnpm verify:offline                    # the three that need no database
+pnpm verify                            # all eight; four of them need a reachable MySQL
+pnpm verify:offline                    # the four that need no database
 node scripts/verify-all.mjs --list     # the list, and which need a database
 node scripts/verify-all.mjs p4 p6      # a subset
 ```
@@ -130,6 +134,7 @@ The suites are per phase and each one prints `PASS` / `FAIL` per assertion:
 | `verify-p1-tools.mjs` | `list_connections` / `read_file` / `run_on_hosts`: permissions, no dialing, no credential leak, throttling | no |
 | `verify-p2-approval.mjs` | command classification, `NEEDS_CONFIRM`, single-use token binding | no |
 | `verify-p3-skills.mjs` | skill catalog, `load_skill`, per-turn cache, 20,000-character cap | no |
+| `verify-storage-lite.mjs` | lite backend: mode resolution, baseline schema, repositories, login tokens, `purgeOwnerData`, WAL checkpoint | no (builds its own SQLite file) |
 | `verify-p4-fingerprints.mjs` | normalization, aggregation, attribution, retention | yes |
 | `verify-p5-alerts.mjs` | de-duplication state machine, webhook signing and retries, mutes | yes |
 | `verify-p6-collab.mjs` | claim / assign / on-call, incident grouping, `recall_fix`, skill write path, route status codes | yes |
@@ -138,6 +143,9 @@ The database suites apply migrations themselves, write rows under a random `veri
 and delete them again in a `finally`. Point them at a schema you may throw away. When you change a
 behavior one of these pins, change the expectation and the code in the same PR — a red suite is a
 regression until proven otherwise, not a test to relax.
+
+`verify-storage-lite.mjs` needs neither MySQL nor Redis: it creates a temp SQLite file, exercises the
+same repositories through the dialect layer, and removes the directory in a `finally`.
 
 ### Docs gate — `pnpm verify:docs`
 
@@ -236,6 +244,11 @@ runtime will tell the user why.
   nobody can query.
 - Do not add a way to store a plaintext secret. If a column holds a credential, it must go through the
   existing `enc:v1:` AES-256-GCM path.
+- Lite mode replays the same chain against SQLite. SQL the dialect layer (`server/db/dialect.ts`)
+  cannot translate goes into a migration's optional `sqliteSql` field, not into a branch in the
+  repository. 0001–0012 are replaced on SQLite by one merged baseline (`server/db/sqlite-schema.ts`),
+  so every table change lands in **both** the baseline and the MySQL migrations — 0013 onwards is the
+  shared path.
 
 ## Authorization changes
 

@@ -160,7 +160,9 @@ platform exposes:
 | `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` in CI | Same root cause as above, seen later | Same fix; there is deliberately no `packageManager` field forcing a rewrite of your local `node_modules` |
 | Native module build failure (`node-pty`, `ssh2`, `cpu-features`) | Missing C++ toolchain | Linux `python3 make g++`; macOS Xcode CLT; Windows VS Build Tools (C++ workload) |
 | Post-install scripts skipped, terminal is broken | pnpm only runs a dependency's build script if it is allow-listed | The list lives in `pnpm-workspace.yaml` — `onlyBuiltDependencies` (pnpm 10/11) and `allowBuilds` (pnpm 12+), both present on purpose — with a shorter mirror in `package.json#pnpm`. `pnpm approve-builds` adds entries interactively. If `node-pty`/`ssh2`/`cpu-features` were skipped, remove `node_modules` and reinstall with the allow-list in place |
-| `EBADENGINE` warnings, or agent-core throws syntax errors at runtime | Node is older than the pinned engine requirement (`>= 22.17.0`) | Use Node 22 LTS or newer; Docker and CI both run 22 |
+| `EBADENGINE` warnings, or agent-core throws syntax errors at runtime | Node is older than the pinned engine requirement (`>= 22.17.0`) | Use Node 22.17 or newer (lite storage needs `>= 22.13`); Docker and CI run 24 |
+| `Cannot find module 'node:sqlite'` in lite mode | The host Node is older than 22.13, where the built-in SQLite module still needed `--experimental-sqlite` | Use Node 22.17+, add `--experimental-sqlite` for that host, or switch back to the enterprise backend (`storage.mode: enterprise`) |
+| `SQLITE_BUSY` / `database is locked` | Another process (e.g. a leftover `scripts/migrate.mjs`) holds the write lock, or `storage.busyTimeoutMs` is too small | Stop the other process; raise `AETHEROPS_SQLITE_BUSY_TIMEOUT_MS` (max 60000) |
 | Install fails resolving `@cicctencent/agent-core` | It is pinned and fetched from the public npm registry — a mirror or firewall that filters packages breaks it | Allow `registry.npmjs.org` (or npmmirror equivalent) for that scope |
 | Build hangs after "build complete" | `vite build` occasionally keeps the process alive on watchers in some environments | Ctrl-C is safe once `dist/` is written; the server build (`tsc -p tsconfig.server.json`) is the step that must have finished |
 
@@ -186,9 +188,10 @@ platform exposes:
   [packages/vscode/README.md](../packages/vscode/README.md)). Sign in inside the WebView and manage
   connections there; the tree is not a reliable health signal today.
 - **VS Code: "server did not become ready" and the port never opens** — the extension starts the same
-  production backend, which exits on `[FATAL] 数据库配置不完整` if `~/.aetherops/config.json` has an
-  empty `database`/`redis` section. The child process inherits VS Code's own environment (minus
-  `NODE_OPTIONS`, which the host injects and which breaks a clean Node start), so `AETHEROPS_DB_*`
+  production backend. With nothing configured it lands on lite (no MySQL/Redis needed); only when you
+  point it at the enterprise backend and `~/.aetherops/config.json` has an empty `database`/`redis`
+  section does it exit on `[FATAL] 数据库配置不完整`. The child process inherits VS Code's own environment
+  (minus `NODE_OPTIONS`, which the host injects and which breaks a clean Node start), so `AETHEROPS_DB_*`
   variables are only seen if the VS Code process itself had them — launching from a desktop icon
   usually does not. Put the settings in the config file, or launch VS Code from a shell that exports
   them. The real reason is in the Output panel → `[aetherops-server]` lines.
@@ -199,7 +202,8 @@ Include, in this order — it usually answers the question before anyone replies
 
 1. Host (web / Electron / VS Code), version (`package.json` version or the release tag), OS of the
    machine running AetherOps, and the **target** OS if the issue is about a remote host.
-2. Node, pnpm and MySQL/Redis versions; whether TLS is enabled on MySQL.
+2. Node, pnpm and MySQL/Redis versions; whether TLS is enabled on MySQL. In lite mode, give
+   `storage.mode` and the database file path instead.
 3. The relevant log tail from `~/.aetherops/server.log` (the same text you see on the console), and the
    browser/DevTools console for front-end problems.
 4. Exact `[FATAL]` / `[pin]` / `[WS]` / migration lines — they are written to fail loudly, so quoting

@@ -2,13 +2,18 @@
 
 **English** · [简体中文](./deployment.zh.md)
 
-AetherOps is one Node process plus **two hard dependencies: MySQL 8.x and Redis**. There is no
-"standalone" mode — the process refuses to bind its port if either dependency is unreachable, so
-planning capacity for those two services is part of deployment, not an afterthought.
+AetherOps is one Node process. Which backing services it needs is a deployment decision:
+
+- **lite** (default for a single user) — nothing external. Accounts, connections, audit history and
+  login tokens live in one SQLite file under the data directory.
+- **enterprise** — MySQL 8.x for business data plus Redis for login tokens. If either is unreachable
+  the process refuses to bind its port, so capacity planning for those two is part of deployment.
+
+See [configuration.md § Storage backends](./configuration.md#storage-backends-lite-sqlite-vs-enterprise).
 
 - [Channels at a glance](#channels-at-a-glance)
 - [Requirements](#requirements)
-- [Provisioning MySQL and Redis](#provisioning-mysql-and-redis)
+- [Provisioning MySQL and Redis (enterprise mode)](#provisioning-mysql-and-redis-enterprise-mode)
 - [Source build](#source-build)
 - [Docker](#docker)
 - [Reverse proxy and TLS](#reverse-proxy-and-tls)
@@ -24,31 +29,36 @@ planning capacity for those two services is part of deployment, not an afterthou
 | Channel | Use when | Notes |
 |---------|----------|-------|
 | Source build | Development, custom builds, air-gapped rollout you script yourself | `pnpm install --frozen-lockfile` + `pnpm build-only` |
-| Docker | Server deployment, team-shared instance | Image contains the app only; you supply MySQL and Redis |
-| Docker Compose (app + db + cache) | Single-host trial or small team | Recommended starting point below |
-| Electron desktop | Individual users who want a native window | Ships its own backend; still needs MySQL and Redis reachable from that machine |
+| Docker | Server deployment, team-shared instance | Image contains the app only; enterprise mode needs you to supply MySQL and Redis, lite needs nothing |
+| Docker Compose (app + db + cache) | Single-host trial or small team | Recommended starting point below (enterprise) |
+| Electron desktop | Individual users who want a native window | Ships its own backend; defaults to lite, so no MySQL/Redis unless you point it at a shared database |
 | VS Code extension | Terminal inside VS Code | Extension bundles the backend runtime; same dependency rule |
 | npm global | **Not published** | Root `package.json` is `"private": true`. Install from source or a release artifact |
 
-The desktop and VS Code channels are convenient, but they do not remove the server dependency: each
-user still needs a MySQL schema and a Redis instance. For a team, run one web instance and let people
-point their desktop/VS Code hosts at it or at a shared database.
+The desktop and VS Code channels are convenient, and for a single user they no longer need any
+backend services: with nothing configured the server falls back to the **lite** backend (a single
+SQLite file under the data directory) and stores accounts, connections, audit history and login
+tokens there. A team that shares one dataset across machines still needs the **enterprise** backend
+(MySQL + Redis); see
+[configuration.md § Storage backends](./configuration.md#storage-backends-lite-sqlite-vs-enterprise).
 
 ## Requirements
 
 | Component | Version | Why this exact floor |
 |-----------|---------|----------------------|
-| Node.js | **>= 22.17.0** | Required by `@cicctencent/agent-core` (the agent engine). Docker and CI both use Node 22 |
+| Node.js | **>= 22.17.0** | Required by `@cicctencent/agent-core` (the agent engine). Lite storage needs `>= 22.13` (that is where built-in `node:sqlite` lost its flag); the Docker image and CI run Node 24 |
 | pnpm | **10** | CI, the Docker image and the pin check all use 10. `pnpm-workspace.yaml` holds the native-module build allow-list (`onlyBuiltDependencies` for 10/11, `allowBuilds` for 12+) plus the zmodem patch; `package.json#pnpm` mirrors the essentials for older pnpm. A lock rewritten by pnpm 11/12 makes CI's `--frozen-lockfile` fail with `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` |
-| MySQL | 8.x | Migrations assume `utf8mb4_0900_ai_ci`, `STRICT_TRANS_TABLES`, `DATETIME(3)` |
-| Redis | 6+ (any recent) | Login token store; `keyPrefix` lets you share an instance |
+| MySQL | 8.x | Enterprise mode only. Migrations assume `utf8mb4_0900_ai_ci`, `STRICT_TRANS_TABLES`, `DATETIME(3)` |
+| Redis | 6+ (any recent) | Enterprise mode only. Login token store; `keyPrefix` lets you share an instance |
 | C++ toolchain | for native modules | `node-pty`, `ssh2`, `cpu-features` need build scripts: Linux `python3 make g++`, macOS Xcode CLT, Windows VS Build Tools |
 
 The build chain is pinned on purpose: `pnpm run check-pin` (run automatically by `build-only`) fails
 the build if `@cicctencent/agent-core` or `vite` is declared as a range or does not match what is
 installed. See [CONTRIBUTING.md](../CONTRIBUTING.md#dependency-pinning).
 
-## Provisioning MySQL and Redis
+## Provisioning MySQL and Redis (enterprise mode)
+
+Skip this section entirely if one person runs one instance: lite mode needs neither.
 
 Create a database and an application user. The app runs its own migrations at startup, so the user
 needs DDL on that schema; if you prefer to apply SQL yourself (`node scripts/migrate.mjs --dump 0001`
@@ -90,6 +100,7 @@ pnpm install --frozen-lockfile
 pnpm run build-only          # pin check → vite build → tsc -p tsconfig.server.json
 
 # Point the app at your MySQL/Redis (config file or environment)
+export AETHEROPS_STORAGE_MODE=enterprise
 export AETHEROPS_DB_HOST=127.0.0.1
 export AETHEROPS_DB_USER=aetherops
 export AETHEROPS_DB_PASSWORD='change-me'
@@ -124,8 +135,16 @@ useful contribution — see [CONTRIBUTING.md](../CONTRIBUTING.md#test-scripts).
 
 ## Docker
 
-The image is a two-stage build (`node:22-slim` for build and runtime, pnpm 10 in both) and contains
-only the application. MySQL and Redis are **not** inside it.
+The image is a two-stage build (`node:24-slim` for build and runtime, pnpm 10 in both) and contains
+only the application. MySQL and Redis are **not** inside it — nor do they have to be, since the lite
+backend keeps everything in one SQLite file in the data volume:
+
+```bash
+docker run -d --name aetherops -p 127.0.0.1:9802:9802 \
+  -e AETHEROPS_STORAGE_MODE=lite \
+  -v aetherops-data:/root/.aetherops \
+  aetherops
+```
 
 ### One command
 
@@ -194,7 +213,7 @@ Image facts worth knowing:
   If you build in another region, adjust those lines; they change nothing at runtime. You can also swap the
   mirror for one build with `--build-arg DEBIAN_MIRROR=...`. If the container cannot reach the apt mirrors
   reliably at all (observed: aborted `Packages` downloads, `.deb` requests returning 403), build with
-  `--build-arg BUILD_IMAGE=node:22` — the full image already ships python3/make/g++, so the apt layer is
+  `--build-arg BUILD_IMAGE=node:24` — the full image already ships python3/make/g++, so the apt layer is
   skipped entirely.
 
 ### Docker Compose with MySQL and Redis
@@ -415,7 +434,7 @@ Two GitHub workflows, separated by tag prefix so they never collide:
 |----------|---------|----------|
 | `.github/workflows/build-vsix.yml` | tag `aetherops-v*` | VSIX + win/mac/linux desktop artifacts on one GitHub Release; then publishes to the VS Code Marketplace (`VSCODE_TOKEN`) and Open VSX (`OVSX_TOKEN`). Runs on `master` pushes and PRs too, as build-only jobs |
 | `.github/workflows/build.yml` | tag `v*`, or manual dispatch with a platform choice | Desktop artifacts only (fallback channel) |
-| `.github/workflows/verify.yml` | called by both workflows above, so every tag, `master` push and PR | Nothing publishable — it is the gate: backend + frontend type checks, the seven verification suites against a throwaway MySQL service, and the bilingual-doc check |
+| `.github/workflows/verify.yml` | called by both workflows above, so every tag, `master` push and PR | Nothing publishable — it is the gate: backend + frontend type checks, the eight verification suites (four of them against a throwaway MySQL service, plus the lite/SQLite one that builds its own temp database), and the bilingual-doc check |
 
 There is a third, non-GitHub pipeline: [`.cnb.yml`](../.cnb.yml) runs on the CNB build platform
 (<https://cnb.cool>). It verifies the build on `master` pushes and, on a tag push, builds the **Linux**
@@ -425,7 +444,7 @@ note pointing back at GitHub. Same pin rules as the workflows: `npm i -g pnpm@10
 
 Details:
 
-- Every job installs with `pnpm install --frozen-lockfile` on pnpm 10 / Node 22 (the VSIX jobs use
+- Every job installs with `pnpm install --frozen-lockfile` on pnpm 10 / Node 24 (the VSIX jobs use
   Node 20 for tooling steps, since they do not run the server).
 - `build-vsix.yml` and `build.yml` both start with a `verify` job that calls `verify.yml`, and every
   artifact job `needs:` it — a failing suite blocks the VSIX, the desktop builds and the marketplace
@@ -515,7 +534,7 @@ Read this section even if you skip the rest.
   Registration itself **cannot be switched off in the app** — if the instance is reachable beyond your
   network, deny `/api/auth/register` at the proxy. See
   [accounts-and-permissions.md](./accounts-and-permissions.md#registration-and-approval).
-- **Protect the two halves of the secret separately.** MySQL holds encrypted credentials;
+- **Protect the two halves of the secret separately.** The database holds encrypted credentials;
   `~/.aetherops/*.key` holds the ability to decrypt them. Anyone with both can read every stored SSH
   credential.
 - **Audit is data, not a security control.** Command and transfer history is recorded per account in

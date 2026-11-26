@@ -135,7 +135,9 @@
 | CI 里 `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` | 同上根因，只是暴露得更晚 | 同上；本仓库刻意没有 `packageManager` 字段去强制重建你本地的 `node_modules` |
 | 原生模块编译失败（`node-pty`、`ssh2`、`cpu-features`） | 缺 C++ 工具链 | Linux `python3 make g++`；macOS Xcode CLT；Windows VS Build Tools（C++ 负载） |
 | 安装后脚本被跳过、终端坏了 | pnpm 只跑被允许清单里的依赖构建脚本 | 清单在 `pnpm-workspace.yaml` —— `onlyBuiltDependencies`（pnpm 10/11）与 `allowBuilds`（pnpm 12+），两份是刻意同时保留的 —— `package.json#pnpm` 里有一份更短的镜像。`pnpm approve-builds` 可交互式追加。如果 `node-pty`/`ssh2`/`cpu-features` 被跳过了，删掉 `node_modules` 并在清单就位后重装 |
-| `EBADENGINE` 警告，或 agent-core 运行时抛语法错误 | Node 低于钉住引擎的要求（`>= 22.17.0`） | 用 Node 22 LTS 或更新；Docker 与 CI 都是 22 |
+| `EBADENGINE` 警告，或 agent-core 运行时抛语法错误 | Node 低于钉住引擎的要求（`>= 22.17.0`） | 用 Node 22.17 或更新（lite 存储需要 `>= 22.13`）；Docker 与 CI 用 24 |
+| lite 模式下 `Cannot find module 'node:sqlite'` | 宿主 Node 低于 22.13，内置 SQLite 模块那时还得加 `--experimental-sqlite` 开关 | 换 Node 22.17+，或给宿主加 `--experimental-sqlite`；也可以改回企业级（`storage.mode: enterprise`） |
+| `SQLITE_BUSY` / `database is locked` | 另一个进程（比如 `scripts/migrate.mjs` 的残留）占着写锁，或 `storage.busyTimeoutMs` 太小 | 先把别的进程关掉；`AETHEROPS_SQLITE_BUSY_TIMEOUT_MS` 调大（上限 60000） |
 | 解析 `@cicctencent/agent-core` 时安装失败 | 它被钉死版本、从公共 npm registry 拉取 —— 会过滤包的镜像或防火墙会掐断它 | 为该 scope 放行 `registry.npmjs.org`（或等价的 npmmirror） |
 | "build complete" 之后构建卡住 | `vite build` 在某些环境里会因为 watcher 让进程多活一会儿 | `dist/` 写完之后再 Ctrl-C 是安全的；必须完成的是服务端构建（`tsc -p tsconfig.server.json`） |
 
@@ -156,8 +158,9 @@
   `deleteConnection()` 调用不带 Bearer 令牌（已记录的缺口，见
   [packages/vscode/README.md](../packages/vscode/README.md)）。请在 WebView 里登录并在那边管理连接；这棵树的可靠性
   目前不能当健康检查用。
-- **VS Code：「server did not become ready」并且端口一直没开** —— 扩展启动的是同一套生产后端，若
-  `~/.aetherops/config.json` 的 `database`/`redis` 段是空的，它会以 `[FATAL] 数据库配置不完整` 退出。子进程继承 VS Code
+- **VS Code：「server did not become ready」并且端口一直没开** —— 扩展启动的是同一套生产后端。什么都没配时它会落到
+  lite（无需 MySQL/Redis）；只有你把它指到企业级、而 `~/.aetherops/config.json` 的 `database`/`redis` 段是空的，
+  它才会以 `[FATAL] 数据库配置不完整` 退出。子进程继承 VS Code
   自身的环境（去掉 `NODE_OPTIONS`，因为宿主注入的它会让干净的 Node 启动失败），所以 `AETHEROPS_DB_*` 只有 VS Code
   进程本身带着时才看得到 —— 从桌面图标启动通常不带。请把配置写进配置文件，或者从一个已导出这些变量的 shell 里
   启动 VS Code。真正的原因在 Output 面板 → `[aetherops-server]` 那些行里。
@@ -168,7 +171,7 @@
 
 1. 宿主（web / Electron / VS Code）、版本（`package.json` 里的版本或 release 标签）、运行 AetherOps 的机器 OS，
    如果涉及远端主机还要给出**目标机** OS。
-2. Node、pnpm、MySQL/Redis 版本；MySQL 是否启用了 TLS。
+2. Node、pnpm、MySQL/Redis 版本；MySQL 是否启用了 TLS。lite 模式请给 `storage.mode` 与库文件路径。
 3. `~/.aetherops/server.log` 里相关的那一段（与控制台是同一份文本），前端问题再附浏览器 DevTools 控制台。
 4. 精确的 `[FATAL]` / `[pin]` / `[WS]` / 迁移日志行 —— 它们写出来就是要大声失败的，所以原文引用比描述症状更快。
 5. 复现步骤，并带上你使用的那个账号的权限位，因为大多数「为什么被拒」的回报其实是 pending 账号或权限被收回。

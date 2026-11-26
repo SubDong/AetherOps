@@ -2,12 +2,17 @@
 
 [English](./deployment.md) · **简体中文**
 
-AetherOps 就是一个 Node 进程，外加**两个硬依赖：MySQL 8.x 与 Redis**。没有「单机免依赖」模式 ——
-只要这两个依赖连不上，进程就拒绝绑定端口，所以给这两个服务做容量规划是部署的一部分，不是事后想起来再补的。
+AetherOps 就是一个 Node 进程，需要哪些后端服务是部署时做的选择：
+
+- **lite**（个人默认）—— 不依赖任何外部服务。账号、连接、审计与登录令牌都在数据目录下的一个 SQLite 文件里。
+- **企业级** —— MySQL 8.x 存业务数据，Redis 存登录令牌。二者任一连不上，进程就拒绝绑定端口，所以给这两个服务
+  做容量规划是部署的一部分。
+
+见 [configuration.zh.md](./configuration.zh.md#存储后端lite-sqlite与企业级)。
 
 - [渠道一览](#渠道一览)
 - [前置要求](#前置要求)
-- [准备 MySQL 与 Redis](#准备-mysql-与-redis)
+- [准备 MySQL 与 Redis（企业级）](#准备-mysql-与-redis企业级)
 - [源码构建](#源码构建)
 - [Docker](#docker)
 - [反向代理与 TLS](#反向代理与-tls)
@@ -23,30 +28,34 @@ AetherOps 就是一个 Node 进程，外加**两个硬依赖：MySQL 8.x 与 Red
 | 渠道 | 适用于 | 备注 |
 |------|--------|------|
 | 源码构建 | 开发、定制构建、自己脚本化的离线交付 | `pnpm install --frozen-lockfile` + `pnpm build-only` |
-| Docker | 服务器部署、团队共享实例 | 镜像里只有应用；MySQL 和 Redis 由你提供 |
-| Docker Compose（应用 + 数据库 + 缓存） | 单机试用或小团队 | 下面推荐的起步方案 |
-| Electron 桌面端 | 想要原生窗口的个人用户 | 自带后端；仍然需要这台机器能访问到 MySQL 和 Redis |
+| Docker | 服务器部署、团队共享实例 | 镜像里只有应用；企业级的 MySQL 和 Redis 由你提供，lite 模式什么都不用提供 |
+| Docker Compose（应用 + 数据库 + 缓存） | 单机试用或小团队 | 下面推荐的起步方案（企业级） |
+| Electron 桌面端 | 想要原生窗口的个人用户 | 自带后端；默认落到 lite，不需要 MySQL/Redis，共享数据库时才需两者 |
 | VS Code 插件 | 在 VS Code 里用终端 | 插件里打包了后端运行时；同样的依赖规则 |
 | npm 全局安装 | **未发布** | 根 `package.json` 是 `"private": true`。请从源码或发版产物安装 |
 
-桌面端和 VS Code 这两个渠道很方便，但它们并没有去掉服务端依赖：每个用户仍然需要一个 MySQL 库和一个 Redis
-实例。对团队来说，正确做法是跑一个 Web 实例，让大家把桌面端/VS Code 指向它，或者指向同一个共享数据库。
+桌面端和 VS Code 这两个渠道很方便，而且对个人用户来说已经不再需要任何后端服务：什么都不配时服务会落到
+**lite** 后端（数据目录下的单个 SQLite 文件），账号、连接、审计与登录令牌都存在它里面。需要多台机器共享一份
+数据集时才要**企业级**（MySQL + Redis），见
+[configuration.zh.md](./configuration.zh.md#存储后端lite-sqlite与企业级)。
 
 ## 前置要求
 
 | 组件 | 版本 | 为什么是这个下限 |
 |------|------|------------------|
-| Node.js | **>= 22.17.0** | 由 `@cicctencent/agent-core`（Agent 引擎）要求。Docker 和 CI 都用 Node 22 |
+| Node.js | **>= 22.17.0** | 由 `@cicctencent/agent-core`（Agent 引擎）要求。lite 存储需要 `>= 22.13`（内置 `node:sqlite` 从这一版起不再需要开关）；Docker 镜像与 CI 用 Node 24 |
 | pnpm | **10** | CI、Docker 镜像、钉版检查全都用 10。`pnpm-workspace.yaml` 放着原生模块的构建白名单（10/11 用 `onlyBuiltDependencies`，12+ 用 `allowBuilds`）以及 zmodem 补丁；`package.json#pnpm` 为旧版 pnpm 镜像了其中关键的几项。被 pnpm 11/12 重写过的锁文件会让 CI 的 `--frozen-lockfile` 以 `ERR_PNPM_LOCKFILE_CONFIG_MISMATCH` 失败 |
-| MySQL | 8.x | 迁移假设了 `utf8mb4_0900_ai_ci`、`STRICT_TRANS_TABLES`、`DATETIME(3)` |
-| Redis | 6+（任意近期版本） | 登录令牌存储；`keyPrefix` 让你可以共用一个实例 |
+| MySQL | 8.x | 仅企业级。迁移假设了 `utf8mb4_0900_ai_ci`、`STRICT_TRANS_TABLES`、`DATETIME(3)` |
+| Redis | 6+（任意近期版本） | 仅企业级。登录令牌存储；`keyPrefix` 让你可以共用一个实例 |
 | C++ 工具链 | 用于原生模块 | `node-pty`、`ssh2`、`cpu-features` 需要执行构建脚本：Linux `python3 make g++`，macOS Xcode CLT，Windows VS Build Tools |
 
 构建链是刻意钉死的：`pnpm run check-pin`（由 `build-only` 自动执行）会在 `@cicctencent/agent-core` 或
 `vite` 被声明成版本区间、或与实际安装不一致时让构建失败。见
 [CONTRIBUTING.md](../CONTRIBUTING.md#dependency-pinning)。
 
-## 准备 MySQL 与 Redis
+## 准备 MySQL 与 Redis（企业级）
+
+一个人跑一套实例的话这一节可以整段跳过：lite 模式两者都不需要。
 
 建库并建一个应用账号。应用会在启动时自己跑迁移，所以这个账号需要该库的 DDL 权限；如果你更愿意自己执行
 SQL（`node scripts/migrate.mjs --dump 0001` 之类），那么一个只有 DML 的账号就够了。
@@ -86,6 +95,7 @@ pnpm install --frozen-lockfile
 pnpm run build-only          # 钉版检查 → vite build → tsc -p tsconfig.server.json
 
 # 指向你的 MySQL/Redis（配置文件或环境变量都行）
+export AETHEROPS_STORAGE_MODE=enterprise
 export AETHEROPS_DB_HOST=127.0.0.1
 export AETHEROPS_DB_USER=aetherops
 export AETHEROPS_DB_PASSWORD='change-me'
@@ -120,8 +130,15 @@ node scripts/verify-auth.mjs        # 登录、pending、权限、隔离、单�
 
 ## Docker
 
-镜像是两阶段构建（构建和运行都用 `node:22-slim`，两个阶段里都是 pnpm 10），里面只有应用。MySQL 和 Redis
-**不在**其中。
+镜像是两阶段构建（构建和运行都用 `node:24-slim`，两个阶段里都是 pnpm 10），里面只有应用。MySQL 和 Redis
+**不在**其中 —— 也不必在：lite 后端把全部数据放在数据卷里的一个 SQLite 文件里。
+
+```bash
+docker run -d --name aetherops -p 127.0.0.1:9802:9802 \
+  -e AETHEROPS_STORAGE_MODE=lite \
+  -v aetherops-data:/root/.aetherops \
+  aetherops
+```
 
 ### 一条命令
 
@@ -184,9 +201,9 @@ docker run -d \
 - 构建期的镜像源（Debian 用阿里云、pnpm 与 Electron 用 npmmirror）配置在 Dockerfile 里。如果你在别的
   区域构建，请改那几行；它们在运行期不影响任何东西。也可以用 `--build-arg DEBIAN_MIRROR=...` 临时换源；
   如果容器内访问 apt 源本身就不稳定（实测有 Packages 连接中断、`.deb` 返回 403 的情况），改用
-  `--build-arg BUILD_IMAGE=node:22`：完整镜像自带 python3/make/g++，整段 apt 会被跳过。
+  `--build-arg BUILD_IMAGE=node:24`：完整镜像自带 python3/make/g++，整段 apt 会被跳过。
 
-### 用 Docker Compose 一起拉起 MySQL 与 Redis
+### 用 Docker Compose 一起拉起 MySQL 与 Redis（企业级）
 
 这是在一台机器上得到可用实例的最短路径。这**不是**高可用方案 —— 单实例约束见
 [给 fork 的说明](#给-fork-的说明)。
@@ -403,7 +420,7 @@ pnpm run vscode:package      # build-only → prepare-vscode-runtime → vsce pa
 |----------|----------|------|
 | `.github/workflows/build-vsix.yml` | tag `aetherops-v*` | 在同一个 GitHub Release 上产出 VSIX + win/mac/linux 桌面产物；随后发布到 VS Code Marketplace（`VSCODE_TOKEN`）和 Open VSX（`OVSX_TOKEN`）。在 `master` 推送和 PR 上也会跑，但只作为构建校验任务 |
 | `.github/workflows/build.yml` | tag `v*`，或手动 dispatch 并选择平台 | 只产出桌面产物（备用渠道） |
-| `.github/workflows/verify.yml` | 由上面两条 workflow 调用，因此每个 tag、`master` 推送和 PR 都会跑 | 不产出任何可发布物 —— 它就是门禁：前后端类型检查、七套验证脚本（配一个一次性 MySQL 服务）以及双语文档检查 |
+| `.github/workflows/verify.yml` | 由上面两条 workflow 调用，因此每个 tag、`master` 推送和 PR 都会跑 | 不产出任何可发布物 —— 它就是门禁：前后端类型检查、八套验证脚本（其中四套配一个一次性 MySQL 服务，另加自建临时库的 lite/SQLite 一套）以及双语文档检查 |
 
 还有第三条非 GitHub 的流水线：[`.cnb.yml`](../.cnb.yml) 跑在 CNB 构建平台（<https://cnb.cool>）上。
 它在 `master` 推送时做构建校验，而在 tag 推送时只构建 **Linux** 的 Electron 产物，并把它们发布到一个
@@ -412,7 +429,7 @@ pnpm run vscode:package      # build-only → prepare-vscode-runtime → vsce pa
 
 细节：
 
-- 每个任务都在 pnpm 10 / Node 22 上用 `pnpm install --frozen-lockfile` 安装（VSIX 相关的任务在工具链
+- 每个任务都在 pnpm 10 / Node 24 上用 `pnpm install --frozen-lockfile` 安装（VSIX 相关的任务在工具链
   步骤上用 Node 20，因为它们不跑服务端）。
 - `build-vsix.yml` 与 `build.yml` 都以一个 `verify` 作业起步，它 `uses:` `verify.yml`，后面每个
   产出作业都 `needs:` 它 —— 套件红了就没有 VSIX、没有桌面端产物，也不会发到应用市场。本地等价命令是
@@ -489,9 +506,9 @@ git push origin v0.1.0
   主机）之所以从 `terminal` 里拆出来，正是这个原因。注册这件事**在应用里关不掉** —— 如果实例的可达范围超出
   你的网络，请在代理上封掉 `/api/auth/register`。见
   [accounts-and-permissions.zh.md](./accounts-and-permissions.zh.md#注册与授权)。
-- **分别保护秘密的两半。** MySQL 里放着加密后的凭据；`~/.aetherops/*.key` 里放着解密它们的能力。同时拿到
+- **分别保护秘密的两半。** 数据库里放着加密后的凭据；`~/.aetherops/*.key` 里放着解密它们的能力。同时拿到
   两者的人就能读出所有存储的 SSH 凭据。
-- **审计是数据，不是安全控制。** 命令与传输历史按账号记录在 MySQL 里；它自己不会阻断任何东西，而且删除账号
+- **审计是数据，不是安全控制。** 命令与传输历史按账号记录在数据库里；它自己不会阻断任何东西，而且删除账号
   会连带清除该归属下的所有行 —— 必须先导出的内容，请在移除任何人之前导出。
 - **没有内置的限流与暴力破解防护。** 登录既没有锁定也没有按 IP 节流；请把这一层做在反向代理上。
 - 出站请求仅限于你配置的 AI 服务商、可选的 OpenRouter 价格目录，以及（仅桌面端）GitHub 的 releases 接口。

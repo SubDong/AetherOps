@@ -76,7 +76,7 @@
 - **采不到就说采不到**：每项指标带 `supported` 标记，平台给不出的数据（例如部分 BSD 的 CPU 占用率、
   鸿蒙的 Swap）在界面上显示「无法采集」，历史曲线直接不画 —— 绝不填个 0 装作正常。
 - **面板不是归档**：刷新页面不会把 Agent 能看到的东西一起抹掉，同一套采集器还会把每分钟的聚合写进
-  MySQL —— 见[主机指标留存](#主机指标留存与-query_metrics)。
+  数据库 —— 见[主机指标留存](#主机指标留存与-query_metrics)。
 
 ### 主机指标留存与 `query_metrics`
 
@@ -112,10 +112,10 @@
 - 自助注册落库即 `pending` 且权限全关，等管理员授权后才能用任何功能。
 - 管理端：建号/禁用/重置密码/踢下线；并且作为账号隔离的唯一例外，可查看成员的审计轨迹、文件传输记录、
   连接清单（凭据字段会被剥掉）与在线会话，并可强制断开某个用户。
-- 登录态是 OAuth2 风格的 Bearer 令牌，存在 Redis，TTL 滑动续期，令牌以哈希形式存放，单账号单点登录
-  （新登录会顶掉旧会话）。
-- 口令用 `scrypt` 哈希；SSH 口令/私钥/passphrase 与 AI API Key 进 MySQL 前用 AES-256-GCM 加密
-  （`enc:v1:` 前缀），密钥只落在本地数据目录 —— 只拖走数据库拿不到凭据。
+- 登录态是 OAuth2 风格的 Bearer 令牌，TTL 滑动续期，令牌以哈希形式存放，单账号单点登录
+  （新登录会顶掉旧会话）。企业级存在 Redis，lite 存在 `auth_sessions` 表。
+- 口令用 `scrypt` 哈希；SSH 口令/私钥/passphrase 与 AI API Key 进库前用 AES-256-GCM 加密
+  （`enc:v1:`），密钥只在本地数据目录 —— 单凭一份数据库导出泄露不了凭据。
 
 ### AI 模型管理、自动路由与成本治理
 
@@ -180,7 +180,7 @@
 
 - 对任意远端或本机日志文件 `tail -f`；自动检测 ERROR / FATAL / CRITICAL / Exception / Traceback
   并分级告警；彩色流式输出；一键把最近若干行交给 Agent 分析。
-- **命中的不是一闪而过的行，而是一条能归属到人的记录。** 规则命中会落成 MySQL 里的告警（`open` /
+- **命中的不是一闪而过的行，而是一条能归属到人的记录。** 规则命中会落成数据库里的告警（`open` /
   `acked` / `resolved`，按主机 + 指纹去重并累计 `occurrences`），并可带 HMAC 签名推到
   `alerts.webhookUrl`。面板里一条告警可以**认领**（一步完成确认 + 认领给自己）、**指派**给另一个在线
   账号、**归并**成事件 —— 同一台主机 30 分钟内 3 条未解决告警会自动成组。**值班表**（账号 + 时间段）
@@ -197,7 +197,8 @@
 - **Web**：`node server.js` 开浏览器即用。
 - **Electron 桌面端**（Windows / macOS / Linux）：启动时向 GitHub Releases 检查新版本，只提示不自动下载。
 - **VSCode 插件**：把同一套后端与 SPA 嵌进编辑器，自行拉起 localhost 服务并适配编辑器主题。
-  它启的是同一个生产后端，所以同样需要 `~/.aetherops/config.json` 里配好 MySQL + Redis，并且需要一个账号登录，
+  它启的是同一个生产后端，读的也是同一份 `~/.aetherops/config.json` —— lite 不需要别的，
+  企业级才需要 MySQL + Redis —— 另外需要一个账号登录，
   见 [`packages/vscode`](./packages/vscode/README.md)。
 - **国际化**：中文 / 英文 UI，运行时切换。
 - **CI/CD**：GitHub Actions 产出全平台安装包与 `.vsix`。
@@ -206,14 +207,21 @@
 
 | 组件 | 要求 | 说明 |
 |------|------|------|
-| Node.js | **>= 22.17** | Agent 引擎的 `engines` 要求；CI 与 Docker 镜像均用 Node 22 |
+| Node.js | **>= 22.17** | Agent 引擎的 `engines` 要求。lite 存储需要 `>= 22.13`（内置 `node:sqlite` 从这一版起不再需要开关）；CI 与 Docker 镜像用 Node 24 |
 | 包管理器 | **pnpm 10** | 锁文件、CI、Docker 镜像与 `scripts/check-engine-pin.mjs` 统一认这个大版本。原生模块的构建许可刻意写在两处：`pnpm-workspace.yaml`（pnpm 10/11 读 `onlyBuiltDependencies`，pnpm 12+ 读 `allowBuilds`）与 `package.json#pnpm`（列表更短，但带着补丁声明，供不读 workspace 文件键名的旧 pnpm 使用）。pnpm 11/12 重写过的锁会被 CI 的 pnpm 10 在 `--frozen-lockfile` 下拒绝 |
-| MySQL | 8.x | **硬依赖**，连不上服务不启动 |
-| Redis | 任意近期版本 | **硬依赖**，登录令牌存放在此 |
+| MySQL | 8.x | **仅企业级**（共享实例的默认选择）；lite 模式不用 |
+| Redis | 任意近期版本 | **仅企业级** —— 登录令牌存放在此；lite 模式的令牌就在 SQLite 文件里 |
 | 编译工具 | python3 / make / g++（Linux）、Xcode CLT（macOS）、VS Build Tools（Windows） | 原生模块：node-pty、ssh2、cpu-features |
 
-MySQL 与 Redis 都**不是可选件**：启动时会校验配置、探活两个服务、跑完表结构迁移，然后才绑端口。
-任一不可用就直接退出，并给出可读原因 —— 不会出现「端口开着，但每个查询都报错」这种更难查的中间态。
+存储后端两选一，部署时决定，没有第三种，也不能中途互换：
+
+- **lite**（什么都不配时的默认值）—— 一个 SQLite 文件（`~/.aetherops/aetherops.db`）同时装下
+  账号、连接、会话、审计、告警、指标**和**登录令牌。不用装任何外部服务，备份也就多一个文件。
+- **企业级** —— MySQL 8.x 存业务数据，Redis 存登录令牌。启动时会校验配置、探活两个服务、跑完表结构
+  迁移，然后才绑端口；任一不可用就直接退出并给出可读原因 —— 不会出现「端口开着，但每个查询都报错」这种更难查的中间态。
+
+要用哪种可以写死：`storage.mode`（`auto` / `enterprise` / `lite`）或 `AETHEROPS_STORAGE_MODE`，见
+[docs/configuration.zh.md](./docs/configuration.zh.md#存储后端lite-sqlite与企业级)。
 
 ## 快速开始
 
@@ -230,10 +238,15 @@ pnpm install --frozen-lockfile
 # 3. 构建前端与服务端
 pnpm build
 
-# 4. 指定 MySQL 与 Redis
+# 4. 存储。个人用什么都不用改：没配数据库时服务会自动落到 lite，
+#    并建出 ~/.aetherops/aetherops.db。
+#    要多人/多机共享一份数据，就把后端写死为企业级，并配好 MySQL + Redis。
 #    首次运行会在 ~/.aetherops/config.json 落一份模板（权限 0600），
-#    改 database + redis 两段，或者用环境变量覆盖。
+#    改 storage / database / redis 三段，或者用环境变量覆盖。
 #    端口不是默认值时必须一起给，否则会去连 3306 / 6379：
+# export AETHEROPS_STORAGE_MODE=enterprise
+# export AETHEROPS_STORAGE_MODE=lite      # 或者显式钉住 SQLite 文件
+# export AETHEROPS_SQLITE_PATH=...        # 默认：<数据目录>/aetherops.db
 export AETHEROPS_DB_HOST=127.0.0.1
 export AETHEROPS_DB_PORT=3306
 export AETHEROPS_DB_USER=aetherops
@@ -246,7 +259,7 @@ export AETHEROPS_REDIS_PASSWORD='...'
 #    接管一台已经在用的实例（换机器、搬进容器、连别人搭过的库）时：先把那台机器
 #    数据目录里的 connections.key 与 ai-config.key 拷到本机 ~/.aetherops/ 再启动。
 #    这两把密钥只从文件读，没有环境变量能代替；缺了它们，库里已存的 SSH 口令 /
-#    私钥与 AI Key 会静默解密失败，界面上表现为空值。
+#    私钥与 AI Key 会静默解密失败，界面上表现为空值。lite 模式下的 aetherops.db* 同样要一起拿。
 
 # 5.（可选）让采集器也去采没有开着终端的主机
 #    metrics.offlineSampling 默认是关的：每次采样都是一次真实 SSH 登录，目标机的
@@ -289,7 +302,7 @@ node server.js
 | 方式 | 命令 / 来源 | 适合 |
 |------|-------------|------|
 | 源码构建 | `pnpm install && pnpm build && node server.js` | 目前的主路径 |
-| Docker | `pnpm docker:build`（或 `docker build -t aetherops .`），配合带 MySQL/Redis 的 compose | 服务器部署、团队共用 |
+| Docker | `pnpm docker:build`（或 `docker build -t aetherops .`）；企业级配带 MySQL/Redis 的 compose，lite 单容器即可 | 服务器部署、团队共用 |
 | Electron 桌面端 | `pnpm electron:build:win \| :mac \| :linux` | 想要原生窗口的个人用户 |
 | VSCode 插件 | `pnpm vscode:package` 出 `.vsix`，再「从 VSIX 安装」 | 在编辑器里干活 |
 | GitHub Releases | 推送版本标签后由 CI 产出（beta 版） | 不想本地装工具链 |
@@ -309,7 +322,7 @@ docker run -d -p 9802:9802 -v ~/.aetherops:/root/.aetherops aetherops
 ```
 
 `docker:build` 开跑前会查什么（Dockerfile 要 COPY 的输入、daemon 是否可用、构建上下文有没有
-漏排、工作树是否干净）、把 MySQL、Redis 和应用一起拉起来的 compose 文件、反向代理配置
+漏排、工作树是否干净）、把 MySQL、Redis 和应用一起拉起来的 compose 文件（企业级）、反向代理配置
 （WebSocket 升级是必须的）、以及发版流程，见 [docs/deployment.zh.md](./docs/deployment.zh.md)。
 
 ### CLI
@@ -334,8 +347,9 @@ aetherops stop | restart | -v
 |----|-----|
 | 默认路径 | `~/.aetherops/config.json`（自动生成，权限 0600） |
 | 路径覆盖 | `AETHEROPS_DATA_DIR`（数据目录）/ `AETHEROPS_CONFIG`（直接指定文件） |
-| 配置段 | `server`、`database`、`redis`、`auth`、`debug`、`metrics` |
+| 配置段 | `server`、`storage`、`database`、`redis`、`auth`、`debug`、`metrics` |
 | 端口 / 绑定 | `PORT`、`HOST`（默认 9802 / 127.0.0.1） |
+| 存储后端 | `AETHEROPS_STORAGE_MODE`（`auto` / `enterprise` / `lite`）、`AETHEROPS_SQLITE_PATH`、`AETHEROPS_SQLITE_BUSY_TIMEOUT_MS` |
 | 数据库 | `AETHEROPS_DB_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_NAME` / `_POOL_SIZE` / `_SSL` / `_TZ` / `_SSL_CA` / `_SSL_INSECURE` |
 | Redis | `AETHEROPS_REDIS_URL`，或 `_HOST` / `_PORT` / `_USER` / `_PASSWORD` / `_DB` / `_PREFIX` / `_CONNECT_TIMEOUT_MS` |
 | 其他 | `AETHEROPS_MAX_UPLOAD_MB`（默认 100）、`AETHEROPS_SSH_DEBUG`、`AETHEROPS_LAUNCH_TOKEN`、`AETHEROPS_METRICS_OFFLINE_SAMPLING`（默认关） |
@@ -376,10 +390,11 @@ aetherops stop | restart | -v
 先过权限表再校验会话归属，然后进仓储层 —— `owner_id` 一路显式传递。终端 I/O、AI 流式输出、审计事件共用
 这条 WebSocket，所以面板是实时的。
 
-存储：**MySQL** 存连接、会话、AI 配置/对话/消息/用量/预算、审计、技能、片段（迁移自动执行；
-`node scripts/migrate.mjs --status` 看待执行版本，`--dump <ver>` 导出成纯 SQL 交 DBA）。**Redis** 存登录令牌。
-**数据目录** 存配置模板、两个 AES 密钥文件（`connections.key`、`ai-config.key`）、`server.log`、
-PID 文件与回收站 `.trash/`。
+存储取决于后端。**企业级**下 MySQL 存连接、会话、AI 配置/对话/消息/用量/预算、审计、技能、片段，
+Redis 存登录令牌；**lite** 下同样的表与令牌都在 `~/.aetherops/aetherops.db` 里。两种后端都是迁移自动执行
+（`node scripts/migrate.mjs --status` 看待执行版本，`--dump <ver>` 导出成纯 SQL 交 DBA）。
+**数据目录** 另有配置模板、两个 AES 密钥文件（`connections.key`、`ai-config.key`）、`server.log`、
+PID 文件、SQLite 文件与回收站 `.trash/`。
 
 ## 开发
 
@@ -390,8 +405,8 @@ pnpm build-server     # 仅服务端
 pnpm type-check       # vue-tsc
 pnpm lint             # eslint（含 --fix）
 pnpm check-pin        # 校验钉住的依赖与锁文件版本一致
-pnpm verify           # 跑 scripts/verify-*.mjs 里的全部验证套件（需要 MySQL）
-pnpm verify:offline   # 只跑不需要数据库的三套
+pnpm verify           # 跑 scripts/verify-*.mjs 里的全部验证套件（四套需要 MySQL）
+pnpm verify:offline   # 只跑不需要数据库的四套
 pnpm verify:docs      # 双语文档成对、语言切换行、标题结构、相对链接
 pnpm docker:build     # 打 Docker 镜像（加 -- --dry-run 只看要执行什么命令）
 node scripts/migrate.mjs --status   # 查看库结构状态
@@ -400,14 +415,15 @@ BASE=http://127.0.0.1:9802 ADMIN_USER=admin ADMIN_PASS=... \
   node scripts/verify-auth.mjs   # 登录/权限/隔离/单点登录端到端验证
 ```
 
-`pnpm dev` 同样需要能连上 MySQL 与 Redis（迁移在端口绑定之前跑）。依赖安装请用 pnpm 10 ——
+`pnpm dev` 在 lite 下不需要任何外部服务（绑端口之前会自动把 SQLite 文件建好）；企业级则需要能连上
+MySQL 与 Redis。依赖安装请用 pnpm 10 ——
 `pnpm-workspace.yaml` 里带着原生模块的构建白名单（`onlyBuiltDependencies` / `allowBuilds`）和
 让 `rz`/`sz` 稳定工作的 `zmodem.js` 补丁，跳过它的后果是「装得上、传不了文件」。
 
 `pnpm verify` 就是 CI 跑的那道门禁，它验的是行为而不是形状：`scripts/verify-*.mjs` 里每一套都
 require **编译产物**（`dist/server/**`），所以先 `pnpm build-server`。其中四套要真实 MySQL ——
 它们自己跑迁移、用随机 `verify-*` 前缀写测试行、在 `finally` 里删掉，请指向一个临时库而不是生产库。
-手边没有数据库时，`pnpm verify:offline` 只跑不需要库的三套。`scripts/verify-docs.mjs` 把下文「文档」
+手边没有数据库时，`pnpm verify:offline` 只跑不需要库的四套。`scripts/verify-docs.mjs` 把下文「文档」
 那段的成对规则变成可执行断言。两个发布工作流都会在打包前调用同一道门禁
 （`.github/workflows/verify.yml`），套件不过就不会有 vsix 与桌面端产物。
 
@@ -454,7 +470,7 @@ Agent 拥有真实 shell，因此在执行前有一层拦截：
 | `https://openrouter.ai/api/v1/models` | 刷新模型定价目录（缓存 24 小时，失败缓存 5 分钟） | **可省** —— 拉不到就退化成按模型名推断档位，并把成本显示为「未知」而不是瞎算 |
 | `https://api.github.com/repos/SubDong/AetherOps/releases/latest` | Electron 启动时的版本检查（只提示，且 fork 请改 `electron/updater.js`） | 可省 |
 
-除此之外没有任何遥测。终端输出、对话、审计日志与凭据都留在你自己的 MySQL / Redis / 数据目录里，
+除此之外没有任何遥测。终端输出、对话、审计日志与凭据都留在你自己的数据库 / Redis / 数据目录里，
 没有统计上报，没有崩溃回传，没有云端同步。数据库里的凭据是 AES-256-GCM 密文，密钥只存在于数据目录。
 
 ## 跨平台支持
@@ -494,7 +510,7 @@ Agent 拥有真实 shell，因此在执行前有一层拦截：
   `deleteConnection()` 不带 `Authorization` 头，所以即使后端健康，树节点也会显示 `HTTP 401` 错误项。
   WebView 里的应用本身正常（在那边登录即可），连接管理请走 WebView 这一侧。详情见
   [packages/vscode/README.md](./packages/vscode/README.md)（英文）。
-- **没有高可用模式**：单进程服务 + 一个 Redis + 一个 MySQL。多实例可以共用数据库，
+- **没有高可用模式**：单进程服务 + 一个数据库。多实例可以共用数据库，
   但不协调内存里的终端会话。
 - **Agent 的「历史」只包含这个应用跑过的命令**：`search_audit` 与 `recall_fix` 读的是
   `audit_events` / `error_fingerprints`，记录范围是工具调用与文件传输；直接在终端里手敲的命令
@@ -516,7 +532,7 @@ Agent 拥有真实 shell，因此在执行前有一层拦截：
 |------|---------|------|
 | [getting-started.zh.md](./docs/getting-started.zh.md) | [getting-started.md](./docs/getting-started.md) | 首次启动：建库、初始管理员、权限授权、第一个连接与第一次 AI 对话 |
 | [configuration.zh.md](./docs/configuration.zh.md) | [configuration.md](./docs/configuration.md) | 全部配置项与环境变量、存储布局、迁移 |
-| [deployment.zh.md](./docs/deployment.zh.md) | [deployment.md](./docs/deployment.md) | 带 MySQL/Redis 的 Docker Compose、反向代理、升级、CI 发版 |
+| [deployment.zh.md](./docs/deployment.zh.md) | [deployment.md](./docs/deployment.md) | 带 MySQL/Redis 的 Docker Compose（企业级）或单容器 lite、反向代理、升级、CI 发版 |
 | [accounts-and-permissions.zh.md](./docs/accounts-and-permissions.zh.md) | [accounts-and-permissions.md](./docs/accounts-and-permissions.md) | 角色、10 个权限位、管理员代管、令牌机制 |
 | [ai-models-and-cost.zh.md](./docs/ai-models-and-cost.zh.md) | [ai-models-and-cost.md](./docs/ai-models-and-cost.md) | 多套模型配置、自动路由与成本档位、用量与预算 |
 | [jump-host.zh.md](./docs/jump-host.zh.md) | [jump-host.md](./docs/jump-host.md) | 启动脚本、Agent 转发、多级跳转 |

@@ -13,6 +13,7 @@ files in the data directory that you need to know about before operating it.
 - [Database schema and migrations](#database-schema-and-migrations)
 - [What is stored where](#what-is-stored-where)
 - [Backup and move](#backup-and-move)
+- [Storage backends: lite (SQLite) vs enterprise](#storage-backends-lite-sqlite-vs-enterprise)
 
 ## Where configuration lives
 
@@ -53,7 +54,29 @@ number, `"true"` / `"1"` for a boolean; anything mismatched is ignored with a wa
 | `port` | `9802` | HTTP/WS listen port. CLI `--port` and `PORT` win over this |
 | `host` | `127.0.0.1` | Bind address. Use `0.0.0.0` only behind auth + a network you control. Env: `HOST` (preferred) or `AETHEROPS_HOST` |
 
+### `storage`
+
+Decides where data lands. **A personal / single-host deployment needs neither MySQL nor Redis**: leave
+this section alone and one SQLite file holds accounts, connections, audit, metrics, alerts and login
+tokens.
+
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `mode` | `auto` | `auto` / `enterprise` / `lite`. `auto` = enterprise when any of `database.host`, `redis.host`, `redis.url` is set, lite when all are empty |
+| `sqlitePath` | *empty* | SQLite file path. Empty = `aetherops.db` in the data directory; relative paths resolve against it |
+| `busyTimeoutMs` | `5000` | Write-lock wait budget (ms). Lets the server and `pnpm migrate` queue on the same file instead of failing with `SQLITE_BUSY` |
+
+`mode: auto` exists so **existing deployments do not change behaviour on upgrade**: an instance whose
+config already has `database.host` keeps using MySQL + Redis, and only a fresh install with nothing
+filled in lands on SQLite. Writing `lite` explicitly makes `database` / `redis` ignored with a startup
+warning — no "thinks it is on the remote DB but has been writing a local file all along".
+
+The two modes **cannot be swapped later**: the data is not compatible and there is no built-in
+MySQL → SQLite migration tool. Switching means starting from an empty store.
+
 ### `database`
+
+Only used when `storage.mode=enterprise` (under `auto`, decided by whether `database.host` is set).
 
 | Key | Default | Meaning |
 |-----|---------|---------|
@@ -77,6 +100,9 @@ The template file also carries a `_comment` key (Chinese) that explains what the
 ignored by the loader, and so is any other unrecognized key — with a warning, never silently.
 
 ### `redis`
+
+Only used when `storage.mode=enterprise`: in lite mode login tokens live in the SQLite `auth_sessions`
+table and Redis is never contacted.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
@@ -184,6 +210,9 @@ this section or the `AETHEROPS_ALERTS_*` variables**. The same applies to every 
 | `PORT` | `server.port` | Server reads only `PORT` here |
 | `HOST` / `AETHEROPS_HOST` | `server.host` | `HOST` takes precedence |
 | `AETHEROPS_DATA_DIR` | data directory | Disables the legacy `~/.aicmd` auto-migration |
+| `AETHEROPS_STORAGE_MODE` | `storage.mode` | `auto` / `enterprise` / `lite`; `lite` drops the MySQL / Redis dependency entirely |
+| `AETHEROPS_SQLITE_PATH` | `storage.sqlitePath` | SQLite file path (relative paths resolve against the data directory) |
+| `AETHEROPS_SQLITE_BUSY_TIMEOUT_MS` | `storage.busyTimeoutMs` | Write-lock wait budget (0–60000) |
 | `AETHEROPS_CONFIG` | config file path | Missing file = fatal |
 | `AETHEROPS_DB_HOST` / `AETHEROPS_DB_PORT` / `AETHEROPS_DB_USER` / `AETHEROPS_DB_PASSWORD` / `AETHEROPS_DB_NAME` | `database.*` | Avoid putting secrets on disk |
 | `AETHEROPS_DB_POOL_SIZE` / `AETHEROPS_DB_SSL` / `AETHEROPS_DB_TZ` | `database.connectionLimit` / `.ssl` / `.timezone` | |
@@ -203,7 +232,7 @@ this section or the `AETHEROPS_ALERTS_*` variables**. The same applies to every 
 | `VITE_PORT` | — | Dev-server port only (default 9801) |
 
 AI provider settings (base URL, key, model) are **not** configurable through env: they are
-per-account data stored in MySQL, edited in the UI. There is no `OPENAI_API_KEY` lookup.
+per-account data stored in the database, edited in the UI. There is no `OPENAI_API_KEY` lookup.
 
 ## Storage layout
 
@@ -214,13 +243,20 @@ per-account data stored in MySQL, edited in the UI. There is no `OPENAI_API_KEY`
 ├── ai-config.key                    # AES-256-GCM key for AI provider API keys
 ├── server.log                       # backend log (console output is tee'd here)
 ├── aetherops.server.<port>.pid      # written on listen, removed on SIGINT/SIGTERM
+├── aetherops.db                     # lite only: SQLite main file (accounts, connections, audit, tokens…)
+├── aetherops.db-wal                 # lite only: WAL write-ahead log (merged back on commit)
+├── aetherops.db-shm                 # lite only: WAL shared-memory index
 └── .trash/                          # delete-protection recovery bin
     └── _del_<epoch>_<name>
 ```
 
+In lite mode the three `aetherops.db*` files are **one unit**: backup and move them together.
+Copying only the main file can lose commits made after the last checkpoint.
+
 `connections.json`, `sessions.json`, `ai-config.json`, `ai-history/` and `audit/*.jsonl` are the
-**former** storage of upstream AICmd. They are no longer written: that data now lives in MySQL.
-The directory may still contain them if you migrated from a single-user build.
+**former** storage of upstream AICmd. They are no longer written: that data now lives in the
+database (MySQL, or `aetherops.db` in lite mode). The directory may still contain them if you
+migrated from a single-user build.
 
 The two `.key` files are read from the data directory only — **no** environment variable or
 `config.json` key can supply them (`AETHEROPS_DATA_DIR` changes the directory, not the filenames).
@@ -250,6 +286,7 @@ statement text with whitespace normalized.
 | `0010-alerts` | New `alerts` (stateful alerts: `open` / `acked` / `resolved`, deduplicated by owner + connection + fingerprint through the generated column `open_key`) and `alert_mutes` (rule-level silence windows) |
 | `0011-collaboration` | `alerts.assignee_id` / `alerts.incident_id` plus `idx_alerts_assignee` / `idx_alerts_incident`; new `incidents` (one row per owner / connection event, `open` / `resolved`, `alert_count` refreshed from the alerts table) and `alert_oncall` (account + minute-of-day shift, primary key `(owner_id, user_id, start_minute)`) |
 | `0012-watch-tokens` | New `auth_watch_tokens`: one row per wallboard read-only token (`owner_id`, `label`, `token_hash`, `created_at`, `expires_at`, `revoked_at`, `last_used_at`). It is a table rather than Redis because such tokens must be listable and individually revocable, and must **not** consume the "one login session per account" slot |
+| `0013-auth-sessions` | New `auth_sessions`: the login tokens used in lite mode (`token_hash` primary key, `user_id` unique index, `payload`, `issued_at`, `expires_at`). The table is created on MySQL too, so both backends share one migration chain; enterprise tokens still go to Redis |
 
 Schema constraints worth knowing if you intend to add a migration:
 
@@ -268,6 +305,22 @@ Schema constraints worth knowing if you intend to add a migration:
 - `owner_id` columns have no default: a missing owner should fail loudly under strict mode rather
   than silently writing `''`, which produces rows nobody can query.
 
+In lite mode the migration chain has a different shape (every difference is confined to the
+dispatch in `server/db/migrate.ts`):
+
+- A fresh database executes a **merged baseline** (`server/db/sqlite-schema.ts`, the final shape of
+  0001–0012) instead of replaying those twelve migrations — their `information_schema` +
+  `PREPARE` dynamic DDL and `FULLTEXT` have no SQLite equivalent.
+- 0001–0012 are recorded as applied but not replayed; an extra `0000-baseline` row stores the
+  baseline checksum, and editing the baseline after release makes startup fail (drift guard).
+- From 0013 on both sides run the same chain: the translatable DDL/DML is handled by
+  `server/db/dialect.ts` (`ON DUPLICATE KEY UPDATE` → `ON CONFLICT … DO UPDATE`, `GREATEST` →
+  `MAX`, `VALUES(col)` → `excluded.col`, `DATE_FORMAT` registered as a custom function); anything
+  it cannot translate (dynamic DDL, multi-column `ALTER`, `FULLTEXT`) gets a `sqliteSql` field in
+  the migration itself.
+- Concurrency protection switches from MySQL `GET_LOCK` to `BEGIN IMMEDIATE`; SQLite DDL also runs
+  inside a transaction, so a failed migration really rolls back.
+
 CLI:
 
 ```bash
@@ -281,21 +334,21 @@ node scripts/migrate.mjs --force     # ignore checksum mismatch / already-applie
 
 | Data | Store | Encrypted? |
 |------|-------|-----------|
-| SSH connections (host, user, auth type, startup script) | MySQL `connections` (owner-scoped) | Passwords / keys / passphrases as `enc:v1:` AES-256-GCM |
-| Terminal session metadata | MySQL `sessions` | no |
-| AI provider profiles (base URL, model, temperature, tier, prices) | MySQL `ai_config` | API key as `enc:v1:` |
-| Conversations and messages | MySQL `ai_chats`, `ai_history`, `ai_messages` | no |
-| Token usage and cost | MySQL `ai_usage` | no |
-| Budget caps | MySQL `ai_budget` | no |
-| Audit events (commands, transfers, blocked/rewritten) | MySQL `audit_events` | no |
-| Skills | MySQL `skills` (user, written from the skills editor) + files in `<app>/data/skills/*.md` (built-in) | no |
-| Command snippets | MySQL `snippets` | no |
-| Host metrics history (per-minute CPU / memory / disk / load) | MySQL `host_metrics_minute` (owner-scoped) | no |
-| Error fingerprints (one row per owner / connection / normalized error) | MySQL `error_fingerprints` | no |
-| Alerts, rule-level mutes, incidents and the on-call roster | MySQL `alerts` (with `assignee_id` / `incident_id`), `alert_mutes`, `incidents`, `alert_oncall` (owner-scoped) | no |
-| Accounts (scrypt hash, role, status, 10 permission bits) | MySQL `users` | password hash only, irreversible |
-| Login tokens | Redis (`aetherops:token:*`, hashed, sliding TTL) | n/a |
-| Wallboard read-only tokens | MySQL `auth_watch_tokens` (owner-scoped, SHA-256 hash only) | n/a; the cleartext appears once, in the issue response |
+| SSH connections (host, user, auth type, startup script) | `connections` (enterprise MySQL / lite SQLite, owner-scoped) | Passwords / keys / passphrases as `enc:v1:` AES-256-GCM |
+| Terminal session metadata | `sessions` | no |
+| AI provider profiles (base URL, model, temperature, tier, prices) | `ai_config` | API key as `enc:v1:` |
+| Conversations and messages | `ai_chats`, `ai_history`, `ai_messages` | no |
+| Token usage and cost | `ai_usage` | no |
+| Budget caps | `ai_budget` | no |
+| Audit events (commands, transfers, blocked/rewritten) | `audit_events` | no |
+| Skills | `skills` (user, written from the skills editor) + files in `<app>/data/skills/*.md` (built-in) | no |
+| Command snippets | `snippets` | no |
+| Host metrics history (per-minute CPU / memory / disk / load) | `host_metrics_minute` (owner-scoped) | no |
+| Error fingerprints (one row per owner / connection / normalized error) | `error_fingerprints` | no |
+| Alerts, rule-level mutes, incidents and the on-call roster | `alerts` (with `assignee_id` / `incident_id`), `alert_mutes`, `incidents`, `alert_oncall` (owner-scoped) | no |
+| Accounts (scrypt hash, role, status, 10 permission bits) | `users` | password hash only, irreversible |
+| Login tokens | Enterprise: Redis (`aetherops:token:*`); lite: the `auth_sessions` table | SHA-256 hash only |
+| Wallboard read-only tokens | `auth_watch_tokens` (owner-scoped, SHA-256 hash only) | n/a; the cleartext appears once, in the issue response |
 | Decryption keys | data dir `*.key` files | these **are** the secrets |
 | Server log, PID file, trash | data dir | no |
 
@@ -303,19 +356,25 @@ Practical consequences:
 
 - The database dump alone does not expose credentials; the `.key` files do. Keep them out of any
   export that leaves your machine, and back them up separately from the database.
-- Anyone with MySQL *and* the data directory can read every stored SSH credential. That is the
-  normal threat model for a credential store; protect both accordingly.
+- Anyone with the database *and* the data directory can read every stored SSH credential. That is
+  the normal threat model for a credential store; protect both accordingly.
 - Live terminal sessions are in-process state. Restarting the server closes them; the persisted
   metadata lets the UI restore tabs, not the shell itself.
 
 ## Backup and move
 
-Back up both halves together:
+Back up both halves together (enterprise):
 
 ```bash
 mysqldump --single-transaction aetherops | gzip > aetherops-db.sql.gz
 tar czf aetherops-data.tar.gz -C ~ .aetherops
 ```
+
+In lite mode there are no "two halves": the database sits inside the data directory, so
+`aetherops.db*` and the two `.key` files must be taken together. Copying while the server runs is
+safe (WAL mode), but then include `-wal` / `-shm`; alternatively stop the server first (on exit it
+runs `wal_checkpoint(TRUNCATE)` to merge the WAL back, after which a single `aetherops.db` is a
+complete snapshot).
 
 Restoring elsewhere requires the same `schema_version` rows (they come with the dump), so do not
 hand-edit applied migrations. If you move the data directory, keep file modes: `config.json` should
@@ -324,3 +383,76 @@ be `0600`.
 Legacy note: if `~/.aicmd` exists and `~/.aetherops` is empty, the first start moves it (falling
 back to copy across devices and leaving `~/.aicmd.migrated.bak`). The `.key` files move with it, so
 stored credentials remain decryptable. Setting `AETHEROPS_DATA_DIR` suppresses the move entirely.
+
+## Storage backends: lite (SQLite) vs enterprise
+
+Two backends, picked at deploy time:
+
+| | lite (default) | enterprise |
+|---|---|---|
+| Business data | `aetherops.db` in the data directory (SQLite) | MySQL 8.x |
+| Login tokens | `auth_sessions` table in the same file | Redis (`aetherops:token:*`) |
+| External dependencies | **none** (zero backend services, single process) | MySQL + Redis |
+| Fits | One person, one machine, offline setups, desktop / VSCode hosts | Many machines or users sharing data, central backups, an existing DBA |
+| Backup | Copy the three `aetherops.db*` files + the two `.key` files | `mysqldump` + Redis RDB/AOF + the data directory |
+
+### How to choose
+
+You usually don't have to:
+
+```
+# nothing configured  -> falls back to lite (a SQLite file)
+# any of database.host / redis.host / redis.url set -> enterprise
+```
+
+To pin it down, edit `config.json`:
+
+```jsonc
+{
+  "storage": {
+    "mode": "lite",          // auto | enterprise | lite
+    "sqlitePath": "",        // empty = <data dir>/aetherops.db
+    "busyTimeoutMs": 5000
+  }
+}
+```
+
+Or use environment variables only (recommended in containers):
+
+```bash
+# lite: one container, one volume, no MySQL/Redis
+AETHEROPS_STORAGE_MODE=lite
+AETHEROPS_DATA_DIR=/data/aetherops
+
+# enterprise
+AETHEROPS_STORAGE_MODE=enterprise
+AETHEROPS_DB_HOST=mysql.internal
+AETHEROPS_DB_USER=aetherops
+AETHEROPS_DB_PASSWORD=***
+AETHEROPS_REDIS_HOST=redis.internal
+```
+
+### Boundaries and caveats
+
+- **Node ≥ 22.13 at runtime**: lite uses the built-in `node:sqlite`, which lost its
+  `--experimental-sqlite` flag in 22.13, so every supported Node (the floor is 22.17) has it. No
+  `better-sqlite3`-style native module, so no rebuild problems. The official Docker image and CI are
+  on Node 24, the current LTS.
+- **Modes cannot be swapped later**: each backend has its own schema and there is no built-in
+  MySQL → SQLite migration tool. Switching modes means a fresh empty database (accounts,
+  connections and audit history all start over).
+- **Writes are serialized**: SQLite admits one writer at a time (`busyTimeoutMs` decides how long
+  to wait before reporting `SQLITE_BUSY`). Fine for one person / one machine; a dozen people sharing
+  one dataset should use the enterprise backend.
+- **Full-text search degrades to `LIKE`**: the audit keyword search uses the ngram full-text index
+  on enterprise and plain `LIKE` on lite (no index, relying on a small dataset).
+- **Session tokens survive restarts**: this is a behavioral difference from the Redis version — on a
+  single machine the process restarts far more often than Redis does, so lite stores `expires_at`
+  in the table instead of relying on in-process state.
+
+### Verify
+
+```bash
+pnpm build-server
+node scripts/verify-storage-lite.mjs   # builds a temp DB, runs schema/migrations/repos/tokens, self-cleans
+```

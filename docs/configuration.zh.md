@@ -12,6 +12,7 @@ AetherOps 只有一份配置文件、一套环境变量命名空间，以及数�
 - [表结构与迁移](#表结构与迁移)
 - [什么数据存在哪儿](#什么数据存在哪儿)
 - [备份与搬迁](#备份与搬迁)
+- [存储后端：lite（SQLite）与企业级](#存储后端lite-sqlite与企业级)
 
 ## 配置放在哪里
 
@@ -49,7 +50,26 @@ AetherOps 只有一份配置文件、一套环境变量命名空间，以及数�
 | `port` | `9802` | HTTP/WS 监听端口。CLI 的 `--port` 与环境变量 `PORT` 优先于它 |
 | `host` | `127.0.0.1` | 绑定地址。只有在认证之后、且网络归你控制时才用 `0.0.0.0`。环境变量：`HOST`（优先）或 `AETHEROPS_HOST` |
 
+### `storage`
+
+决定数据落在哪里。**个人/单机部署不需要 MySQL 和 Redis**：留空这一段，服务会用一个 SQLite 文件把
+账号、连接、审计、指标、告警、令牌全部装下。
+
+| 键 | 默认值 | 含义 |
+|----|--------|------|
+| `mode` | `auto` | `auto` / `enterprise` / `lite`。`auto` = `database.host`、`redis.host`、`redis.url` 三者任一有值就当企业级，全空则 lite |
+| `sqlitePath` | *空* | SQLite 文件路径。留空 = 数据目录下的 `aetherops.db`；相对路径按数据目录解析 |
+| `busyTimeoutMs` | `5000` | 写锁等待上限（毫秒）。服务端与 `pnpm migrate` 同时打开同一个文件时靠它排队，而不是立刻抛 `SQLITE_BUSY` |
+
+`mode: auto` 是为了**老部署升级后行为不变**：配置文件里已经有 `database.host` 的实例仍然连 MySQL +
+Redis，只有「什么都没配」的新装机才会落到 SQLite。显式写 `lite` 时，`database` / `redis` 段会被忽略并
+打一条警告 —— 避免出现「以为在连远端库、其实一直写本地文件」。
+
+两种模式**不能中途互换**：数据不通用，也没有内置的 MySQL → SQLite 迁移工具。换模式等于换一套空库。
+
 ### `database`
+
+仅 `storage.mode=enterprise` 时生效（`auto` 下由 `database.host` 是否有值决定）。
 
 | 键 | 默认值 | 含义 |
 |----|--------|------|
@@ -72,6 +92,8 @@ AetherOps 只有一份配置文件、一套环境变量命名空间，以及数�
 键 —— 但会给出警告，绝不静默。
 
 ### `redis`
+
+仅 `storage.mode=enterprise` 时生效：lite 模式下登录令牌存在 SQLite 的 `auth_sessions` 表里，不连 Redis。
 
 | 键 | 默认值 | 含义 |
 |----|--------|------|
@@ -165,6 +187,9 @@ AetherOps 实际连上的那台机器 —— 也就是跳板机本身，和状�
 | `PORT` | `server.port` | 服务端这一段只读 `PORT` |
 | `HOST` / `AETHEROPS_HOST` | `server.host` | `HOST` 优先 |
 | `AETHEROPS_DATA_DIR` | 数据目录 | 设置后会禁用旧的 `~/.aicmd` 自动搬迁 |
+| `AETHEROPS_STORAGE_MODE` | `storage.mode` | `auto` / `enterprise` / `lite`；写 `lite` 即完全不依赖 MySQL / Redis |
+| `AETHEROPS_SQLITE_PATH` | `storage.sqlitePath` | SQLite 文件路径（相对路径按数据目录解析） |
+| `AETHEROPS_SQLITE_BUSY_TIMEOUT_MS` | `storage.busyTimeoutMs` | 写锁等待上限（0–60000） |
 | `AETHEROPS_CONFIG` | 配置文件路径 | 文件不存在即为致命错误 |
 | `AETHEROPS_DB_HOST` / `AETHEROPS_DB_PORT` / `AETHEROPS_DB_USER` / `AETHEROPS_DB_PASSWORD` / `AETHEROPS_DB_NAME` | `database.*` | 避免把密钥写到磁盘上 |
 | `AETHEROPS_DB_POOL_SIZE` / `AETHEROPS_DB_SSL` / `AETHEROPS_DB_TZ` | `database.connectionLimit` / `.ssl` / `.timezone` | |
@@ -195,9 +220,15 @@ AI 服务商的设置（Base URL、Key、模型）**不能**通过环境变量�
 ├── ai-config.key                    # AI 服务商 API Key 的 AES-256-GCM 密钥
 ├── server.log                       # 后端日志（控制台输出会同步写到这里）
 ├── aetherops.server.<port>.pid      # 端口绑定时写入，SIGINT/SIGTERM 时清理
+├── aetherops.db                     # 仅 lite：SQLite 主文件（含账号、连接、审计、令牌…）
+├── aetherops.db-wal                 # 仅 lite：WAL 预写日志（提交后会被归并回主文件）
+├── aetherops.db-shm                 # 仅 lite：WAL 的共享内存索引
 └── .trash/                          # 删除保护的回收入口
     └── _del_<epoch>_<name>
 ```
+
+lite 模式下的三个 `aetherops.db*` 文件是**一体**的：备份/搬迁必须一起拿，只拷主文件可能丢掉最后一个
+检查点之前的提交。
 
 `connections.json`、`sessions.json`、`ai-config.json`、`ai-history/`、`audit/*.jsonl` 是上游 AICmd
 **过去**的存储形态，现在不再写入：这些数据已经在 MySQL 里了。如果你是从单用户版本迁过来的，目录里可能
@@ -228,6 +259,7 @@ AI 服务商的设置（Base URL、Key、模型）**不能**通过环境变量�
 | `0010-alerts` | 新增 `alerts`（有状态告警：`open` / `acked` / `resolved`，靠生成列 `open_key` 按归属 + 连接 + 指纹去重）与 `alert_mutes`（规则级静默窗口） |
 | `0011-collaboration` | `alerts.assignee_id` / `alerts.incident_id` 两列，另加 `idx_alerts_assignee` / `idx_alerts_incident`；新增 `incidents`（每个归属 / 连接的事件一行，`open` / `resolved`，`alert_count` 以 alerts 表为准刷新）与 `alert_oncall`（账号 + 一天中的分钟班次，主键 `(owner_id, user_id, start_minute)`） |
 | `0012-watch-tokens` | 新增 `auth_watch_tokens`：大屏只读令牌一行一枚（`owner_id`、`label`、`token_hash`、`created_at`、`expires_at`、`revoked_at`、`last_used_at`）。单独一张表而不是塞 Redis，是因为它要能被列出、被单独吊销，并且**不能**挤占「一账号一登录会话」的名额 |
+| `0013-auth-sessions` | 新增 `auth_sessions`：lite 模式下的登录令牌（`token_hash` 主键、`user_id` 唯一索引、`payload`、`issued_at`、`expires_at`）。MySQL 侧也建这张表，两种后端共用一条迁移链；企业级的令牌仍写 Redis |
 
 如果你打算加迁移，这些表结构约束值得先知道：
 
@@ -243,6 +275,16 @@ AI 服务商的设置（Base URL、Key、模型）**不能**通过环境变量�
   都可重入。
 - `owner_id` 列没有默认值：在严格模式下，漏了归属应当大声失败，而不是静默写入 `''` 造出谁也查不到的行。
 
+lite 模式下的迁移链形状不同（差异全部收在 `server/db/migrate.ts` 的分派里）：
+
+- 首次建库执行一份**合并基线**（`server/db/sqlite-schema.ts`，0001–0012 的最终形态），而不是重放那 12 个迁移 ——
+  它们用的 `information_schema` + `PREPARE` 动态 DDL、`FULLTEXT` 在 SQLite 上没有等价写法。
+- 0001–0012 只登记不重放，另记一行 `0000-baseline` 存基线 checksum；基线发布后再改会被启动拒绝（防漂移）。
+- 0013 起两边走同一条链：能自动翻译的 DDL/DML 由 `server/db/dialect.ts` 处理
+  （`ON DUPLICATE KEY UPDATE` → `ON CONFLICT … DO UPDATE`、`GREATEST` → `MAX`、`VALUES(col)` → `excluded.col`、
+  `DATE_FORMAT` 注册为自定义函数）；翻译不了的（动态 DDL / 多列 `ALTER` / `FULLTEXT`）就在迁移里补 `sqliteSql` 字段。
+- 并发保护从 MySQL 的 `GET_LOCK` 换成 `BEGIN IMMEDIATE`；而且 SQLite 的 DDL 在事务里，失败能真回滚。
+
 命令行：
 
 ```bash
@@ -256,21 +298,21 @@ node scripts/migrate.mjs --force     # 忽略 checksum 不一致 / 已应用的�
 
 | 数据 | 存储位置 | 是否加密 |
 |------|----------|----------|
-| SSH 连接（主机、用户、认证方式、启动脚本） | MySQL `connections`（按归属隔离） | 密码 / 私钥 / passphrase 为 `enc:v1:` AES-256-GCM |
-| 终端会话元数据 | MySQL `sessions` | 否 |
-| AI 服务商配置（Base URL、模型、温度、档位、价格） | MySQL `ai_config` | API Key 为 `enc:v1:` |
-| 对话与消息 | MySQL `ai_chats`、`ai_history`、`ai_messages` | 否 |
-| Token 用量与成本 | MySQL `ai_usage` | 否 |
-| 预算上限 | MySQL `ai_budget` | 否 |
-| 审计事件（命令、传输、被拦截/被改写） | MySQL `audit_events` | 否 |
-| 技能 | MySQL `skills`（用户技能，从技能编辑器写入）+ `<app>/data/skills/*.md`（内置技能） | 否 |
-| 命令片段 | MySQL `snippets` | 否 |
-| 主机指标历史（每分钟的 CPU / 内存 / 磁盘 / load） | MySQL `host_metrics_minute`（按归属隔离） | 否 |
-| 错误指纹（每个归属 / 连接 / 归一化错误一行） | MySQL `error_fingerprints` | 否 |
-| 告警、规则级静默、事件与值班表 | MySQL `alerts`（含 `assignee_id` / `incident_id`）、`alert_mutes`、`incidents`、`alert_oncall`（按归属隔离） | 否 |
-| 账号（scrypt 哈希、角色、状态、10 个权限位） | MySQL `users` | 只存口令哈希，不可逆 |
-| 登录令牌 | Redis（`aetherops:token:*`，哈希存储，滑动 TTL） | 不适用 |
-| 大屏只读令牌 | MySQL `auth_watch_tokens`（按归属隔离，存 SHA-256 哈希） | 不适用；明文只在签发响应里出现一次 |
+| SSH 连接（主机、用户、认证方式、启动脚本） | `connections`（企业级 MySQL / lite SQLite，按归属隔离） | 密码 / 私钥 / passphrase 为 `enc:v1:` AES-256-GCM |
+| 终端会话元数据 | `sessions` | 否 |
+| AI 服务商配置（Base URL、模型、温度、档位、价格） | `ai_config` | API Key 为 `enc:v1:` |
+| 对话与消息 | `ai_chats`、`ai_history`、`ai_messages` | 否 |
+| Token 用量与成本 | `ai_usage` | 否 |
+| 预算上限 | `ai_budget` | 否 |
+| 审计事件（命令、传输、被拦截/被改写） | `audit_events` | 否 |
+| 技能 | `skills`（用户技能，从技能编辑器写入）+ `<app>/data/skills/*.md`（内置技能） | 否 |
+| 命令片段 | `snippets` | 否 |
+| 主机指标历史（每分钟的 CPU / 内存 / 磁盘 / load） | `host_metrics_minute`（按归属隔离） | 否 |
+| 错误指纹（每个归属 / 连接 / 归一化错误一行） | `error_fingerprints` | 否 |
+| 告警、规则级静默、事件与值班表 | `alerts`（含 `assignee_id` / `incident_id`）、`alert_mutes`、`incidents`、`alert_oncall`（按归属隔离） | 否 |
+| 账号（scrypt 哈希、角色、状态、10 个权限位） | `users` | 只存口令哈希，不可逆 |
+| 登录令牌 | 企业级：Redis（`aetherops:token:*`）；lite：`auth_sessions` 表 | 只存 SHA-256 哈希 |
+| 大屏只读令牌 | `auth_watch_tokens`（按归属隔离，存 SHA-256 哈希） | 不适用；明文只在签发响应里出现一次 |
 | 解密密钥 | 数据目录下的 `*.key` 文件 | 这些**就是**秘密本身 |
 | 服务日志、PID 文件、回收站 | 数据目录 | 否 |
 
@@ -283,12 +325,16 @@ node scripts/migrate.mjs --force     # 忽略 checksum 不一致 / 已应用的�
 
 ## 备份与搬迁
 
-两半要一起备份：
+两半要一起备份（企业级）：
 
 ```bash
 mysqldump --single-transaction aetherops | gzip > aetherops-db.sql.gz
 tar czf aetherops-data.tar.gz -C ~ .aetherops
 ```
+
+lite 模式下没有「两半」—— 数据库就在数据目录里，`aetherops.db*` 与两个 `.key` 必须一起拿。
+服务不停也能安全拷（WAL 模式），但要连 `-wal` / `-shm` 一起拷；或者先停服务（退出时会做
+`wal_checkpoint(TRUNCATE)` 把 WAL 并回主文件，之后单个 `aetherops.db` 就是完整快照）。
 
 在别处恢复时需要同样的 `schema_version` 行（它们随 dump 一起走），所以不要手改已应用的迁移。搬迁数据目录
 时保留文件权限：`config.json` 应当是 `0600`。
@@ -296,3 +342,72 @@ tar czf aetherops-data.tar.gz -C ~ .aetherops
 旧数据说明：如果存在 `~/.aicmd` 且 `~/.aetherops` 为空，首次启动会把它搬过去（跨设备时退化为复制，并把原目录留成
 `~/.aicmd.migrated.bak`）。`.key` 文件跟着一起搬，所以已保存的凭据搬迁后仍可解密。设置了 `AETHEROPS_DATA_DIR`
 则完全不做搬迁。
+
+## 存储后端：lite（SQLite）与企业级
+
+两套后端，部署时二选一：
+
+| | lite（默认） | 企业级 |
+|---|---|---|
+| 业务数据 | 数据目录下的 `aetherops.db`（SQLite） | MySQL 8.x |
+| 登录令牌 | 同一文件的 `auth_sessions` 表 | Redis（`aetherops:token:*`） |
+| 外部依赖 | **无**（零后端服务，单个可执行文件） | MySQL + Redis |
+| 适用 | 个人、单机、离线环境、桌面/VSCode 宿主 | 多机/多人共享、需要集中备份、已有 DBA |
+| 备份 | 拷 3 个 `aetherops.db*` + 2 个 `.key` | `mysqldump` + Redis RDB/AOF + 数据目录 |
+
+### 怎么选
+
+不用选：
+
+```
+# 什么都不配 → 自动落到 lite（SQLite 文件）
+# 配了 database.host / redis.host / redis.url 任一项 → 自动走企业级
+```
+
+要写死就改 `config.json`：
+
+```jsonc
+{
+  "storage": {
+    "mode": "lite",          // auto | enterprise | lite
+    "sqlitePath": "",        // 留空 = <数据目录>/aetherops.db
+    "busyTimeoutMs": 5000
+  }
+}
+```
+
+或只用环境变量（容器里推荐）：
+
+```bash
+# 轻量级：一个容器 + 一个卷，不需要 MySQL/Redis
+AETHEROPS_STORAGE_MODE=lite
+AETHEROPS_DATA_DIR=/data/aetherops
+
+# 企业级
+AETHEROPS_STORAGE_MODE=enterprise
+AETHEROPS_DB_HOST=mysql.internal
+AETHEROPS_DB_USER=aetherops
+AETHEROPS_DB_PASSWORD=***
+AETHEROPS_REDIS_HOST=redis.internal
+```
+
+### 边界与注意事项
+
+- **运行期需要 Node ≥ 22.13**：SQLite 用的是内置的 `node:sqlite`，它在 22.13 去掉了
+  `--experimental-sqlite` 开关，所以本项目的下限（22.17）已经能直接用。不需要装 `better-sqlite3`
+  之类原生模块，也没有 rebuild 问题。官方 Docker 镜像与 CI 用 Node 24（当前 LTS）。
+- **不能中途换模式**：两种后端的 schema 各自独立，没有内置的 MySQL → SQLite 迁移工具。换模式等于换一套
+  空库（账号、连接、审计全部从零开始）。
+- **写并发是串行的**：SQLite 一次只允许一个写者（`busyTimeoutMs` 决定等待多久才报 `SQLITE_BUSY`）。
+  适合「一个人/一台机」的部署；十几个人共用一套数据请上企业级。
+- **全文检索退化为 `LIKE`**：审计页的关键词搜索在企业级走 ngram 全文索引，在 lite 下只走 `LIKE`
+  （无索引，靠数据量小）。
+- **会话令牌落库后重启不掉线**：这是与 Redis 版的一个行为差异 —— 单机部署重启 Redis 的概率比重启库高，
+  所以 lite 的令牌存 `expires_at` 而不是依赖进程内状态。
+
+### 验证
+
+```bash
+pnpm build-server
+node scripts/verify-storage-lite.mjs   # 临时目录建库，跑建表/迁移/仓储/令牌全链路，跑完自删
+```

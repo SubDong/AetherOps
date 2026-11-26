@@ -18,7 +18,7 @@ master:
   push:
     - name: build-verify
       docker:
-        image: node:22
+        image: node:24
         volumes:
           - pnpm-store:/root/.local/share/pnpm/store/v3:rw
       env:
@@ -63,7 +63,7 @@ $:
   tag_push:
     - name: build-electron-release
       docker:
-        image: node:22
+        image: node:24
         volumes:
           - pnpm-store:/root/.local/share/pnpm/store/v3:rw
       env:
