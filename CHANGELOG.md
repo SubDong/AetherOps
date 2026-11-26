@@ -5,17 +5,48 @@ All notable changes to AetherOps are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Unreleased items are what `master` contains beyond the last tagged version. `v0.0.1-beta.1` (2026-11-10)
-was the first tag and `v0.1.0` the second; the latter is also where the version number was reset to this
+was the first tag and `v0.1.0` the second; `v0.1.0` is also where the version number was reset to this
 project's own scheme, so the `1.0.26` section below is a snapshot of what the fork inherited, not a
-predecessor release. Version numbers are plain `major.minor.patch` with no `-beta` suffix, because the
-built-in update check compares them numerically (`Number("0-beta")` is `NaN`, so a suffix silently means
-"already up to date"); beta status is carried by the `0.x` line and the release label. Record the tag —
-or the commit, for a build that predates one — that you run.
+predecessor release. `v0.1.5` (2026-11-26) is the third and carries everything below it. Version numbers
+are plain `major.minor.patch` with no `-beta` suffix, because the built-in update check compares them
+numerically (`Number("0-beta")` is `NaN`, so a suffix silently means "already up to date"); beta status
+is carried by the `0.x` line and the release label. Record the tag — or the commit, for a build that
+predates one — that you run.
 
 ## [Unreleased]
 
+## [0.1.5] — 2026-11-26
+
 ### Added
 
+- **A lite storage backend: one SQLite file instead of MySQL + Redis.** `storage.mode` now picks the
+  backend per deployment — `enterprise` keeps the existing MySQL + Redis pair, `lite` puts business
+  data *and* login tokens in a single `aetherops.db`, and the default `auto` resolves to `lite` when
+  neither `database.host` nor `redis.host` / `redis.url` is set, so a personal install configures
+  nothing at all. The dispatch sits in `server/db/pool.ts`: all 20 repositories keep calling
+  `query` / `execute` / `queryOne` and were not touched. The SQL differences are translated in
+  `server/db/dialect.ts` — `ON DUPLICATE KEY UPDATE` → `ON CONFLICT … DO UPDATE`, `VALUES(col)` →
+  `excluded.col`, `GREATEST` → `MAX`, `INSERT IGNORE` → `INSERT OR IGNORE`, `CAST(… AS UNSIGNED)` →
+  `… AS INTEGER`, `DATE_FORMAT` registered as a function — with time columns stored as fixed-width UTC
+  text and mapped back to `Date` on read, so the same rows mean the same thing on both sides. Login
+  tokens move behind a `TokenStore` (`server/db/token-store.ts`): Redis Lua in enterprise, an
+  `auth_sessions` table with a `user_id` unique index in lite, both reproducing single-session takeover
+  and sliding renewal. Migrations `0001`–`0012` are not replayed on SQLite: a fresh file executes one
+  merged baseline (`server/db/sqlite-schema.ts`) and records `0000-baseline` (checksum kept, so drift
+  is still caught) plus the twelve versions as applied; `0013` onwards is one shared chain, and the
+  concurrency guard switches from `GET_LOCK` to `BEGIN IMMEDIATE`. **Boundary:** it uses the built-in
+  `node:sqlite`, so there is no native module and no rebuild step — that module is unflagged from Node
+  22.13, which the project's 22.17 floor already covers, and the image and CI moved to 24 because it
+  is the current LTS, not because lite requires it; there is **no** MySQL → SQLite migration tool, so
+  the backend is chosen at deployment time and cannot be switched on an instance that already holds
+  data; lite is one process against one connection on one file — the personal / single-host case, not
+  a stand-in for a shared instance; the audit log's keyword search uses ngram `MATCH … AGAINST` on
+  MySQL and falls back to `LIKE` on SQLite, so a query still filters but by substring instead of
+  segmented terms; a backup has to take `aetherops.db`, `-wal` and `-shm` together, because a
+  checkpoint may not have run. Asserted in `scripts/verify-storage-lite.mjs` (68 assertions).
+  Documented under *Storage backends* in
+  [docs/configuration.md](docs/configuration.md#storage-backends-lite-sqlite-vs-enterprise) /
+  [docs/configuration.zh.md](docs/configuration.zh.md#存储后端lite-sqlite-与企业级).
 - **A read-only watch token, so an always-on screen no longer has to hold a login session.**
   Migration `0012` adds `auth_watch_tokens` — one row per issued token, scoped by `owner_id`, storing
   the SHA-256 of the token rather than the token itself, with an absolute `expires_at`, a `revoked_at`
@@ -316,9 +347,9 @@ or the commit, for a build that predates one — that you run.
 ### Changed
 
 - **The build stage's base image and Debian mirror are build arguments, so a blocked apt mirror no
-  longer strands a build.** `BUILD_IMAGE` (default `node:22-slim`) and `DEBIAN_MIRROR` (default
+  longer strands a build.** `BUILD_IMAGE` (default `node:24-slim`) and `DEBIAN_MIRROR` (default
   `mirrors.aliyun.com`) now exist as `ARG`s, and the toolchain layer installs python3/make/g++ only
-  when the base image does not already have them — `--build-arg BUILD_IMAGE=node:22` skips the apt
+  when the base image does not already have them — `--build-arg BUILD_IMAGE=node:24` skips the apt
   step entirely. **Boundary:** this is a build-time escape hatch, not a runtime setting (the server
   reads neither value); with no arguments the build pulls the same base and mirrors as before, so a
   rebuild produces the same image; the skip is decided by probing the base image, so a slim image
@@ -353,15 +384,16 @@ or the commit, for a build that predates one — that you run.
   and `temp/`. The `Dockerfile` uses `COPY . .`, so anything left out of this file is shipped into
   the build context: the first time it is just slow, the second time it is wrong, because stale local
   build output gets mixed into an image whose dependencies were installed with `--frozen-lockfile`.
-- **The verification suites left `temp/` and became a gate.** Seven scripts asserted P1–P6 — the
-  agent's reach, approval tiers, skills, fingerprints, alerts and collaboration — but they lived in
+- **The verification suites left `temp/` and became a gate.** Eight scripts assert P1–P6 and the lite
+  backend — agent reach, approval tiers, skills, fingerprints, alerts, collaboration and SQLite
+  storage — but they lived in
   `temp/`, which `.gitignore` excludes: the only record of them was a note in this file, and they ran
   only when somebody remembered to type the path. They now live in `scripts/verify-*.mjs` beside
   `verify-auth.mjs`, behind one entry point: `scripts/verify-all.mjs` (`pnpm verify`; `--offline` for
-  the three suites that need no database; `--list`; or a named subset such as `pnpm verify p5-alerts`)
+  the four suites that need no database; `--list`; or a named subset such as `pnpm verify p5-alerts`)
   runs the migrations once, spawns each suite as its own process, prints a summary table and exits
   non-zero if any suite failed. A new reusable workflow, `.github/workflows/verify.yml`, runs the docs
-  check, both type checks and the seven suites against a throwaway `mysql:8.0` service; `build.yml`
+  check, both type checks and the eight suites against a throwaway `mysql:8.0` service; `build.yml`
   (desktop artifacts) and `build-vsix.yml` (VSIX + Marketplace / Open VSX) each call it and `needs:`
   it, so a red suite now means no package is produced — until now the release path only installed
   and built. The same workflow runs `scripts/verify-docs.mjs`, which turns the `docs/` pairing rule
@@ -370,18 +402,19 @@ or the commit, for a build that predates one — that you run.
   every document, the *Known limitations* / *已知边界* sections carry the same number of items, links
   resolve and code fences pair up. **Boundary:** the suites assert the *compiled* server
   (`dist/server/**`), so `pnpm build-server` comes first, exactly as in CI; four of them need a real
-  MySQL and the offline subset is precisely the three in-memory ones, which makes
-  `pnpm verify:offline` a fast pre-commit check rather than a substitute for the full run; the
-  assertions are behavioural fixtures, not coverage — a phase that changes shape needs its fixture
-  changed too, and green proves the recorded behaviours still hold, nothing more; the docs check
-  proves structure and links, never that two prose paragraphs say the same thing. See
+  MySQL and the offline subset is the four that need none (one of those builds its own temporary
+  SQLite file), which makes `pnpm verify:offline` a fast pre-commit check rather than a substitute for
+  the full run; the assertions are behavioural fixtures, not coverage — a phase that changes shape
+  needs its fixture changed too, and green proves the recorded behaviours still hold, nothing more;
+  the docs check proves structure and links, never that two prose paragraphs say the same thing. See
   [CONTRIBUTING.md](CONTRIBUTING.md#test-scripts).
 - **The version line is this project's own from here on.** `package.json` read `1.0.26`, inherited with
   the fork and never bumped, so installers, the `latest.yml` the updater compares against and the Docker
-  image tag all carried a number that no tag ever mentioned. It now reads `0.1.0` — the same number the tag
-  says — so release label, installer file names, update manifest and in-app version finally agree. The
-  number is plain `major.minor.patch`, no `-beta` suffix: `electron/updater.js` splits on `.` and calls
-  `Number()`, so a suffix becomes `NaN` and the update check reports "already up to date" forever.
+  image tag all carried a number that no tag ever mentioned. It reads `0.1.0` at that tag and `0.1.5`
+  here — the same number as the tag — so release label, installer file names, update manifest and
+  in-app version finally agree. The number is plain `major.minor.patch`, no `-beta` suffix:
+  `electron/updater.js` splits on `.` and calls `Number()`, so a suffix becomes `NaN` and the update
+  check reports "already up to date" forever.
   **Boundary:** the number goes *down* — semver puts `0.1.0` below `1.0.26`, so the update check will not
   offer this build to anyone running 1.0.26; they download it once by hand. `packages/vscode` deliberately
   keeps its own line (`0.1.25`): the VSIX version has to equal whatever follows `aetherops-v` in the tag,
