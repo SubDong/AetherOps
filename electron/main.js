@@ -94,7 +94,7 @@ function getServices() {
 }
 
 /**
- * 启动依赖：连库 + 跑迁移 + Redis 探活 + 初始化服务。
+ * 启动依赖：存储探活 + 跑迁移 +（企业级）Redis 探活 + 初始化服务。
  * 不能只 require 一下就开窗口：表结构 / 初始管理员 / 按账号懒加载的 AI 配置
  * 都依赖这一步；跳过它的话首次登录会直接报「表不存在」。
  */
@@ -105,8 +105,18 @@ function ensureServicesReady() {
     if (isDev) return null;
     const { ensureDatabaseReady } = require(serverDist('db', 'migrate.js'));
     await ensureDatabaseReady();
-    const { probeRedis } = require(serverDist('db', 'redis.js'));
-    await probeRedis();
+    // lite 模式下登录令牌就在同一个 SQLite 文件里，没有 Redis 可探。
+    // 配置读取失败时 fail-safe 走“探 Redis”：连不上自然是 enterprise 的配置或真故障。
+    let mode = 'enterprise';
+    try {
+      mode = require(serverDist('utils', 'config.js')).resolveStorageMode();
+    } catch (e) {
+      console.warn('[Electron] 读取存储模式失败，按 enterprise 处理: ' + (e && e.message ? e.message : e));
+    }
+    if (mode === 'enterprise') {
+      const { probeRedis } = require(serverDist('db', 'redis.js'));
+      await probeRedis();
+    }
     const services = getServices();
     if (services) {
       await services.serverModule.initServices();

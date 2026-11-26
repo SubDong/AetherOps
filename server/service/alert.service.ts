@@ -110,8 +110,18 @@ function clamp(text: string | undefined, max: number): string {
   return String(text || '').slice(0, max);
 }
 
+/**
+ * 唯一键冲突识别。
+ * MySQL 报 ER_DUP_ENTRY / errno 1062；SQLite（lite 模式）报
+ * ERR_SQLITE_ERROR + errcode 2067 / SQLITE_CONSTRAINT_UNIQUE，
+ * 靠 message 里的 “UNIQUE constraint failed” 兜底。
+ * 两边都认，是因为这段代码在告警并发合并的竞态路径上，不是展示路径。
+ */
 function isDuplicateKey(error: any): boolean {
-  return error?.code === 'ER_DUP_ENTRY' || error?.errno === 1062;
+  if (!error) return false;
+  if (error.code === 'ER_DUP_ENTRY' || error.errno === 1062) return true;
+  if (error.errcode === 2067) return true;
+  return typeof error.message === 'string' && /UNIQUE constraint failed/i.test(error.message);
 }
 
 /**

@@ -29,6 +29,9 @@ import {
   type AuthContext,
 } from './server/index';
 import { authenticate } from './server/service/auth.service';
+import { ensureDatabaseReady } from './server/db/migrate';
+import { probeRedis } from './server/db/redis';
+import { describeStorage, resolveStorageMode } from './server/utils/config';
 import { PUBLIC_PATHS, handleAccountRoutes } from './server/routes/auth.routes';
 import { extractBearerToken, isAllowedOrigin, normalizeUploadName, maxUploadBytes } from './server/utils/security';
 import { registerTerminalSocket, unregisterTerminalSocket } from './server/utils/socket-registry';
@@ -39,7 +42,14 @@ const devUploadLimitBytes = maxUploadBytes();
 let servicesReady: Promise<void> | null = null;
 function initServices(): Promise<void> {
   if (!servicesReady) {
-    servicesReady = initServerServices().catch((e: any) => {
+    // 与 server.js 的 bootstrapDatabase 一致：先建表/迁移，再（企业级）探 Redis，
+    // 最后才初始化服务。lite 模式下登录令牌就在同一个 SQLite 文件里，没有 Redis 可探。
+    servicesReady = (async () => {
+      console.log(`[dev] storage -> ${describeStorage()}`);
+      await ensureDatabaseReady();
+      if (resolveStorageMode() === 'enterprise') await probeRedis();
+      await initServerServices();
+    })().catch((e: any) => {
       // dev 模式把原因说清楚：这是「没连上库/Redis」而不是「页面白屏」
       console.error(`[dev] 服务初始化失败: ${e && e.message ? e.message : e}`);
       servicesReady = null;

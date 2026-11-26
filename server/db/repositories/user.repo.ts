@@ -1,4 +1,4 @@
-import { getPool } from '../pool';
+import { execute, query, queryOne } from '../pool';
 import {
   PERMISSION_COLUMNS,
   PERMISSION_KEYS,
@@ -43,20 +43,18 @@ function rowToUser(r: any): UserRecord {
 }
 
 export async function findUserByUsername(username: string): Promise<UserRecord | null> {
-  const [rows] = await getPool().query(`SELECT ${COLUMNS} FROM users WHERE username = ? LIMIT 1`, [username]);
-  const row = (rows as any[])[0];
+  const row = await queryOne(`SELECT ${COLUMNS} FROM users WHERE username = ? LIMIT 1`, [username]);
   return row ? rowToUser(row) : null;
 }
 
 export async function findUserById(id: string): Promise<UserRecord | null> {
-  const [rows] = await getPool().query(`SELECT ${COLUMNS} FROM users WHERE id = ? LIMIT 1`, [id]);
-  const row = (rows as any[])[0];
+  const row = await queryOne(`SELECT ${COLUMNS} FROM users WHERE id = ? LIMIT 1`, [id]);
   return row ? rowToUser(row) : null;
 }
 
 export async function listUsers(): Promise<UserRecord[]> {
-  const [rows] = await getPool().query(`SELECT ${COLUMNS} FROM users ORDER BY created_at ASC`);
-  return (rows as any[]).map(rowToUser);
+  const rows = await query(`SELECT ${COLUMNS} FROM users ORDER BY created_at ASC`);
+  return rows.map(rowToUser);
 }
 
 /**
@@ -71,10 +69,10 @@ export interface MemberBrief {
 }
 
 export async function listActiveMembers(): Promise<MemberBrief[]> {
-  const [rows] = await getPool().query(
+  const rows = await query(
     "SELECT id, username, display_name FROM users WHERE status = 'active' ORDER BY username ASC",
   );
-  return (rows as any[]).map((r) => ({
+  return rows.map((r: any) => ({
     id: String(r.id),
     username: String(r.username),
     displayName: String(r.display_name || r.username),
@@ -82,17 +80,17 @@ export async function listActiveMembers(): Promise<MemberBrief[]> {
 }
 
 export async function countUsers(): Promise<number> {
-  const [rows] = await getPool().query('SELECT COUNT(*) AS n FROM users');
-  return Number((rows as any[])[0]?.n || 0);
+  const row = await queryOne('SELECT COUNT(*) AS n FROM users');
+  return Number(row?.n || 0);
 }
 
 /** 只剩一个管理员时不允许降级/删除/禁用，否则没人能再管账号 */
 export async function countActiveAdmins(excludeId?: string): Promise<number> {
-  const [rows] = await getPool().query(
+  const row = await queryOne(
     `SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND status <> 'disabled'${excludeId ? ' AND id <> ?' : ''}`,
     excludeId ? [excludeId] : [],
   );
-  return Number((rows as any[])[0]?.n || 0);
+  return Number(row?.n || 0);
 }
 
 export async function insertUser(user: UserRecord): Promise<void> {
@@ -105,7 +103,7 @@ export async function insertUser(user: UserRecord): Promise<void> {
   cols.push('created_at', 'updated_at', 'last_login_at', 'last_login_ip');
   values.push(user.createdAt, user.updatedAt, user.lastLoginAt, user.lastLoginIp);
 
-  await getPool().query(
+  await execute(
     `INSERT INTO users (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`,
     values,
   );
@@ -140,16 +138,16 @@ export async function updateUser(id: string, patch: UserUpdate): Promise<void> {
 
   sets.push('updated_at = ?');
   values.push(new Date(), id);
-  await getPool().query(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, values);
+  await execute(`UPDATE users SET ${sets.join(', ')} WHERE id = ?`, values);
 }
 
 export async function touchLogin(id: string, ip: string): Promise<void> {
-  await getPool().query('UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE id = ?', [new Date(), ip, id]);
+  await execute('UPDATE users SET last_login_at = ?, last_login_ip = ? WHERE id = ?', [new Date(), ip, id]);
 }
 
 export async function deleteUserRow(id: string): Promise<number> {
-  const [result] = await getPool().query('DELETE FROM users WHERE id = ?', [id]);
-  return (result as any).affectedRows || 0;
+  const result = await execute('DELETE FROM users WHERE id = ?', [id]);
+  return result.affectedRows || 0;
 }
 
 /**
@@ -157,7 +155,6 @@ export async function deleteUserRow(id: string): Promise<number> {
  * 不建外键（0001 的约定），所以必须在这里显式做，顺序按「子表在前」。
  */
 export async function purgeOwnerData(ownerId: string): Promise<void> {
-  const pool = getPool();
   // 子表在前：alerts 挂在 incidents 上，先删告警再删事件。
   // host_metrics_minute / error_fingerprints / alerts / alert_mutes / incidents / alert_oncall
   // 都是 P4–P6 新增的按账号数据，漏一张就会在删号后留下孤儿行（凭 id 还能被别处读到）。
@@ -170,6 +167,6 @@ export async function purgeOwnerData(ownerId: string): Promise<void> {
     'connections',
   ];
   for (const table of tables) {
-    await pool.query(`DELETE FROM ${table} WHERE owner_id = ?`, [ownerId]);
+    await execute(`DELETE FROM ${table} WHERE owner_id = ?`, [ownerId]);
   }
 }

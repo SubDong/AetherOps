@@ -23,7 +23,7 @@ const valueOf = (flag) => {
 const { MIGRATIONS, dumpMigrationSql } = require('../dist/server/db/migrations/index.js');
 const { runMigrations, getAppliedVersions, checksumOf } = require('../dist/server/db/migrate.js');
 const { closePool, probeDatabase } = require('../dist/server/db/pool.js');
-const { loadConfig, describeDatabase } = require('../dist/server/utils/config.js');
+const { loadConfig, describeStorage } = require('../dist/server/utils/config.js');
 
 if (has('--dump')) {
   const version = valueOf('--dump') || MIGRATIONS[MIGRATIONS.length - 1].version;
@@ -32,7 +32,7 @@ if (has('--dump')) {
 }
 
 if (!has('--help')) {
-  console.log(`[migrate] target -> ${describeDatabase(loadConfig().database)}`);
+  console.log(`[migrate] target -> ${describeStorage(loadConfig())}`);
 }
 
 try {
@@ -49,7 +49,11 @@ try {
   }
 
   const probe = await probeDatabase();
-  console.log(`[migrate] MySQL ${probe.version} | 库 ${probe.database} | 服务端时区 ${probe.serverTz}（system ${probe.systemTz}）`);
+  if (probe.engine === 'sqlite') {
+    console.log(`[migrate] SQLite ${probe.version} | 文件 ${probe.database} | journal ${probe.collation}`);
+  } else {
+    console.log(`[migrate] MySQL ${probe.version} | 库 ${probe.database} | 服务端时区 ${probe.serverTz}（system ${probe.systemTz}）`);
+  }
   const result = await runMigrations(has('--force'));
   if (result.applied.length) {
     console.log(`[migrate] 本次应用: ${result.applied.join(', ')}`);

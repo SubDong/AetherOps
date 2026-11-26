@@ -1,8 +1,12 @@
 import * as crypto from 'crypto';
 import type { PoolConnection } from 'mysql2/promise';
-import { getPool, closePool, probeDatabase } from './pool';
+import { getPool, closePool, probeDatabase, currentDialect } from './pool';
 import type { DbProbeResult } from './pool';
 import { MIGRATIONS } from './migrations';
+import { SQLITE_BASELINE_NAME, SQLITE_BASELINE_SQL, SQLITE_BASELINE_VERSION } from './sqlite-schema';
+import { formatDateTimeUtc, translateDdlForSqlite } from './dialect';
+import { getSqlite, resolveSqlitePrimaryKey, sqliteAll, sqliteExec } from './sqlite';
+import { describeStorage } from '../utils/config';
 
 /**
  * 迁移器：schema_version 表 + 按版本顺序执行未应用的迁移。
@@ -19,12 +23,21 @@ import { MIGRATIONS } from './migrations';
  *    代价是只改注释不会被视为改动。
  *
  * 3) 用 GET_LOCK 串行化：Web/Docker 多副本同时启动时，两个实例并行跑同一批 DDL
- *    会撞出「table exists」之类的假错误。
+ *    会撞出「table exists」之类的假错误。lite 模式改用 `BEGIN IMMEDIATE`：
+ *    SQLite 的 DDL 在事务里，失败能真回滚（比 MySQL 的「只能靠可重入」更强）。
+ *
+ * 4) 两种后端的差异全部收在 runMigrations 的分派里：
+ *    MySQL 走全量重放 0001–0013；SQLite 首次建库执行的是一份**合并基线**
+ *    （0001–0012 的最终形态，见 sqlite-schema.ts），这 12 个版本只登记不重放 ——
+ *    它们用的 information_schema + PREPARE 动态 DDL 在 SQLite 上没法重放。
+ *    0013 起两边都正常执行（必要时在迁移里给 sqliteSql）。
  */
 
 const SCHEMA_TABLE = 'schema_version';
 const LOCK_NAME = 'aetherops_migrate';
 const LOCK_TIMEOUT_SECONDS = 30;
+/** 基线覆盖到哪个版本（含）：这批迁移的最终形态已写进 SQLITE_BASELINE_SQL */
+const SQLITE_BASELINE_COVERS_UNTIL = '0012';
 
 export interface MigrationRecord {
   version: string;
@@ -181,6 +194,10 @@ async function loadApplied(conn: PoolConnection): Promise<Map<string, MigrationR
 
 /** 只读：当前库上已应用的版本，供启动日志与后续诊断接口用 */
 export async function getAppliedVersions(): Promise<MigrationRecord[]> {
+  if (currentDialect() === 'sqlite') {
+    ensureSqliteSchemaTable();
+    return loadSqliteApplied().map((record) => record);
+  }
   const conn = await getPool().getConnection();
   try {
     await ensureSchemaTable(conn);
@@ -190,12 +207,156 @@ export async function getAppliedVersions(): Promise<MigrationRecord[]> {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* SQLite（lite）                                                        */
+/* ------------------------------------------------------------------ */
+
+/** schema_version 在 SQLite 侧同构：列名与 MySQL 一致，applied_at 存文本 */
+function ensureSqliteSchemaTable(): void {
+  sqliteExec(`
+    CREATE TABLE IF NOT EXISTS ${SCHEMA_TABLE} (
+      version      TEXT    NOT NULL PRIMARY KEY,
+      name         TEXT    NOT NULL DEFAULT '',
+      checksum     TEXT    NOT NULL,
+      applied_at   TEXT    NOT NULL,
+      execution_ms INTEGER NOT NULL DEFAULT 0
+    )`);
+}
+
+function loadSqliteApplied(): MigrationRecord[] {
+  return sqliteAll<any>(
+    `SELECT version, name, checksum, execution_ms, applied_at FROM ${SCHEMA_TABLE} ORDER BY version`,
+  ).map((r) => ({
+    version: String(r.version),
+    name: String(r.name || ''),
+    checksum: String(r.checksum),
+    // 正常化会把时间文本转成 Date，这里转回可打印的 ISO 串
+    applied_at: r.applied_at instanceof Date ? r.applied_at.toISOString() : String(r.applied_at),
+    execution_ms: Number(r.execution_ms) || 0,
+  }));
+}
+
+function insertSqliteRecord(
+  version: string,
+  name: string,
+  checksum: string,
+  elapsedMs: number,
+): void {
+  getSqlite()
+    .prepare(`INSERT INTO ${SCHEMA_TABLE} (version, name, checksum, applied_at, execution_ms) VALUES (?, ?, ?, ?, ?)`)
+    .run(version, name, checksum, formatDateTimeUtc(new Date()), elapsedMs);
+}
+
+/**
+ * 将一条迁移展开成可在 SQLite 上执行的语句。
+ * 优先用迁移自带的 sqliteSql；没有则走通用 DDL 翻译（遇到无法转换的结构会直接报错）。
+ */
+function sqliteStatementsOf(migration: { version: string; name: string; sql: string; sqliteSql?: string }): string[] {
+  if (migration.sqliteSql) return splitStatements(migration.sqliteSql);
+  try {
+    return splitStatements(translateDdlForSqlite(migration.sql, resolveSqlitePrimaryKey));
+  } catch (e: any) {
+    throw new Error(`迁移 ${migration.version}（${migration.name}）无法自动转换为 SQLite：${e.message}`);
+  }
+}
+
+async function runSqliteMigrations(force: boolean): Promise<MigrateResult> {
+  const result: MigrateResult = { applied: [], alreadyApplied: [] };
+  const db = getSqlite();
+  const ordered = [...MIGRATIONS].sort((a, b) => (a.version < b.version ? -1 : a.version > b.version ? 1 : 0));
+  const baselineChecksum = checksumOf(SQLITE_BASELINE_SQL);
+
+  // BEGIN IMMEDIATE：立刻拿写锁，两个进程同时启动时第二个会等 busy_timeout 而不是并行建表。
+  // 与 MySQL 不同，SQLite 的 DDL 在事务内，中途失败可以真回滚 —— 不会留下半成品 schema。
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    ensureSqliteSchemaTable();
+    const applied = new Map(loadSqliteApplied().map((r) => [r.version, r]));
+
+    const baseline = applied.get(SQLITE_BASELINE_VERSION);
+    if (!baseline) {
+      // 首次建库：基线里全是 IF NOT EXISTS，重跑安全，但绝不能重复登记 0001–0012
+      const startedAt = Date.now();
+      sqliteExec(SQLITE_BASELINE_SQL);
+      insertSqliteRecord(SQLITE_BASELINE_VERSION, SQLITE_BASELINE_NAME, baselineChecksum, Date.now() - startedAt);
+      const covered = ordered.filter((m) => m.version <= SQLITE_BASELINE_COVERS_UNTIL);
+      for (const m of covered) {
+        insertSqliteRecord(m.version, m.name, checksumOf(m.sql), 0);
+        applied.set(m.version, {
+          version: m.version,
+          name: m.name,
+          checksum: checksumOf(m.sql),
+          applied_at: new Date().toISOString(),
+          execution_ms: 0,
+        });
+      }
+      console.log(
+        `[migrate] SQLite 基线已建立（${covered.length} 个历史迁移合并为一份 schema）: ${SQLITE_BASELINE_NAME}`,
+      );
+    } else if (baseline.checksum !== baselineChecksum && !force) {
+      // 基线改过但库不重建：新旧库会静默不一致，必须报错而不是继续跑
+      throw new Error(
+        'SQLite 基线与建库时记录的校验和不一致：基线发布后不应再修改。'
+        + `库里记的是 ${baseline.checksum.slice(0, 12)}…，现在是 ${baselineChecksum.slice(0, 12)}…。`
+        + '请改写成新迁移（0013+）；确实要按新内容跑就带 --force。',
+      );
+    }
+
+    // 先整体校验已应用的迁移，别等跑到一半才发现历史被改过
+    for (const m of ordered) {
+      const record = applied.get(m.version);
+      if (record && record.checksum !== checksumOf(m.sql) && !force) {
+        throw new Error(
+          `迁移 ${m.version}（${m.name}）的内容与已应用的记录不一致：`
+          + `库里记的是 ${record.checksum.slice(0, 12)}…，现在是 ${checksumOf(m.sql).slice(0, 12)}…。`
+          + '已应用的迁移不要改，追加一个新版本；确实要按新内容跑就带 --force。',
+        );
+      }
+    }
+
+    for (const m of ordered) {
+      if (applied.has(m.version)) {
+        result.alreadyApplied.push(m.version);
+        continue;
+      }
+      const statements = sqliteStatementsOf(m);
+      const startedAt = Date.now();
+      for (let idx = 0; idx < statements.length; idx++) {
+        try {
+          sqliteExec(statements[idx]);
+        } catch (e: any) {
+          throw new Error(
+            `迁移 ${m.version} 第 ${idx + 1}/${statements.length} 条语句失败：${e.code || e.errcode || ''} ${e.message}`
+            + `\n  语句起始内容: ${statements[idx].slice(0, 120).replace(/\s+/g, ' ')}`,
+          );
+        }
+      }
+      const elapsed = Date.now() - startedAt;
+      insertSqliteRecord(m.version, m.name, checksumOf(m.sql), elapsed);
+      result.applied.push(m.version);
+      console.log(`[migrate] applied ${m.version} (${m.name}) ${statements.length} 条语句, ${elapsed}ms`);
+    }
+
+    db.exec('COMMIT');
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch { /* 已自动回滚 */ }
+    throw e;
+  }
+
+  return result;
+}
+
 /**
  * 执行迁移。
  * @param force 已应用的迁移正文与库里记录的校验和不一致时，默认拒绝启动；
  *              force 只应在你确认「改动是安全的、且我需要它按新内容跑」时使用。
  */
 export async function runMigrations(force = false): Promise<MigrateResult> {
+  return currentDialect() === 'sqlite' ? runSqliteMigrations(force) : runMysqlMigrations(force);
+}
+
+/** MySQL 版：全量重放未应用的迁移（DDL 隐式提交，只能靠迁移本身可重入） */
+async function runMysqlMigrations(force = false): Promise<MigrateResult> {
   const conn = await getPool().getConnection();
   const result: MigrateResult = { applied: [], alreadyApplied: [] };
 
@@ -271,10 +432,17 @@ export async function runMigrations(force = false): Promise<MigrateResult> {
  */
 export async function ensureDatabaseReady(): Promise<{ probe: DbProbeResult; migrate: MigrateResult }> {
   const probe = await probeDatabase();
-  console.log(
-    `[db] MySQL ${probe.version} | 库 ${probe.database} | 服务端时区 ${probe.serverTz}`
-    + `（system ${probe.systemTz}）| max_connections=${probe.maxConnections}`,
-  );
+  if (probe.engine === 'sqlite') {
+    console.log(
+      `[db] ${describeStorage()} | SQLite ${probe.version}`
+      + ` | journal=${probe.collation} | 文件 ${probe.database}`,
+    );
+  } else {
+    console.log(
+      `[db] MySQL ${probe.version} | 库 ${probe.database} | 服务端时区 ${probe.serverTz}`
+      + `（system ${probe.systemTz}）| max_connections=${probe.maxConnections}`,
+    );
+  }
   const migrate = await runMigrations();
   if (!migrate.applied.length) {
     console.log(`[db] schema 已是最新（${migrate.alreadyApplied.length} 个迁移均已应用）`);

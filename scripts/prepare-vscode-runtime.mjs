@@ -265,7 +265,9 @@ await build({
   // 注意：'.node' 原生二进制不能被 esbuild 打包（无对应 loader），必须 external。
   // 典型如 ssh2 自带的 sshcrypto.node —— 其 require 本身包在 try/catch 中
   // （ssh2/lib/protocol/crypto.js），缺失时自动降级为纯 JS 加密，不影响 SSH 功能。
-  external: ['node-pty', 'cpu-features', '*.node'],
+  // node:sqlite 是 Node 内置模块（lite 存储），同样不参与打包：
+  // 宿主 Node 不支持时仅在需要 lite 模式时才在运行期报错，enterprise 不受影响。
+  external: ['node-pty', 'cpu-features', 'node:sqlite', '*.node'],
   // 注入打包标记：server.js 内的构建产物校验会据此跳过（dist/server 已被内联删除）
   define: { 'process.env.AETHEROPS_BUNDLED': '"1"' },
   minify: true,

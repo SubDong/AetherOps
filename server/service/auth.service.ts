@@ -1,6 +1,6 @@
 import * as crypto from 'crypto';
 import { promisify } from 'util';
-import { getRedis, redisGet, redisKey } from '../db/redis';
+import { getTokenStore } from '../db/token-store';
 import {
   findUserById,
   findUserByUsername,
@@ -87,7 +87,7 @@ export interface IssuedToken {
   user: PublicUser;
 }
 
-/** Redis 里存的东西；刻意不含令牌明文，只有哈希能对上 */
+/** 令牌存储里的东西；刻意不含令牌明文，只有哈希能对上 */
 export interface TokenPayload {
   userId: string;
   username: string;
@@ -106,14 +106,6 @@ export interface TokenPayload {
 
 function hashToken(token: string): string {
   return crypto.createHash('sha256').update(token).digest('hex');
-}
-
-function tokenKey(tokenHash: string): string {
-  return redisKey(`token:${tokenHash}`);
-}
-
-function userTokenKey(userId: string): string {
-  return redisKey(`user:${userId}:token`);
 }
 
 /* ------------------------------------------------------------------ */
@@ -158,39 +150,9 @@ const DUMMY_HASH = `scrypt$${SCRYPT_N}$${SCRYPT_R}$${SCRYPT_P}$${crypto.randomBy
 /* 令牌：签发 / 校验 / 续期 / 踢下线                                        */
 /* ------------------------------------------------------------------ */
 
-/**
- * 单点登录：写新令牌的同时删掉该账号的旧令牌。
- * 用 Lua 保证「读旧 → 删旧 → 写新」之间不会插进另一个登录请求，
- * 否则两端并发登录会各自以为自己是唯一会话。
- */
-const ISSUE_SCRIPT = `
-local old = redis.call('GET', KEYS[1])
-if old then
-  redis.call('DEL', ARGV[1] .. old)
-end
-redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[4])
-redis.call('SET', KEYS[2], ARGV[3], 'EX', ARGV[4])
-return old or ''
-`;
-
-/**
- * 滑动续期：只在剩余 TTL 低于阈值时续，且与用户索引一起续。
- * 用 Lua 而不是 GET TTL + EXPIRE 两步，避免并发请求各自把 TTL 重置。
- */
-const RENEW_SCRIPT = `
-local ttl = redis.call('TTL', KEYS[1])
-if ttl < 0 then
-  return ttl
-end
-if ttl < tonumber(ARGV[1]) then
-  redis.call('EXPIRE', KEYS[1], ARGV[2])
-  if redis.call('EXISTS', KEYS[2]) == 1 then
-    redis.call('EXPIRE', KEYS[2], ARGV[2])
-  end
-  return tonumber(ARGV[2])
-end
-return ttl
-`;
+// 签发/续期/吊销的具体存储动作都在 db/token-store.ts 里：
+// enterprise 走 Redis 的 Lua（原子），lite 走 SQLite 事务 + 唯一索引。
+// 这里只表达「单账号单会话 + 滑动续期」的业务语义，不关心落到哪个后端。
 
 async function issueToken(user: UserRecord, loginIp: string): Promise<string> {
   const token = `ao_${crypto.randomBytes(32).toString('base64url')}`;
@@ -206,14 +168,9 @@ async function issueToken(user: UserRecord, loginIp: string): Promise<string> {
     loginIp,
     kind: 'session',
   };
-  const client = await getRedis();
-  // KEYS[1] 是账号索引（userId -> 令牌哈希），KEYS[2] 是本次令牌的 payload key：
-  // 「删旧 + 写新索引 + 写新 payload」必须在同一段脚本里，否则并发登录会各自以为自己是唯一会话。
-  // ARGV[1] 是 token key 前缀，Lua 里用来拼旧 key。
-  await client.eval(ISSUE_SCRIPT, {
-    keys: [userTokenKey(user.id), tokenKey(tokenHash)],
-    arguments: [redisKey('token:'), tokenHash, JSON.stringify(payload), String(tokenTtlSeconds())],
-  });
+  // 「删旧 + 写新」是一次原子操作：并发登录时后到的那次会把先到的踢掉，
+  // 而不是两边都以为自己拿到了唯一会话。
+  await getTokenStore().issue(user.id, tokenHash, JSON.stringify(payload), tokenTtlSeconds());
   return token;
 }
 
@@ -233,67 +190,59 @@ export interface AuthenticateOptions {
  */
 export async function authenticate(token: string, options: AuthenticateOptions = {}): Promise<TokenPayload | null> {
   if (!token) return null;
-  // 前缀分流，不靠「Redis 没找到就去查库」：只读令牌走库，会话令牌走 Redis，
+  // 前缀分流，不靠「令牌存储没找到就去查库」：只读令牌走库，会话令牌走令牌存储，
   // 两条路径互不干扰，也不会因为一个前缀猜错而多一次全表查询。
   if (token.startsWith(WATCH_TOKEN_PREFIX)) {
     if (!options.allowWatch) return null;
     return authenticateWatchToken(token);
   }
   const tokenHash = hashToken(token);
-  const key = tokenKey(tokenHash);
-  const client = await getRedis();
-  const raw = await redisGet(key);
+  const store = getTokenStore();
+  const raw = await store.read(tokenHash);
   if (!raw) return null;
 
   let payload: TokenPayload;
   try {
     payload = JSON.parse(raw);
   } catch {
-    await client.del(key);
+    // 存储里的东西解析不了，说明这行已经没用了，顺手清掉避免每次请求都白跑一次
+    await store.remove(tokenHash, null);
     return null;
   }
 
-  // TTL 低于阈值则续到满；这里不 await 结果之外的错误处理，失败就让上层 500——
-  // 续期都失败的 Redis 不该被当成「鉴权通过」继续放行。
-  await client.eval(RENEW_SCRIPT, {
-    keys: [key, userTokenKey(payload.userId)],
-    arguments: [String(tokenRenewThresholdSeconds()), String(tokenTtlSeconds())],
-  });
+  // TTL 低于阈值则续到满；不吞异常，失败就让上层 500——
+  // 续期都失败的存储不该被当成「鉴权通过」继续放行。
+  await store.renew(tokenHash, payload.userId, tokenRenewThresholdSeconds(), tokenTtlSeconds());
 
   return payload;
 }
 
 /** 只读当前剩余有效期，供调试/前端展示用 */
 export async function tokenTtl(token: string): Promise<number> {
-  const client = await getRedis();
-  return client.ttl(tokenKey(hashToken(token)));
+  return getTokenStore().ttl(hashToken(token));
 }
 
+/**
+ * 吊销：删掉这枚令牌。
+ *
+ * 先读出 payload 取 userId —— 只有 Redis 实现需要它来清「账号当前令牌」那枚索引 key，
+ * 且只在索引仍指向本令牌时才删，避免把「重新登录后的新令牌」索引清掉。
+ */
 export async function revokeToken(token: string): Promise<void> {
   if (!token) return;
+  const store = getTokenStore();
   const tokenHash = hashToken(token);
-  const client = await getRedis();
-  const payloadRaw = await redisGet(tokenKey(tokenHash));
+  const payloadRaw = await store.read(tokenHash);
   let userId = '';
   if (payloadRaw) {
     try { userId = JSON.parse(payloadRaw).userId || ''; } catch { /* ignore */ }
   }
-  await client.del(tokenKey(tokenHash));
-  if (userId) {
-    const indexKey = userTokenKey(userId);
-    const current = await redisGet(indexKey);
-    // 只有当索引还指向这个令牌时才删，避免把「重新登录后的新令牌」索引清掉
-    if (current === tokenHash) await client.del(indexKey);
-  }
+  await store.remove(tokenHash, userId || null);
 }
 
 /** 强制下线：禁用账号、改权限、重置密码、删号时调用 */
 export async function kickUser(userId: string): Promise<void> {
-  const client = await getRedis();
-  const indexKey = userTokenKey(userId);
-  const tokenHash = await redisGet(indexKey);
-  if (tokenHash) await client.del(tokenKey(tokenHash));
-  await client.del(indexKey);
+  await getTokenStore().kick(userId);
 }
 
 /* ------------------------------------------------------------------ */

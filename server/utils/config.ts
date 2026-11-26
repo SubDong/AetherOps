@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { getDataPath, ensureDataDir } from './data-dir';
+import { getDataPath, getDataDir, ensureDataDir } from './data-dir';
 
 /**
  * 统一配置入口。
@@ -70,6 +70,30 @@ export interface RedisConfig {
   connectTimeoutMs: number;
 }
 
+/** 实际生效的存储后端：enterprise = MySQL + Redis，lite = 单个 SQLite 文件 */
+export type StorageMode = 'enterprise' | 'lite';
+
+/**
+ * 存储后端选择。
+ *
+ * 个人/单机部署不需要为了「存几条连接配置」去拉一套 MySQL + Redis；
+ * lite 模式下业务数据与登录会话令牌全部落在一个 SQLite 文件里。
+ *
+ * 两种模式的数据结构互不兼容，不做自动搬运：切换后端等于换一套库，
+ * 已有的 MySQL 数据不会自动导进 SQLite（见 docs/configuration.md）。
+ */
+export interface StorageConfig {
+  /**
+   * auto（默认）：配了 database.host / redis.host / redis.url 任一项就走 enterprise，
+   * 全空则走 lite —— 这样老部署升级后行为不变，新装用户不填库也能直接跑。
+   */
+  mode: 'auto' | StorageMode;
+  /** SQLite 文件路径；留空 = 数据目录下的 aetherops.db，相对路径按数据目录解析 */
+  sqlitePath: string;
+  /** SQLite 写锁等待上限（毫秒）。WAL 下并发写会短暂排队，超时才报 SQLITE_BUSY */
+  busyTimeoutMs: number;
+}
+
 export interface AuthConfig {
   /** VSCode/Electron 宿主拉起服务端时的探活令牌（只用于 /health，不是用户身份） */
   launchToken: string;
@@ -114,6 +138,7 @@ export interface MetricsConfig {
 
 export interface AppConfig {
   server: ServerConfig;
+  storage: StorageConfig;
   database: DatabaseConfig;
   redis: RedisConfig;
   auth: AuthConfig;
@@ -147,6 +172,13 @@ const DEFAULTS: AppConfig = {
   server: {
     port: 9802,
     host: '127.0.0.1',
+  },
+  storage: {
+    // auto：见 StorageConfig.mode 的注释
+    mode: 'auto',
+    // 留空落在数据目录（~/.aetherops/aetherops.db），随数据目录一起备份/迁移
+    sqlitePath: '',
+    busyTimeoutMs: 5000,
   },
   database: {
     host: '',
@@ -309,6 +341,9 @@ function applyEnvOverrides(config: AppConfig): AppConfig {
     ['alerts.webhookUrl', str(env.AETHEROPS_ALERTS_WEBHOOK_URL)],
     ['alerts.webhookSecret', str(env.AETHEROPS_ALERTS_WEBHOOK_SECRET)],
     ['alerts.webhookTimeoutMs', num(env.AETHEROPS_ALERTS_WEBHOOK_TIMEOUT_MS)],
+    ['storage.mode', str(env.AETHEROPS_STORAGE_MODE)],
+    ['storage.sqlitePath', str(env.AETHEROPS_SQLITE_PATH)],
+    ['storage.busyTimeoutMs', num(env.AETHEROPS_SQLITE_BUSY_TIMEOUT_MS)],
     ['database.host', str(env.AETHEROPS_DB_HOST)],
     ['database.port', num(env.AETHEROPS_DB_PORT)],
     ['database.user', str(env.AETHEROPS_DB_USER)],
@@ -376,10 +411,19 @@ function writeDefaultConfig(file: string): void {
   ensureDataDir();
   const template = {
     ...DEFAULTS,
+    storage: { ...DEFAULTS.storage },
     database: { ...DEFAULTS.database },
     redis: { ...DEFAULTS.redis },
   };
-  const text = JSON.stringify({ _comment: 'AetherOps 配置；MySQL 与 Redis 的账号密码请在此填写。环境变量可覆盖同名项。', ...template }, null, 2);
+  const text = JSON.stringify(
+    {
+      _comment:
+        'AetherOps 配置。storage.mode=auto 时：不填 database/redis 则用 SQLite 单文件（个人部署），填了则用 MySQL + Redis（企业部署）。环境变量可覆盖同名项。',
+      ...template,
+    },
+    null,
+    2
+  );
   fs.writeFileSync(file, text, { encoding: 'utf8', mode: 0o600 });
   try {
     fs.chmodSync(file, 0o600);
@@ -391,16 +435,9 @@ function writeDefaultConfig(file: string): void {
 /** 配置合法性检查；返回人类可读的问题清单，供启动时一次性报全 */
 export function validateConfig(config: AppConfig): string[] {
   const problems: string[] = [];
+  const mode = resolveStorageMode(config);
   const db = config.database;
 
-  if (!db.host) problems.push('database.host 未配置');
-  if (!db.user) problems.push('database.user 未配置');
-  if (!db.database) problems.push('database.database 未配置（库名）');
-  if (db.password === '' ) problems.push('database.password 未配置');
-  if (!Number.isInteger(db.port) || db.port < 1 || db.port > 65535) problems.push(`database.port 非法: ${db.port}`);
-  if (!Number.isInteger(db.connectionLimit) || db.connectionLimit < 1 || db.connectionLimit > 100) {
-    problems.push(`database.connectionLimit 应在 1~100 之间: ${db.connectionLimit}`);
-  }
   if (!Number.isInteger(config.server.port) || config.server.port < 1 || config.server.port > 65535) {
     problems.push(`server.port 非法: ${config.server.port}`);
   }
@@ -427,22 +464,46 @@ export function validateConfig(config: AppConfig): string[] {
     problems.push(`alerts.webhookTimeoutMs 应不小于 1000: ${alerts.webhookTimeoutMs}`);
   }
 
-  const redis = config.redis;
-  if (!redis.url && !redis.host) problems.push('redis.host 未配置（或改用 redis.url 填完整连接串）');
-  if (!Number.isInteger(redis.port) || redis.port < 1 || redis.port > 65535) problems.push(`redis.port 非法: ${redis.port}`);
-  if (!Number.isInteger(redis.db) || redis.db < 0 || redis.db > 15) problems.push(`redis.db 应在 0~15 之间: ${redis.db}`);
-  if (!redis.keyPrefix) problems.push('redis.keyPrefix 不能为空（为空时容易与其他业务 key 相撞）');
-  if (!redis.url && redis.password === '') {
-    // 不是错误，但有密码的实例漏填会让启动探活报 NOAUTH，先提示一句
-    console.warn('[config] redis.password 为空，将按无密码连接；若实例开了 requirepass 请在配置里补上');
+  const storage = config.storage;
+  if (storage.mode !== 'auto' && storage.mode !== 'enterprise' && storage.mode !== 'lite') {
+    problems.push(`storage.mode 只支持 auto / enterprise / lite: ${storage.mode}`);
+  }
+  if (!Number.isFinite(storage.busyTimeoutMs) || storage.busyTimeoutMs < 0 || storage.busyTimeoutMs > 60000) {
+    problems.push(`storage.busyTimeoutMs 应在 0~60000 之间: ${storage.busyTimeoutMs}`);
   }
 
-  // TLS 相关：配了 CA 却没开 ssl 是常见的“我改了为何不生效”，直接当错误报出来
-  if (db.sslCaPath && !db.ssl) problems.push('database.sslCaPath 已配置但 database.ssl 为 false，CA 不会生效');
-  if (db.sslCaPath && !fs.existsSync(db.sslCaPath)) problems.push(`database.sslCaPath 指向的文件不存在: ${db.sslCaPath}`);
-  if (db.ssl && db.sslRejectUnauthorized && !db.sslCaPath) {
-    problems.push('database.ssl 与 sslRejectUnauthorized 同时开启但未提供 sslCaPath：服务端为自签证书时必定握手失败');
+  // MySQL / Redis 只在企业级后端下必需；lite 模式这两段整体不参与校验，
+  // 否则「只想用 SQLite」的人会被一屏的 database.* 未配置拦截。
+  if (mode === 'enterprise') {
+    if (!db.host) problems.push('database.host 未配置');
+    if (!db.user) problems.push('database.user 未配置');
+    if (!db.database) problems.push('database.database 未配置（库名）');
+    if (db.password === '') problems.push('database.password 未配置');
+    if (!Number.isInteger(db.port) || db.port < 1 || db.port > 65535) problems.push(`database.port 非法: ${db.port}`);
+    if (!Number.isInteger(db.connectionLimit) || db.connectionLimit < 1 || db.connectionLimit > 100) {
+      problems.push(`database.connectionLimit 应在 1~100 之间: ${db.connectionLimit}`);
+    }
+    // TLS 相关：配了 CA 却没开 ssl 是常见的“我改了为何不生效”，直接当错误报出来
+    if (db.sslCaPath && !db.ssl) problems.push('database.sslCaPath 已配置但 database.ssl 为 false，CA 不会生效');
+    if (db.sslCaPath && !fs.existsSync(db.sslCaPath)) problems.push(`database.sslCaPath 指向的文件不存在: ${db.sslCaPath}`);
+    if (db.ssl && db.sslRejectUnauthorized && !db.sslCaPath) {
+      problems.push('database.ssl 与 sslRejectUnauthorized 同时开启但未提供 sslCaPath：服务端为自签证书时必定握手失败');
+    }
+
+    const redis = config.redis;
+    if (!redis.url && !redis.host) problems.push('redis.host 未配置（或改用 redis.url 填完整连接串）');
+    if (!Number.isInteger(redis.port) || redis.port < 1 || redis.port > 65535) problems.push(`redis.port 非法: ${redis.port}`);
+    if (!Number.isInteger(redis.db) || redis.db < 0 || redis.db > 15) problems.push(`redis.db 应在 0~15 之间: ${redis.db}`);
+    if (!redis.keyPrefix) problems.push('redis.keyPrefix 不能为空（为空时容易与其他业务 key 相撞）');
+    if (!redis.url && redis.password === '') {
+      // 不是错误，但有密码的实例漏填会让启动探活报 NOAUTH，先提示一句
+      console.warn('[config] redis.password 为空，将按无密码连接；若实例开了 requirepass 请在配置里补上');
+    }
+  } else if (storage.mode === 'lite' && (db.host || config.redis.host || config.redis.url)) {
+    // 显式指定了 lite 却又填了外部库：那不是错误，但两边的数据毫无关系，必须说清楚
+    console.warn('[config] storage.mode=lite：database / redis 段将被忽略，连接配置、账号、审计与会话令牌全部落在 SQLite');
   }
+
   return problems;
 }
 
@@ -474,7 +535,11 @@ export function loadConfig(force = false): AppConfig {
         writeDefaultConfig(file);
         createdOnFirstRun = true;
         console.warn(`[config] 未找到配置文件，已生成模板（权限 0600）: ${file}`);
-        console.warn('[config] 请编辑其中 database 段填入 MySQL 账号密码，或用 AETHEROPS_DB_* 环境变量覆盖。');
+        console.warn(
+          '[config] 个人部署什么都不用改（storage.mode=auto → SQLite 单文件）；'
+          + '要多机/多人共享数据就把 storage.mode 设为 enterprise 并填 database / redis 段'
+          + '（或用 AETHEROPS_STORAGE_MODE / AETHEROPS_DB_* / AETHEROPS_REDIS_* 环境变量覆盖）。',
+        );
         fromFile = {};
       }
     }
@@ -486,6 +551,7 @@ export function loadConfig(force = false): AppConfig {
 
   const merged: AppConfig = {
     server: mergeSection(DEFAULTS.server, fromFile.server),
+    storage: mergeSection(DEFAULTS.storage, fromFile.storage),
     database: mergeSection(DEFAULTS.database, fromFile.database),
     redis: mergeSection(DEFAULTS.redis, fromFile.redis),
     auth: mergeSection(DEFAULTS.auth, dropDeprecated('auth', fromFile.auth)),
@@ -522,4 +588,33 @@ export function redactConfig(config: AppConfig = loadConfig()): any {
 export function describeDatabase(target: DatabaseConfig = loadConfig().database): string {
   const host = target.host ? `${target.host}:${target.port}` : '(未配置)';
   return `${target.user || '(未配置)'}@${host}/${target.database}`;
+}
+
+/**
+ * 解析实际生效的存储后端。
+ * auto 下「只要配了任意一个外部依赖就当企业级」：老部署升级后 database.host
+ * 通常已经在配置文件里，行为不会静默变成换库；新装用户什么都不填则直接拿到一张 SQLite。
+ */
+export function resolveStorageMode(config: AppConfig = loadConfig()): StorageMode {
+  const mode = config.storage.mode;
+  if (mode === 'enterprise' || mode === 'lite') return mode;
+  const db = config.database;
+  const redis = config.redis;
+  return db.host || redis.host || redis.url ? 'enterprise' : 'lite';
+}
+
+/** SQLite 文件的绝对路径（已展开相对路径与默认值） */
+export function getSqlitePath(config: AppConfig = loadConfig()): string {
+  const raw = (config.storage.sqlitePath || '').trim();
+  if (!raw) return getDataPath('aetherops.db');
+  return path.isAbsolute(raw) ? path.normalize(raw) : path.resolve(getDataDir(), raw);
+}
+
+/** 存储后端摘要，用于启动日志 */
+export function describeStorage(config: AppConfig = loadConfig()): string {
+  const mode = resolveStorageMode(config);
+  if (mode === 'lite') return `lite (SQLite) ${getSqlitePath(config)}`;
+  const redis = config.redis;
+  const redisTarget = redis.url ? 'url' : `${redis.host || '(未配置)'}:${redis.port}`;
+  return `enterprise (MySQL + Redis) db=${describeDatabase(config.database)} redis=${redisTarget}`;
 }

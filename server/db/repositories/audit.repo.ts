@@ -9,7 +9,7 @@
  *    全文索引对 1 个字的词无效（ngram_token_size=2），LIKE 负责兜住这种短词；
  *    BOOLEAN MODE 的操作符会污染用户输入，必须先剥掉再按词加引号。
  */
-import { execute, query, queryOne } from '../pool';
+import { currentDialect, execute, query, queryOne } from '../pool';
 
 /** 取值由表上的 ck_audit_status 约束，所以这里可以直接写死成联合类型 */
 export type AuditStatus = 'success' | 'error' | 'blocked' | 'rewritten';
@@ -138,7 +138,10 @@ function buildWhere(q: AuditQueryRow): { sql: string; params: any[] } {
   if (q.keyword) {
     const like = `%${q.keyword}%`;
     const bool = toBooleanQuery(q.keyword);
-    if (bool) {
+    // MATCH ... AGAINST 是 MySQL 的 ngram 全文索引语法，SQLite 没有对应能力：
+    // lite 模式下降级为纯 LIKE（已有含关键词的完整实现，只是退化为全表扫描；
+    // 单机部署的数据量与并发量本就适合这种退化）。
+    if (bool && currentDialect() === 'mysql') {
       clauses.push('(MATCH(user_message, command, result) AGAINST(? IN BOOLEAN MODE)'
         + ' OR user_message LIKE ? OR command LIKE ? OR result LIKE ?)');
       params.push(bool, like, like, like);

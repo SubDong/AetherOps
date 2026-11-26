@@ -10,6 +10,7 @@ import { ERROR_FINGERPRINTS_SQL } from './0009-error-fingerprints';
 import { ALERTS_SQL } from './0010-alerts';
 import { COLLABORATION_SQL } from './0011-collaboration';
 import { WATCH_TOKENS_SQL } from './0012-watch-tokens';
+import { AUTH_SESSIONS_SQL, AUTH_SESSIONS_SQLITE_SQL } from './0013-auth-sessions';
 
 /**
  * 迁移清单。
@@ -28,7 +29,17 @@ import { WATCH_TOKENS_SQL } from './0012-watch-tokens';
 export interface Migration {
   version: string;
   name: string;
+  /** MySQL 正文；企业级后端与 `--dump` 导出用它 */
   sql: string;
+  /**
+   * SQLite 专用正文（lite 模式）。
+   *
+   * 日常 DML/DDL 能由 dialect.ts 自动翻译，但 MySQL 的 information_schema 探测、
+   * PREPARE 动态 DDL、多列 ALTER、FULLTEXT 这些在 SQLite 上没有等价写法，
+   * 一旦出现在新迁移里就必须在这里补一份 SQLite 版本（否则 lite 启动会报错并指明本条迁移）。
+   * 可选：不填时走通用翻译器。
+   */
+  sqliteSql?: string;
 }
 
 export const MIGRATIONS: Migration[] = [
@@ -44,6 +55,7 @@ export const MIGRATIONS: Migration[] = [
   { version: '0010', name: 'alerts', sql: ALERTS_SQL },
   { version: '0011', name: 'collaboration', sql: COLLABORATION_SQL },
   { version: '0012', name: 'watch-tokens', sql: WATCH_TOKENS_SQL },
+  { version: '0013', name: 'auth-sessions', sql: AUTH_SESSIONS_SQL, sqliteSql: AUTH_SESSIONS_SQLITE_SQL },
 ];
 
 /** 供 CLI 导出 .sql 文本 */

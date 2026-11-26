@@ -10,7 +10,7 @@ const WebSocket = require('ws');
 // 统一数据目录管理（所有写入文件必须通过此模块获取路径）
 const { ensureDataDir, getDataPath } = require('./dist/server/utils/data-dir');
 // 统一配置入口：优先级 环境变量 > ~/.aetherops/config.json > 内置默认值
-const { loadConfig, validateConfig, describeDatabase, getConfigPath } = require('./dist/server/utils/config');
+const { loadConfig, validateConfig, describeDatabase, describeStorage, resolveStorageMode, getConfigPath } = require('./dist/server/utils/config');
 const {
   isAllowedOrigin,
   extractBearerToken,
@@ -31,16 +31,20 @@ try {
   console.error('[FATAL] 配置加载失败:', err.message);
   process.exit(1);
 }
-// 数据库配置不完整 = 不起。存储层已切到 MySQL（server/db），没有任何「降级回
+// 数据库配置不完整 = 不起。存储层已切到 MySQL / SQLite（server/db），没有任何「降级回
 // JSON 文件」的分支：宁可启动失败并打印人话原因，也不要两套存储并存导致
 // 用户以为数据写进了库、实际始终在本地文件里。
+// 校验规则与所选存储模式有关：lite 模式不要求 database/redis 段。
 const configProblems = validateConfig(appConfig);
 if (configProblems.length) {
   console.error('[FATAL] 数据库配置不完整: ' + configProblems.join('; '));
-  console.error('[FATAL] 请编辑 ' + getConfigPath() + '（或用 AETHEROPS_DB_* 环境变量提供）');
+  console.error('[FATAL] 请编辑 ' + getConfigPath() + '（或用 AETHEROPS_DB_* / AETHEROPS_STORAGE_* 环境变量提供）');
   process.exit(1);
 }
-console.log('[config] database -> ' + describeDatabase(appConfig.database));
+console.log('[config] storage -> ' + describeStorage(appConfig));
+if (resolveStorageMode(appConfig) === 'enterprise') {
+  console.log('[config] database -> ' + describeDatabase(appConfig.database));
+}
 
 const uploadLimitBytes = maxUploadBytes();
 
@@ -869,22 +873,25 @@ const pidFilePath = getDataPath('aetherops.server.' + PORT + '.pid');
 function cleanupPid() {
   try { if (fs.existsSync(pidFilePath)) fs.unlinkSync(pidFilePath); } catch {}
 }
-// 启动前必须让依赖就绪：MySQL 探活 + 跑完迁移 + Redis 探活 + 加载服务配置。
+// 启动前必须让依赖就绪：存储探活 + 跑完迁移 +（企业级）Redis 探活 + 加载服务配置。
 // 迁移完成后才 listen：服务还没开始接请求就失败退出，
 // 不会出现「端口已开但一查就错」这种更难排查的中间态。
 async function bootstrapDatabase() {
   try {
     const { ensureDatabaseReady } = require('./dist/server/db/migrate');
     await ensureDatabaseReady();
-    // Redis 持有登录令牌，连不上等于没人能登录，同样按硬依赖处理
-    const { probeRedis } = require('./dist/server/db/redis');
-    await probeRedis();
+    // lite 模式下登录令牌就在同一个 SQLite 文件里，没有 Redis 可探；
+    // enterprise 模式下 Redis 持有令牌，连不上等于没人能登录，按硬依赖处理。
+    if (resolveStorageMode(appConfig) === 'enterprise') {
+      const { probeRedis } = require('./dist/server/db/redis');
+      await probeRedis();
+    }
     // 建表完成后才能读表：服务的初始化（AI 配置、连接列表等）必须在这一步之后
     const { initServices } = require('./dist/server/index.js');
     await initServices();
   } catch (err) {
     console.error('[FATAL] ' + (err && err.message ? err.message : String(err)));
-    console.error('[FATAL] 依赖服务不可用（MySQL / Redis），服务不启动。校对配置: ' + getConfigPath());
+    console.error('[FATAL] 依赖服务不可用（MySQL / Redis / SQLite），服务不启动。校对配置: ' + getConfigPath());
     try { logStream.end(); } catch (e) { /* ignore */ }
     process.exit(1);
   }

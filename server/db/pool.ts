@@ -1,11 +1,38 @@
 import * as fs from 'fs';
 import type { Pool, PoolOptions } from 'mysql2/promise';
 import * as mysql from 'mysql2/promise';
-import { loadConfig } from '../utils/config';
-import type { DatabaseConfig } from '../utils/config';
+import { loadConfig, resolveStorageMode } from '../utils/config';
+import type { DatabaseConfig, StorageMode } from '../utils/config';
+import {
+  closeSqlite,
+  getSqliteStatus,
+  probeSqlite,
+  sqliteExecute,
+  sqliteQuery,
+  sqliteTransaction,
+} from './sqlite';
 
 /**
- * MySQL 连接池。
+ * 仓储层的唯一入口：按 storage 配置分派到 MySQL 或 SQLite。
+ *
+ * 20 个 repo 都只认这里的 `query` / `execute` / `queryOne`，所以「换存储后端」
+ * 不需要改动它们（方言差异见 dialect.ts）。
+ *
+ * 两种模式：
+ * - enterprise（默认行为，与改造前一致）：MySQL 存业务数据，Redis 存登录令牌；
+ * - lite：单个 SQLite 文件存业务数据**与**登录会话令牌，不再需要外部依赖。
+ */
+
+/** 当前生效的后端；每次调用都重新解析（dev 模式改配置后会重新求值） */
+export function currentDialect(): 'mysql' | 'sqlite' {
+  return resolveStorageMode() === 'lite' ? 'sqlite' : 'mysql';
+}
+
+export function currentStorageMode(): StorageMode {
+  return resolveStorageMode();
+}
+
+/** MySQL 连接池。
  *
  * 设计约束（来自这次对目标实例的实测，换实例时要重新确认）：
  * - 服务端 time_zone=SYSTEM 且 system_time_zone=CST，而驱动 timezone 固定按 '+00:00'
@@ -90,6 +117,9 @@ function signatureOf(db: DatabaseConfig): string {
 }
 
 export function getPool(): Pool {
+  if (currentDialect() === 'sqlite') {
+    throw new Error('当前是 lite（SQLite）模式，没有 MySQL 连接池；请改用 query()/execute() 帮助函数');
+  }
   const db = loadConfig().database;
   const sig = signatureOf(db);
   const state = poolState();
@@ -143,6 +173,8 @@ export function describeDbError(e: any): string {
 }
 
 export interface DbProbeResult {
+  /** 实际后端；调用方据此决定日志文案与后续步骤 */
+  engine: 'mysql' | 'sqlite';
   version: string;
   serverTz: string;
   systemTz: string;
@@ -154,8 +186,23 @@ export interface DbProbeResult {
 /**
  * 启动探活：建一条真连接、读几个关键服务端参数，然后关掉。
  * 不做「失败就静默继续」——按既定策略，连不上库服务端就不该起来。
+ * lite 模式下探活的是 SQLite 文件（顺带把目录建出来）。
  */
 export async function probeDatabase(): Promise<DbProbeResult> {
+  if (currentDialect() === 'sqlite') {
+    const probe = await probeSqlite();
+    return {
+      engine: 'sqlite',
+      version: probe.version,
+      // SQLite 没有服务端时区：时间一律按 UTC 文本存
+      serverTz: 'UTC',
+      systemTz: 'UTC',
+      maxConnections: 1,
+      database: probe.file,
+      collation: probe.journalMode,
+    };
+  }
+
   const db = loadConfig().database;
   let conn;
   try {
@@ -175,6 +222,7 @@ export async function probeDatabase(): Promise<DbProbeResult> {
     );
     const r = (rows as any[])[0] || {};
     return {
+      engine: 'mysql',
       version: String(r.version),
       serverTz: String(r.time_zone),
       systemTz: String(r.system_time_zone),
@@ -189,11 +237,13 @@ export async function probeDatabase(): Promise<DbProbeResult> {
 
 /** 通用查询：只做参数化转发，不吞错误 */
 export async function query<T = any>(sql: string, params?: any[]): Promise<T[]> {
+  if (currentDialect() === 'sqlite') return sqliteQuery<T>(sql, params);
   const [rows] = await getPool().query(sql, params);
   return rows as T[];
 }
 
 export async function execute<T = any>(sql: string, params?: any[]): Promise<{ affectedRows: number; insertId: number }> {
+  if (currentDialect() === 'sqlite') return sqliteExecute(sql, params);
   const [result] = await getPool().execute(sql, params);
   const r = result as any;
   return { affectedRows: r?.affectedRows ?? 0, insertId: r?.insertId ?? 0 };
@@ -208,8 +258,13 @@ export async function queryOne<T = any>(sql: string, params?: any[]): Promise<T 
 /**
  * 事务。回调里必须用传入的 conn，不要用 query()/execute() 帮助函数——
  * 它们从池里另拿连接，不在同一个事务里，且不报错，是最难查的一类 bug。
+ *
+ * lite 模式下只有一个连接，传入的 conn 是空壳（SQLite 的语句天然在同一连接上）；
+ * 但回调仍是 async，期间别的请求可能插进同一事务，所以 lite 模式下真实业务事务
+ * 应当使用同步写法（见 sqlite.ts 的 sqliteTransactionSync）。
  */
-export async function transaction<T>(fn: (conn: mysql.PoolConnection) => Promise<T>): Promise<T> {
+export async function transaction<T>(fn: (conn: any) => Promise<T>): Promise<T> {
+  if (currentDialect() === 'sqlite') return sqliteTransaction(() => fn(null));
   const conn = await getPool().getConnection();
   try {
     await conn.beginTransaction();
@@ -224,8 +279,12 @@ export async function transaction<T>(fn: (conn: mysql.PoolConnection) => Promise
   }
 }
 
-/** 连接池实时状态，供 /health 与后续诊断接口使用 */
+/** 连接状态，供 /health 与后续诊断接口使用 */
 export function getPoolStatus(): { initialized: boolean; connectionLimit: number; target: string } {
+  if (currentDialect() === 'sqlite') {
+    const status = getSqliteStatus();
+    return { initialized: status.initialized, connectionLimit: 1, target: status.file };
+  }
   const db = loadConfig().database;
   return {
     initialized: !!poolState().pool,
@@ -235,6 +294,7 @@ export function getPoolStatus(): { initialized: boolean; connectionLimit: number
 }
 
 export async function closePool(): Promise<void> {
+  await closeSqlite().catch(() => undefined);
   const state = poolState();
   if (!state.pool) return;
   const ending = state.pool;
