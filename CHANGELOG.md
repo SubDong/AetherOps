@@ -15,6 +15,50 @@ predates one — that you run.
 
 ## [Unreleased]
 
+### Changed
+
+- **A command that needs approval now stops the turn instead of being reported back to the model.**
+  `execute_command` / `run_on_hosts` used to answer `NEEDS_CONFIRM`, hand the decision to the model and let it
+  carry on with the rest of the turn while the card sat in the panel; the front end then sent one more message
+  after the click to resume. That made a single instruction — `mkdir -p … && cat > … << 'EOF'` — a race: the
+  approval belonged to one turn and the command ran in another, and anything the model queued in between was
+  already running. The tool now registers the approval, emits `confirm_required`, and **awaits** the click in
+  place (`waitForApproval`); approving resolves the waiter with the token and the same call continues into the
+  terminal and returns its output, denying resolves it with `null` and the tool returns `NOT_EXECUTED` with the
+  reason. The event carries `blocking: true`, so the panel updates the card and sends nothing further —
+  previously that extra resume message ran an already-approved command a second time. A stopped turn
+  (`stopAgent`) and an expired approval resolve the waiters as well, so the turn closes instead of hanging for
+  five minutes. **Boundary:** a caller with no interactive front end (scripts, anything without a
+  `confirmSink`) still gets the old `NEEDS_CONFIRM` text and registers no waiter, because waiting there would
+  stall for the full TTL; several waiters are woken by one click, since the model may send the same command
+  twice in a turn; a `deny` that arrives for an approval already resolved is refused rather than retroactively
+  cancelling a command that is running.
+- **Commands in one chat now run in order.** `agent-core` dispatches the tool calls of one assistant turn in
+  parallel (`executeToolGroupParallel`, and `startEarlyExecution` starts a call as soon as its arguments
+  parse), and the model habitually splits one job into several commands — `mkdir -p` then a heredoc, a
+  `systemctl daemon-reload` then a restart. A per-`ownerId:chatId` lock (`withChatLock`) now queues command
+  execution, approval wait included, so the second command does not start until the first has returned;
+  `execute_command` and `run_on_hosts` share the same lock, so a batch cannot interleave either. A failed
+  command releases the next one instead of leaving the chat blocked. **Boundary:** read-only tools
+  (`read_terminal`, `query_metrics`, `search_audit`, …) are not queued; the lock lives in one process, so two
+  instances serving the same account against the same database do not serialize against each other; and a
+  command that is waiting on an approval holds the queue for up to the five-minute TTL, which is the point —
+  the alternative is a later command overtaking it.
+
+### Fixed
+
+- **The approval card stayed on "Confirming…" forever.** `approveStep` moved the card to `approving` and
+  waited for `confirm_approved`, and that handler treated `approving` as a duplicate delivery and returned
+  early — the one state that was actually waiting for the event was the state that ignored it, so the token
+  arrived and nothing ever resumed. The guard now skips only `approved` / `denied`. Dismissing a card sends
+  `decision: 'deny'` instead of only greying it out locally, so the server stops waiting and the model is told
+  the command did not run; a `confirm_denied` that arrives later still attaches its reason to a card dismissed
+  earlier. The confirm copy now says the agent is waiting on the decision, and *Confirmed, running it now*
+  replaces *Confirmed, re-running*. Asserted in `scripts/verify-p2-approval.mjs` (76 assertions, up from 68):
+  the blocking call has not returned while the card is pending, approving continues the same call, a denied
+  command returns `NOT_EXECUTED`, and with one command waiting on approval a second one in the same chat has
+  not written to the terminal yet.
+
 ## [0.1.5] — 2026-11-26
 
 ### Added

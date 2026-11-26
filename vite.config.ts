@@ -530,10 +530,11 @@ const config = defineConfig({
                                     break;
                                 }
                                 case 'ai-agent-confirm': {
-                                    // 中风险命令的人类确认：待确认请求换成一次性 token，
-                                    // 下一轮工具带着它才能放行（归属与对话由 ai.service 按 ownerId 校验）
+                                    // 中风险命令的人类确认：工具正停在原地等这次点击
+                                    // （归属与对话由 ai.service 按 ownerId 校验）；拒绝也要把结果送回去
                                     const { approvalId, chatId: confirmChatId, aiSessionId: confirmSid } = data || {};
                                     const confirmTarget = confirmChatId || confirmSid;
+                                    const decision = data?.decision === 'deny' ? 'deny' : 'approve';
                                     if (!wsUser.permissions || !wsUser.permissions.ai) {
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', event: { type: 'confirm_denied', error: 'Forbidden: missing permission', code: 'forbidden' } }));
                                         break;
@@ -542,14 +543,15 @@ const config = defineConfig({
                                         safeSend(JSON.stringify({ type: 'ai-agent-event', event: { type: 'confirm_denied', error: 'Missing params: approvalId / chatId', code: 'bad_request' } }));
                                         break;
                                     }
-                                    const result = aiService.approveCommand(ownerId, confirmTarget, approvalId);
-                                    console.log(`[dev][WS] AI Agent confirm: id=${approvalId} ok=${result.ok}${result.code ? ` code=${result.code}` : ''}`);
+                                    const result = aiService.resolveApproval(ownerId, confirmTarget, approvalId, decision);
+                                    console.log(`[dev][WS] AI Agent confirm: id=${approvalId} decision=${decision} ok=${result.ok}${result.code ? ` code=${result.code}` : ''}`);
                                     safeSend(JSON.stringify({
                                         type: 'ai-agent-event',
                                         sessionId: confirmSid || '',
                                         chatId: confirmTarget,
                                         event: result.ok
-                                            ? { type: 'confirm_approved', approval: { ...result.approval, token: result.token } }
+                                            // blocking：工具已经续完了，前端不要再发一轮，否则同一条命令会跑两次
+                                            ? { type: 'confirm_approved', approval: { ...result.approval, token: result.token }, blocking: !!result.blocking }
                                             : { type: 'confirm_denied', approval: result.approval, error: result.error, code: result.code },
                                     }));
                                     break;

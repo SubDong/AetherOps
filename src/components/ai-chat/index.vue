@@ -787,9 +787,8 @@ function stepHostIndex(): number {
 }
 
 /**
- * 批准后的续跑：token 只在紧接着的一轮有效，所以必须由前端再发一轮。
- * 指令里把命令原文带上 —— 工具侧按「原文归一化后全等」校验 token，
- * 模型自己改写一个字都换不回来。
+ * 批准后的续跑：仅在老后端（不带 blocking）时用作降级 —— 那种后端只是把 token 交回来，
+ * 真正执行要靠下一轮。阻塞式后端已经在这一轮里跑完了，再发一轮会让同一条命令执行两次。
  */
 function queueApprovedResume(approval: ApprovalState) {
   const item: QueuedMessage = {
@@ -821,11 +820,23 @@ function approveStep(step: AgentStep) {
   });
 }
 
-/** 不执行：只是把卡片收起来，后端那条待确认 5 分钟后自己过期 */
+/**
+ * 不执行：必须告诉后端 —— 工具此刻就停在原地等这个答案，
+ * 只把卡片收起来会让那一轮干到卡片过期，用户看到的就是「卡住了」。
+ */
 function dismissStep(step: AgentStep) {
   const approval = step.approval;
   if (!approval || approval.status !== 'pending') return;
   approval.status = 'denied';
+  emit('ws-send', {
+    type: 'ai-agent-confirm',
+    data: {
+      aiSessionId: props.sessionId,
+      chatId: currentChatId.value || undefined,
+      approvalId: approval.id,
+      decision: 'deny',
+    },
+  });
 }
 
 // 处理 Agent 事件（由父组件调用）
@@ -877,12 +888,15 @@ function handleAgentEvent(event: any) {
     const found = findApprovalStep(event.approval?.id);
     if (!found) { scrollToBottom(); return; }
     const approval = found.step.approval!;
-    // 重复投递不能续跑两轮：一条待确认只会换出一个 token
-    if (approval.status === 'approved' || approval.status === 'approving' || approval.status === 'denied') return;
+    // 只有已批准 / 已拒绝才是真的重复投递。approving 恰恰是「正在等这条事件」的中间态，
+    // 把它当成重复拦掉，卡片就会永远停在「正在确认…」
+    if (approval.status === 'approved' || approval.status === 'denied') return;
     if (event.approval?.token) {
       approval.status = 'approved';
       approval.token = event.approval.token;
-      queueApprovedResume(approval);
+      // blocking：工具已经在服务端原地续跑，前端只更新卡片，不再发一轮
+      // （否则同一轮里同一条命令会被执行第二次）
+      if (!event.blocking) queueApprovedResume(approval);
     } else {
       approval.status = 'denied';
       approval.error = event.error;
@@ -895,8 +909,11 @@ function handleAgentEvent(event: any) {
     const found = findApprovalStep(event.approval?.id);
     if (!found) { scrollToBottom(); return; }
     const approval = found.step.approval!;
-    // 已经点过「不执行」的卡片不用再被后端消息改写
-    if (approval.status === 'denied') return;
+    // 已经点过「不执行」的卡片不用再被后端消息改写，但后端回的原因要补上（可能有归属 / 过期细节）
+    if (approval.status === 'denied') {
+      if (!approval.error && event.error) approval.error = event.error;
+      return;
+    }
     approval.status = event.code === 'expired' ? 'expired' : 'denied';
     approval.error = event.error;
     approval.token = undefined;

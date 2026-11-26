@@ -768,6 +768,9 @@ wss.on('connection', async (ws, req) => {
           // 这里拿到别人的 approvalId 也换不出 token。
           const { approvalId, chatId: confirmChatId, aiSessionId: confirmSid } = data || {};
           const confirmTarget = confirmChatId || confirmSid;
+          // 同一个入口处理「执行」与「不执行」：工具正停在原地等这次点击，
+          // 拒绝也必须把结果送回去，否则那一轮要干等到卡片过期
+          const decision = data?.decision === 'deny' ? 'deny' : 'approve';
           const { aiService } = serverModule;
           if (!wsUser.permissions || !wsUser.permissions.ai) {
             ws.send(JSON.stringify({ type: 'ai-agent-event', event: { type: 'confirm_denied', error: 'Forbidden: missing permission', code: 'forbidden' } }));
@@ -780,15 +783,16 @@ wss.on('connection', async (ws, req) => {
             }));
             break;
           }
-          const result = aiService.approveCommand(ownerId, confirmTarget, approvalId);
-          console.log(`[WS] AI Agent confirm: id=${approvalId} ok=${result.ok}${result.code ? ` code=${result.code}` : ''}`);
+          const result = aiService.resolveApproval(ownerId, confirmTarget, approvalId, decision);
+          console.log(`[WS] AI Agent confirm: id=${approvalId} decision=${decision} ok=${result.ok}${result.code ? ` code=${result.code}` : ''}`);
           if (ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
               type: 'ai-agent-event',
               sessionId: confirmSid || '',
               chatId: confirmTarget,
               event: result.ok
-                ? { type: 'confirm_approved', approval: { ...result.approval, token: result.token } }
+                // blocking：工具已经续完了，前端拿到 token 不要再发一轮，否则同一条命令会跑两次
+                ? { type: 'confirm_approved', approval: { ...result.approval, token: result.token }, blocking: !!result.blocking }
                 : { type: 'confirm_denied', approval: result.approval, error: result.error, code: result.code },
             }));
           }

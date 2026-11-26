@@ -176,6 +176,13 @@ export interface ApprovalRequest {
   scope: ApprovalScope;
   /** 过期时间（毫秒时间戳） */
   expiresAt: number;
+  /**
+   * 工具正停在原地等这次点击。
+   *
+   * true 表示批准后命令会立刻在后台继续执行，前端不要再发一轮「续跑」消息；
+   * false / 缺省是旧行为（拿 token 再跑一轮），只留作无 UI 场合的降级。
+   */
+  blocking?: boolean;
 }
 
 /** 待确认的命令：只放内存，进程重启即失效 */
@@ -186,6 +193,25 @@ interface PendingApproval extends ApprovalRequest {
   /** 目标范围指纹（终端会话 id / 目标连接清单）：换了目标就要重新确认 */
   targetKey: string;
   createdAt: number;
+  /**
+   * 停在原地等这次点击的工具。
+   *
+   * 批准传 token、拒绝/过期/停止传 null。用数组而不是单个回调：
+   * 模型可能在同一轮里把同一条命令发两次，两次都应该被同一次点击唤醒，
+   * 否则后一个会立刻拿到 null 而误报「用户拒绝了」。
+   */
+  waiters: Array<(token: string | null) => void>;
+}
+
+/** 一次「点确认 / 点不执行」的结果 */
+interface ApprovalResolution {
+  ok: boolean;
+  token?: string;
+  approval?: ApprovalRequest;
+  error?: string;
+  code?: 'not_found' | 'forbidden' | 'expired';
+  /** 工具正原地等待：前端拿到后不要再发一轮续跑 */
+  blocking?: boolean;
 }
 
 /** 已批准的一次性令牌 */
@@ -457,6 +483,9 @@ const APPROVAL_TOKENS_KEY = 'approvalTokens';
 /** agentRun 每轮通过 context.custom 带进来的「需要确认时通知前端」的回调 */
 const CONFIRM_SINK_KEY = 'confirmSink';
 
+/** agentRun 每轮通过 context.custom 带进来的中止信号（用户点停止时靠它叫醒等待者） */
+const ABORT_SIGNAL_KEY = 'abortSignal';
+
 function approvalTokensOf(ctx: ToolContext): string[] {
   const value = ctx.custom?.[APPROVAL_TOKENS_KEY];
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
@@ -478,6 +507,8 @@ interface ApprovalContext {
   chatId: string;
   tokens: string[];
   onConfirmRequired?: (request: ApprovalRequest) => void;
+  /** 本轮的中止信号：用户点停止时，停在原地等确认的那条命令必须立刻放手 */
+  signal?: AbortSignal;
 }
 
 function approvalContextOf(ctx: ToolContext): ApprovalContext {
@@ -486,7 +517,16 @@ function approvalContextOf(ctx: ToolContext): ApprovalContext {
     chatId: ctx.sessionId || '',
     tokens: approvalTokensOf(ctx),
     onConfirmRequired: confirmSinkOf(ctx),
+    signal: abortSignalOf(ctx),
   };
+}
+
+function abortSignalOf(ctx: ToolContext): AbortSignal | undefined {
+  const value = ctx.custom?.[ABORT_SIGNAL_KEY];
+  // 只认带 addEventListener 的真信号：custom 是开放字典，随便塞个对象进来当不得
+  return value && typeof (value as AbortSignal).addEventListener === 'function'
+    ? value as AbortSignal
+    : undefined;
 }
 
 /** 命令检查结果：`safe` 保留是为了与旧调用点兼容，判断放不放行必须看 `level` */
@@ -517,6 +557,17 @@ function needsConfirmMsg(command: string, code: string, request: ApprovalRequest
     + 'retrying produces the same card and wastes a round. Tell the user in one sentence that the command is '
     + 'waiting for confirmation, then stop.'
     + (note ? ` ${note}` : '');
+}
+
+/**
+ * 人工确认没有通过时回给模型的文案。
+ *
+ * 必须写明「没有执行」：只说「未获批准」时模型经常照着原计划总结「已完成」，
+ * 而终端里什么都没发生 —— 这是最糟的一种错误报告。
+ */
+function confirmNotRunMsg(command: string, why: string): string {
+  return `NOT_EXECUTED: "${oneLine(command, 120)}" was not run (${why}). Nothing was sent to the terminal. `
+    + 'Tell the user plainly that it did not run and why; do not claim it succeeded and do not retry it in this turn.';
 }
 
 // ========== Agent System Prompt ==========
@@ -637,6 +688,13 @@ export class AIService {
   private issuedApprovalTokens = new Map<string, ApprovalTokenRecord>();
   /** 确认请求的有效期：超过它，卡片点了也不认 */
   private readonly APPROVAL_TTL_MS = 5 * 60 * 1000;
+  /**
+   * 同一对话的命令排队链（key = ownerId:chatId）。
+   *
+   * agent-core 会把同一轮的多个工具调用并发派发，而模型习惯把一件事拆成几条命令
+   * （先 mkdir -p、再 cat heredoc），并行之后顺序就没了。
+   */
+  private chatCommandLocks = new Map<string, Promise<unknown>>();
 
   // ---- 状态 ----
   private loadedSessions = new Set<string>();
@@ -1537,7 +1595,11 @@ export class AIService {
   /** 过期的待确认与令牌自己收敛：不靠定时器，也就不会忘了关 */
   private pruneApprovals(now = Date.now()): void {
     for (const [id, pending] of this.pendingApprovals) {
-      if (pending.expiresAt <= now) this.pendingApprovals.delete(id);
+      if (pending.expiresAt <= now) {
+        this.pendingApprovals.delete(id);
+        // 不会再有人来点这张卡了：正在等它的工具立刻放手，别让它干耗到自己的定时器
+        this.settleApproval(pending, null);
+      }
     }
     for (const [token, record] of this.issuedApprovalTokens) {
       if (record.used || record.expiresAt <= now) this.issuedApprovalTokens.delete(token);
@@ -1581,6 +1643,7 @@ export class AIService {
       sessionId,
       createdAt: now,
       expiresAt: now + this.APPROVAL_TTL_MS,
+      waiters: [],
     };
     this.pendingApprovals.set(request.id, request);
     console.log(`[AIService] 命令待确认: id=${request.id} code=${code} scope=${scope} owner=${ownerId} chat=${chatId}`);
@@ -1593,13 +1656,7 @@ export class AIService {
    * 归属与对话都要对得上，否则知道 approvalId 就能让别人的命令放行；
    * 这两项都不能从请求参数里信任，必须与登记时的记录比对。
    */
-  approveCommand(ownerId: string, chatId: string, approvalId: string): {
-    ok: boolean;
-    token?: string;
-    approval?: ApprovalRequest;
-    error?: string;
-    code?: 'not_found' | 'forbidden' | 'expired';
-  } {
+  approveCommand(ownerId: string, chatId: string, approvalId: string): ApprovalResolution {
     const now = Date.now();
     this.pruneApprovals(now);
     const pending = this.pendingApprovals.get(String(approvalId || ''));
@@ -1611,6 +1668,7 @@ export class AIService {
     }
     if (pending.expiresAt <= now) {
       this.pendingApprovals.delete(pending.id);
+      this.settleApproval(pending, null);
       return {
         ok: false,
         code: 'expired',
@@ -1629,8 +1687,115 @@ export class AIService {
       used: false,
     });
     this.pendingApprovals.delete(pending.id);
+    // 工具正停在原地：先把它叫醒，它拿到 token 会立刻往下执行
+    this.settleApproval(pending, token);
     console.log(`[AIService] 命令已确认: id=${pending.id} code=${pending.code} owner=${ownerId}`);
-    return { ok: true, token, approval: this.publicApproval(pending) };
+    return { ok: true, token, approval: this.publicApproval(pending), blocking: true };
+  }
+
+  /**
+   * 用户点了「不执行」。
+   *
+   * 必须立刻叫醒等待者：只把卡片收起来、让工具自己熬到过期，
+   * 这一轮对话会停在那里 —— 用户看到的就是「卡住了」。
+   */
+  denyCommand(ownerId: string, chatId: string, approvalId: string): ApprovalResolution {
+    this.pruneApprovals();
+    const pending = this.pendingApprovals.get(String(approvalId || ''));
+    if (!pending) {
+      return { ok: false, code: 'not_found', error: 'This confirmation is unknown, already used or expired.' };
+    }
+    if (pending.ownerId !== ownerId || pending.chatId !== chatId) {
+      return { ok: false, code: 'forbidden', error: 'This confirmation belongs to another account or conversation.' };
+    }
+    this.pendingApprovals.delete(pending.id);
+    this.settleApproval(pending, null);
+    console.log(`[AIService] 命令被拒绝: id=${pending.id} code=${pending.code} owner=${ownerId}`);
+    return { ok: false, approval: this.publicApproval(pending), error: 'The user declined to run this command.' };
+  }
+
+  /**
+   * 宿主统一入口：把「点的是哪个按钮」翻译成批准或拒绝。
+   *
+   * 三处宿主（server.js / Electron IPC / dev 中间件）都走这一个方法，
+   * 免得只在一处支持了「不执行」。
+   */
+  resolveApproval(
+    ownerId: string,
+    chatId: string,
+    approvalId: string,
+    decision: 'approve' | 'deny' = 'approve',
+  ): ApprovalResolution {
+    return decision === 'deny'
+      ? this.denyCommand(ownerId, chatId, approvalId)
+      : this.approveCommand(ownerId, chatId, approvalId);
+  }
+
+  /**
+   * 停在原地等人类点确认。
+   *
+   * 返回 token = 刚被批准；null = 被拒绝 / 过期 / 本轮被停止。
+   *
+   * 为什么一定要阻塞：先回一句 NEEDS_CONFIRM 就让模型继续往下跑，
+   * 等于把「要不要执行」和「执行什么、什么顺序」拆成两件互不知道的事 ——
+   * 模型会接着调后面的工具，命令顺序和用户意图都会丢，危险就在于此。
+   */
+  private waitForApproval(pending: PendingApproval, signal?: AbortSignal): Promise<string | null> {
+    return new Promise<string | null>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (token: string | null) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        const index = pending.waiters.indexOf(finish);
+        if (index >= 0) pending.waiters.splice(index, 1);
+        resolve(token);
+      };
+      const onAbort = () => finish(null);
+      // 卡片上的过期时间之后再等 1 秒：先让 approveCommand 有机会把「已过期」说清楚
+      timer = setTimeout(() => finish(null), Math.max(0, pending.expiresAt - Date.now()) + 1000);
+      if (signal?.aborted) {
+        finish(null);
+        return;
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+      pending.waiters.push(finish);
+    });
+  }
+
+  /** 唤醒所有等着这条待确认的工具：批准传 token，拒绝 / 过期 / 停止传 null */
+  private settleApproval(pending: PendingApproval, token: string | null): void {
+    const waiters = pending.waiters.splice(0, pending.waiters.length);
+    for (const waiter of waiters) waiter(token);
+  }
+
+  /**
+   * 同一对话里的命令按到达顺序串行执行。
+   *
+   * agent-core 会把同一轮的多个工具调用并发派发（tool-executor 的 executeToolGroupParallel，
+   * 加上「参数聚合完成即预执行」），而模型习惯把一件事拆成几条命令。
+   * 一旦并行，先跑的那条可能依赖后跑的产物 —— 会话里的顺序和模型以为的顺序就不一样了。
+   * 锁按 ownerId:chatId 排队：前一条（包括它正在等的人工确认）没结束，后一条不开始。
+   */
+  private async withChatLock<T>(key: string, task: () => Promise<T>): Promise<T> {
+    const previous = this.chatCommandLocks.get(key) || Promise.resolve();
+    // 前一条无论成功还是抛错都要放行后来者：两个分支都接同一个 task
+    const running = previous.then(task, task);
+    const tail = running.then(() => undefined, () => undefined);
+    this.chatCommandLocks.set(key, tail);
+    try {
+      return await running;
+    } finally {
+      // 队尾还是自己才清理：否则会把排在后面的那条的链一起删掉，锁就失效了
+      if (this.chatCommandLocks.get(key) === tail) this.chatCommandLocks.delete(key);
+    }
+  }
+
+  /** 串行的粒度是「账号 + 对话」：不同对话互不影响，同一对话内严格按顺序 */
+  private commandLockKey(fallback: string, approval?: ApprovalContext): string {
+    return `${approval?.ownerId || ''}:${approval?.chatId || fallback}`;
   }
 
   /**
@@ -1771,6 +1936,19 @@ export class AIService {
     timeout: number,
     approval?: ApprovalContext,
   ): Promise<string> {
+    // 先排队再判断终端：同一轮里并发派发的几条命令，后一条连「终端在不在」都不该插到前一条前面
+    return this.withChatLock(
+      this.commandLockKey(sessionId, approval),
+      () => this.executeCommandLocked(command, sessionId, timeout, approval),
+    );
+  }
+
+  private async executeCommandLocked(
+    command: string,
+    sessionId: string,
+    timeout: number,
+    approval?: ApprovalContext,
+  ): Promise<string> {
     const blocked = this.terminalGuard(sessionId);
     if (blocked) return blocked;
     // guard 已经确认过会话存在，这里的判空只是给 TS 看
@@ -1781,7 +1959,7 @@ export class AIService {
     if (check.level === 'blocked') return check.reason!;
     if (check.level === 'confirm') {
       // 中风险：没人点过确认就不跑。这里是整个闸门唯一放行点 ——
-      // 不管模型怎么表述、换什么参数，只要没有对应的 token 就只能拿到一张卡片
+      // 不管模型怎么表述、换什么参数，只要没有对应的 token 就只能停在原地等
       const approved = !!approval
         && this.consumeApprovalToken(approval.ownerId, approval.chatId, command, approval.tokens, 'terminal', sessionId);
       if (!approved) {
@@ -1795,9 +1973,20 @@ export class AIService {
           sessionId,
         );
         approval?.onConfirmRequired?.(request);
-        return needsConfirmMsg(command, check.code || 'confirm', request);
+        // 没有可交互的前端（脚本 / 无 UI 调用）时退回「只回一张卡片」的老行为，
+        // 否则那条命令会白白等满 5 分钟
+        const pending = approval?.onConfirmRequired ? this.pendingApprovals.get(request.id) : undefined;
+        if (!pending) return needsConfirmMsg(command, check.code || 'confirm', request);
+        // 就停在这里等人：命令没批完，这一轮后面的步骤不会开始
+        const token = await this.waitForApproval(pending, approval?.signal);
+        if (!token) return confirmNotRunMsg(command, 'the user declined or the confirmation expired');
+        // 刚批的 token 也走一次校验：命令原文与终端必须与登记时一致
+        const matched = this.consumeApprovalToken(approval!.ownerId, approval!.chatId, command, [token], 'terminal', sessionId);
+        if (!matched) return confirmNotRunMsg(command, 'the approval no longer matches this command or terminal');
+        console.log(`[AIService] Safety: user confirmed "${oneLine(command, 120)}"`);
+      } else {
+        console.log(`[AIService] Safety: user confirmed "${oneLine(command, 120)}"`);
       }
-      console.log(`[AIService] Safety: user confirmed "${oneLine(command, 120)}"`);
     }
     const actualCommand = check.rewritten || command;
     if (check.rewritten) console.log(`[AIService] Safety: rewrote "${command}" -> "${actualCommand}"`);
@@ -2231,6 +2420,20 @@ export class AIService {
     args: Record<string, unknown>,
     approval?: ApprovalContext,
   ): Promise<string> {
+    // 与 execute_command 共用同一把对话锁：批量执行也不能插到前面的命令中间
+    return this.withChatLock(
+      this.commandLockKey(currentSessionId, approval),
+      () => this.runOnHostsLocked(ownerId, currentSessionId, permissions, args, approval),
+    );
+  }
+
+  private async runOnHostsLocked(
+    ownerId: string,
+    currentSessionId: string,
+    permissions: Record<string, boolean>,
+    args: Record<string, unknown>,
+    approval?: ApprovalContext,
+  ): Promise<string> {
     if (!allows(permissions, 'batch')) return permissionDeniedMsg('run_on_hosts', 'batch');
     if (!this.batch || !this.sshService) return 'BATCH_UNAVAILABLE: batch execution is not enabled in this deployment.';
     if (!ownerId) return 'BATCH_UNAVAILABLE: this run has no account binding, so no host can be targeted.';
@@ -2318,12 +2521,20 @@ export class AIService {
           targetKey,
         );
         approval?.onConfirmRequired?.(request);
-        return needsConfirmMsg(
-          command,
-          risk.code || 'confirm',
-          request,
-          'Approving it runs the command on EVERY targeted host, not just the current terminal.',
-        );
+        const pending = approval?.onConfirmRequired ? this.pendingApprovals.get(request.id) : undefined;
+        if (!pending) {
+          return needsConfirmMsg(
+            command,
+            risk.code || 'confirm',
+            request,
+            'Approving it runs the command on EVERY targeted host, not just the current terminal.',
+          );
+        }
+        // 与单终端一样停在原地：批准了才真正发往目标机集合
+        const token = await this.waitForApproval(pending, approval?.signal);
+        if (!token) return confirmNotRunMsg(command, 'the user declined or the confirmation expired');
+        const matched = this.consumeApprovalToken(approval!.ownerId, approval!.chatId, command, [token], 'hosts', targetKey);
+        if (!matched) return confirmNotRunMsg(command, 'the approval no longer matches this command or host set');
       }
       console.log(`[AIService] Safety: user confirmed batch "${oneLine(command, 120)}"`);
     }
@@ -2572,6 +2783,8 @@ export class AIService {
             chatId,
             tokens: opts?.approvalTokens || [],
             onConfirmRequired: (request) => eventCallback({ type: 'confirm_required', approval: request }),
+            // 用户点停止时，停在原地等确认的那条命令要立刻放手，否则本轮收不了尾
+            signal: ctrl.signal,
           };
           const shellExecutor = this.buildShellExecutor(terminalSessionId, approvalCtx);
           const runCustom = {
@@ -2585,6 +2798,7 @@ export class AIService {
             // 已批准的一次性 token + 需要确认时的回调
             [APPROVAL_TOKENS_KEY]: approvalCtx.tokens,
             [CONFIRM_SINK_KEY]: approvalCtx.onConfirmRequired,
+            [ABORT_SIGNAL_KEY]: ctrl.signal,
             // 本轮已加载的技能：同一轮重复 load_skill 直接回缓存，不重读也不重复占上下文
             [SKILL_CACHE_KEY]: new Map<string, string>(),
           };
@@ -2855,6 +3069,13 @@ export class AIService {
   }
 
   stopAgent(ownerId: string, chatId: string): boolean {
+    // 先叫醒「正在等确认」的工具：它们不在 abort 的监听链上（registry 工具拿不到 signal 时），
+    // 不主动唤醒会一直停着，abort 之后这一轮也收不了尾
+    for (const pending of [...this.pendingApprovals.values()]) {
+      if (pending.ownerId !== ownerId || pending.chatId !== chatId) continue;
+      this.pendingApprovals.delete(pending.id);
+      this.settleApproval(pending, null);
+    }
     const ctrl = this.abortControllers.get(this.abortKey(ownerId, chatId));
     if (!ctrl) return false;
     ctrl.abort();
