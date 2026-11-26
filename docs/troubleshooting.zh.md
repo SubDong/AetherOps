@@ -136,7 +136,7 @@
 | 原生模块编译失败（`node-pty`、`ssh2`、`cpu-features`） | 缺 C++ 工具链 | Linux `python3 make g++`；macOS Xcode CLT；Windows VS Build Tools（C++ 负载） |
 | 安装后脚本被跳过、终端坏了 | pnpm 只跑被允许清单里的依赖构建脚本 | 清单在 `pnpm-workspace.yaml` —— `onlyBuiltDependencies`（pnpm 10/11）与 `allowBuilds`（pnpm 12+），两份是刻意同时保留的 —— `package.json#pnpm` 里有一份更短的镜像。`pnpm approve-builds` 可交互式追加。如果 `node-pty`/`ssh2`/`cpu-features` 被跳过了，删掉 `node_modules` 并在清单就位后重装 |
 | `EBADENGINE` 警告，或 agent-core 运行时抛语法错误 | Node 低于钉住引擎的要求（`>= 22.17.0`） | 用 Node 22.17 或更新（lite 存储需要 `>= 22.13`）；Docker 与 CI 用 24 |
-| lite 模式下 `Cannot find module 'node:sqlite'` | 宿主 Node 低于 22.13，内置 SQLite 模块那时还得加 `--experimental-sqlite` 开关 | 换 Node 22.17+，或给宿主加 `--experimental-sqlite`；也可以改回企业级（`storage.mode: enterprise`） |
+| lite 模式报 `Cannot find module 'node:sqlite'`，或构建时报 `ERR_UNKNOWN_BUILTIN_MODULE: No such built-in module: node:sqlite` | 跑服务（或跑构建，`vite build` 会加载服务端模块图）的 Node 太旧：22.5 之前根本没有这个模块，22.5–22.12 还得加 `--experimental-sqlite` | 服务与构建都用 Node 22.17+（CI 因此用 24）；`--experimental-sqlite` 只在 22.5–22.12 上有用；也可以改回企业级（`storage.mode: enterprise`） |
 | `SQLITE_BUSY` / `database is locked` | 另一个进程（比如 `scripts/migrate.mjs` 的残留）占着写锁，或 `storage.busyTimeoutMs` 太小 | 先把别的进程关掉；`AETHEROPS_SQLITE_BUSY_TIMEOUT_MS` 调大（上限 60000） |
 | 解析 `@cicctencent/agent-core` 时安装失败 | 它被钉死版本、从公共 npm registry 拉取 —— 会过滤包的镜像或防火墙会掐断它 | 为该 scope 放行 `registry.npmjs.org`（或等价的 npmmirror） |
 | "build complete" 之后构建卡住 | `vite build` 在某些环境里会因为 watcher 让进程多活一会儿 | `dist/` 写完之后再 Ctrl-C 是安全的；必须完成的是服务端构建（`tsc -p tsconfig.server.json`） |
