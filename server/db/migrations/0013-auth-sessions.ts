@@ -26,7 +26,9 @@ export const AUTH_SESSIONS_SQL = `
 -- 与 TokenPayload 一一对应；鉴权命中后直接用它，不必再查 users
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS auth_sessions (
-  token_hash TEXT      NOT NULL COMMENT '访问令牌的 SHA-256（hex）',
+  -- CHAR(64) 而不是 TEXT：sha256 hex 就是定长 64，且 MySQL 不允许 TEXT/BLOB 直接作主键
+  -- （ER_BLOB_KEY_WITHOUT_LENGTH，要么给前缀长度，要么换成定长类型）
+  token_hash CHAR(64)  NOT NULL COMMENT '访问令牌的 SHA-256（hex，定长 64）',
   user_id    VARCHAR(64) NOT NULL COMMENT '归属账号',
   payload    TEXT      NOT NULL COMMENT 'TokenPayload 的 JSON 快照',
   issued_at  DATETIME(3) NOT NULL COMMENT '签发时间（UTC）',
